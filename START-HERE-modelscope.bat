@@ -62,7 +62,13 @@ if errorlevel 1 (
 rem --- Run setup.py NON-INTERACTIVELY: pass the choices + point it at the local GGUFs ---
 rem --family swift --model IQ3_XXS = Swift 1.5 IQ3_XXS; --context 131072 = 128K; --kv int8 = 8-bit KV;
 rem --vision yes = images on; --yes = accept recommended answers; --gguf-dir = use local files (no HF download).
-".venv\Scripts\python.exe" setup.py --family swift --model IQ3_XXS --context 131072 --kv int8 --vision yes --gguf-dir "%~dp0..\Strata-data\models\swift-IQ3_XXS" --yes %*
+rem
+rem 2026-10-13: **默认启动「带 logprobs 的引擎」**（build-lp\...\strata-lp.exe，由 build-strata-lp.bat 编出）。
+rem   start_server.py 做三件事：跑 setup.py --no-start（只装不启）→ 派生一份 exe 指向
+rem   strata-lp.exe 的配置 → 用 local\logprobs\server_logprobs.py 启动。
+rem   没编出 strata-lp.exe 时**自动退回原版引擎**，所以这个启动永远不会因此失败。
+rem   传 --stock 强制原版；--setup / --check / --no-start / --calibrate / --update 则完全交给 setup.py 自己收尾。
+".venv\Scripts\python.exe" local\logprobs\start_server.py --family swift --model IQ3_XXS --context 131072 --kv int8 --vision yes --gguf-dir "%~dp0..\Strata-data\models\swift-IQ3_XXS" --yes %*
 if errorlevel 1 pause
 exit /b
 
