@@ -2,6 +2,21 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
+> ### 🔧 这是 `xiezhipeng-git/Strata` —— 一个加了 **OpenAI API `logprobs`** 的 fork
+>
+> **This fork adds per-request `logprobs` / `top_logprobs` to the Strata engine**, so a client
+> like **[AnyJev](https://github.com/Niko1221/Strata)** can read the model's probability
+> distribution over candidate tokens (and so distribution-based early stopping becomes possible).
+>
+> * `src/` is **never modified** — the patched engine source is *generated* as a copy and built
+>   as a **separate binary `strata-lp`**. The stock `engine/strata.exe` is untouched, so the
+>   normal launchers keep working exactly as upstream.
+> * The only change to a tracked file is **one appended line** in `CMakeLists.txt`.
+> * `origin` = this fork, `upstream` = `Niko1221/Strata` (`git rebase upstream/main` keeps working).
+>
+> **📖 全部说明见 [`README.local.md`](README.local.md)** — 改了什么、为什么必须改引擎、
+> 怎么在 Windows / Linux 构建、怎么起服务、怎么自检、怎么与上游同步。
+
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 
