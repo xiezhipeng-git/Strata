@@ -94,10 +94,15 @@ echo [ok] ninja  : %NINJA%
 
 REM ------------------------------------------------------------
 REM 3. CUDA toolkit (nvcc). Look for the newest usable one.
+REM    Search order: an explicit CUDA_PATH, then the usual install roots
+REM    (C:\Program Files, C:\CUDA, D:\CUDA) so a custom install path works too.
 REM ------------------------------------------------------------
 set "NVCC="
-for %%V in (13.3 13.2 13.1 13.0 12.9 12.8 12.6 12.5 12.4 12.1 11.8) do (
-  if not defined NVCC if exist "%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v%%V\bin\nvcc.exe" set "NVCC=%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v%%V\bin\nvcc.exe"
+if defined CUDA_PATH if exist "%CUDA_PATH%\bin\nvcc.exe" set "NVCC=%CUDA_PATH%\bin\nvcc.exe"
+if not defined NVCC for %%V in (13.3 13.2 13.1 13.0 12.9 12.8 12.6 12.5 12.4 12.1 11.8) do (
+  for %%R in ("%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v%%V" "C:\CUDA\v%%V" "D:\CUDA\v%%V" "D:\cuda\v%%V") do (
+    if not defined NVCC if exist "%%~R\bin\nvcc.exe" set "NVCC=%%~R\bin\nvcc.exe"
+  )
 )
 if not defined NVCC (
   echo.
@@ -145,9 +150,12 @@ REM 6. Configure
 REM ------------------------------------------------------------
 echo.
 echo ---- [3/4] cmake configure ----
-call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul
+REM NOTE: build-win-env.bat, not vcvars64.bat. vcvars64 queries the
+REM registry with reg.exe, which sandboxes block; this one reads the
+REM same directories off the filesystem.
+call "%~dp0build-win-env.bat"
 if errorlevel 1 (
-  echo [ERROR] vcvars64.bat failed
+  echo [ERROR] build-win-env.bat failed
   goto :fail
 )
 "%CMAKE%" -S "%ROOT%" -B "%BUILD%" -G Ninja ^
