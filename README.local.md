@@ -119,19 +119,44 @@ cmake --build build-lp --target strata-lp -j8
 所以参数是 Strata 的：`--engine strata --config <配置> --port 8080`。配置里的 `exe` 指向哪个引擎二进制，
 就用哪个。
 
-**带 logprobs 的引擎**：把 `strata-swift-iq3_xxs.json` 复制一份，只改 `exe`（指向 `strata-lp.exe`）
-和 `log`（换个文件，别覆盖原版日志），然后：
+### ★ 桌面启动已默认走 logprobs
+
+`START-HERE-modelscope.bat` 和 `strata_125b.bat` **现在默认启动带 logprobs 的引擎**：
+
+```
+双击 START-HERE-modelscope.bat
+  → local/logprobs/start_server.py
+      1. setup.py … --no-start      （只管装好、调好、写好配置；**不让它启动**，因为它只会启原版）
+      2. make_lp_config.py           （派生 strata-lp-<model>.json：只改 exe 和 log 两个字段）
+      3. server_logprobs.py --engine strata --config <派生配置> --port 8080
+```
+
+**`strata-lp.exe` 没编出来时自动退回原版引擎** —— 所以这个启动永远不会因为没编译而失败。
+
+| 想干什么 | 怎么传 |
+|---|---|
+| 默认 | 直接双击 |
+| 强制原版引擎 | `START-HERE-modelscope.bat --stock` |
+| 强制 logprobs（没编出来就报错） | `START-HERE-modelscope.bat --logprobs` |
+| 只 setup 不启动 / 检查 / 升级 | `--setup` / `--check` / `--no-start` / `--calibrate` / `--update` —— 原样交给 setup.py 自己收尾 |
+
+> `--stock` / `--logprobs` / `--port` 是**我们自己的开关**，不会传给 setup.py（它不认识）。
+> 这段参数逻辑放在 **Python**（`start_server.py`）里而不是 .bat 里：cmd 的 `shift` 循环容易写错，
+> 而且 Python 可以真的去测 —— 7 种参数形态都验过，`stock_config()` 也能正确挑出 setup.py 刚写的那份配置。
+
+### 手动起（不经过 setup.py）
 
 ```bat
 .venv\Scripts\python.exe local\logprobs\server_logprobs.py ^
     --engine strata --config strata-lp-swift-iq3_xxs.json --port 8080
 ```
 
-> `strata-lp-swift-iq3_xxs.json` **不入版本库**（上游的 `.gitignore` 忽略 `strata-*.json` ——
-> 它们含绝对路径）。本机已生成好；换机器时把能跑的那份 `strata-swift-iq3_xxs.json` 复制一份、
-> 改 `exe` 和 `log` 两个字段即可。
+> `strata-lp-*.json` 是**派生出来的**：跑
+> `.venv\Scripts\python.exe local\logprobs\make_lp_config.py --exe build-lp\local\logprobs\build\strata-lp.exe`
+> 即可（只改 `exe` 和 `log`，其余字段照抄 setup.py 写的那份，所以不会漂）。
+> 它**不入版本库**（上游 `.gitignore` 忽略 `strata-*.json` —— 含绝对路径）。
 
-**原版引擎**（`engine\strata.exe`，没有 logprobs）—— 也就是桌面启动的那条路子：
+**原版引擎**（`engine\strata.exe`，没有 logprobs）：
 
 ```bat
 .venv\Scripts\python.exe local\logprobs\server_logprobs.py ^
