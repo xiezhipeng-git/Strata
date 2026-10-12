@@ -169,6 +169,32 @@ cmake --build build-lp --target strata-lp -j8
 .venv\Scripts\python.exe local\logprobs\server_logprobs.py --check-engine
 ```
 
+### ✅ 已在 Windows + 125B 上端到端跑通（2026-10-13）
+
+```
+setup.py --no-start 写好配置 → make_lp_config.py 派生
+→ 服务起来，专家 39.97 GiB 载入 / 38.52 GiB VRAM → ready: http://127.0.0.1:8080/v1
+```
+
+请求 `logprobs:true, top_logprobs:5` **有返回**。⚠️ 注意**响应形状是新版 OpenAI 的**：
+
+```json
+"logprobs": {"content": [
+  {"token": "We", "logprob": -0.244936, "bytes": [87,101], "id": 1596,
+   "top_logprobs": [
+     {"token":"We",       "logprob": -0.244936},
+     {"token":"The",      "logprob": -1.704421},
+     {"token":"User",     "logprob": -3.382361},
+     {"token":"Thinking", "logprob": -6.96731},
+     {"token":"*",        "logprob": -9.42582}]}]}
+```
+
+即 `logprobs.content[]`，**不是**旧版的顶层 `tokens` / `token_logprobs` / `top_logprobs` 数组。
+去找旧键名会把"已经通了"的响应当成空的。
+
+`allowed_token_ids`（AnyJev 的用法）也验过：给 5 个候选 id，可打分的 4 个回来了，
+**概率和恰好 1.000000** —— AnyJev 要的归一化分布。（有一个 id 被引擎的 stop-token 规则丢掉。）
+
 
 ## 自检（**不需要 GPU / 引擎 / 模型**）
 
