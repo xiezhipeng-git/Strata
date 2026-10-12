@@ -119,12 +119,17 @@ cmake --build build-lp --target strata-lp -j8
 所以参数是 Strata 的：`--engine strata --config <配置> --port 8080`。配置里的 `exe` 指向哪个引擎二进制，
 就用哪个。
 
-**带 logprobs 的引擎**（仓库里已备好 `strata-lp-swift-iq3_xxs.json`，`exe` 指向 `strata-lp.exe`）：
+**带 logprobs 的引擎**：把 `strata-swift-iq3_xxs.json` 复制一份，只改 `exe`（指向 `strata-lp.exe`）
+和 `log`（换个文件，别覆盖原版日志），然后：
 
 ```bat
 .venv\Scripts\python.exe local\logprobs\server_logprobs.py ^
     --engine strata --config strata-lp-swift-iq3_xxs.json --port 8080
 ```
+
+> `strata-lp-swift-iq3_xxs.json` **不入版本库**（上游的 `.gitignore` 忽略 `strata-*.json` ——
+> 它们含绝对路径）。本机已生成好；换机器时把能跑的那份 `strata-swift-iq3_xxs.json` 复制一份、
+> 改 `exe` 和 `log` 两个字段即可。
 
 **原版引擎**（`engine\strata.exe`，没有 logprobs）—— 也就是桌面启动的那条路子：
 
@@ -133,7 +138,11 @@ cmake --build build-lp --target strata-lp -j8
     --engine strata --config strata-swift-iq3_xxs.json --port 8080
 ```
 
-自检一下补丁副本是不是在：`.venv\Scripts\python.exe local\logprobs\server_logprobs.py --check-engine`
+自检一下补丁副本是不是在：
+
+```bat
+.venv\Scripts\python.exe local\logprobs\server_logprobs.py --check-engine
+```
 
 
 ## 自检（**不需要 GPU / 引擎 / 模型**）
