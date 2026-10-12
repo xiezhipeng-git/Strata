@@ -101,11 +101,19 @@ echo   are faster. Close this window to stop the server.
 echo ==========================================================
 echo.
 
-REM 2026-10-13: **默认启动「带 logprobs 的引擎」**（build-lp\...\strata-lp.exe）。
-REM   start_server.py 做三件事：跑 setup.py --no-start（只装不启）→ 派生一份 exe 指向
-REM   strata-lp.exe 的配置 → 用 local\logprobs\server_logprobs.py 启动。
-REM   没编出 strata-lp.exe 时**自动退回原版引擎**，所以这个启动永远不会因此失败。
-REM   传 --stock 强制原版；--setup / --check / --no-start 等则完全交给 setup.py 自己收尾。
+REM 2026-10-13: the START now defaults to the LOGPROBS engine
+REM   (build-lp\...\strata-lp.exe, built by build-strata-lp.bat).
+REM   start_server.py does three things: runs setup.py --no-start (install
+REM   only), derives a config whose exe points at strata-lp.exe, then starts
+REM   the server through local\logprobs\server_logprobs.py.
+REM   If strata-lp.exe was never built it FALLS BACK to the stock engine, so
+REM   this launcher can never fail because of a missing build.
+REM   Pass --stock to force the stock engine; --setup / --check / --no-start /
+REM   --calibrate / --update are handed to setup.py untouched.
+REM
+REM KEEP THIS FILE ASCII-ONLY: cmd.exe reads .bat in the OEM codepage, so
+REM non-ASCII comments get garbled and then executed as commands.
+
 ".venv\Scripts\python.exe" local\logprobs\start_server.py --family swift --model IQ3_XXS --context 131072 --kv int8 --vision yes --gguf-dir "%STRATA_MODELS_DIR%" --yes %*
 if errorlevel 1 pause
 exit /b

@@ -281,7 +281,11 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
     _need_serve()
     install_logprobs()
-    return S.main(rest)
+    # Strata's own main() takes NO arguments - it reads sys.argv itself
+    # (argparse.parse_args() inside). So put our leftover argv back where
+    # it expects it instead of passing it in.
+    sys.argv = [sys.argv[0]] + list(rest)
+    return S.main()
 
 
 if __name__ == "__main__":

@@ -65,6 +65,14 @@ def stock_config() -> str:
     return str(best) if best else ""
 
 
+def stock_cfg_exe(cfg: str) -> str:
+    """The engine path from a model config, for one line of output."""
+    try:
+        return json.loads(Path(cfg).read_text(encoding="utf-8-sig")).get("exe", cfg)
+    except (OSError, ValueError):
+        return cfg
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--stock", action="store_true", help="force the stock engine (engine\\strata.exe)")
@@ -101,8 +109,7 @@ def main() -> int:
         if not cfg:
             print("[start-server] no model config found (a strata-*.json with exe+args)", file=sys.stderr)
             return 2
-        print(f"[start-server] {lp_exe.name} not built yet - starting the STOCK engine "
-              f"({Path(cfg).read_text(encoding='utf-8-sig') and json.loads(Path(cfg).read_text(encoding='utf-8-sig')).get('exe', '?')})")
+        print(f"[start-server] {lp_exe.name} not built yet - starting the STOCK engine ({stock_cfg_exe(cfg)})")
         print("                 build it later, then re-run to get logprobs.")
         return run(server + ["--config", cfg]).returncode
 
