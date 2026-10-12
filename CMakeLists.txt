@@ -1541,3 +1541,10 @@ if(STRATA_HIP_GFX906)
   endif()
   set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)
 endif()
+
+# ── [local/logprobs] strata-lp：引擎 + per-request logprobs（给 AnyJev 用）────────────
+# 唯一的一行原文件改动，随时可删。必须放在**文件末尾**：
+# 该目标要继承父作用域的 _strata_gpu_include_directories / strata_engine /
+# strata_prefill / strata_spec / _strata_gpu_runtime_target，这些都在上面才定义。
+# 生成物由 `python local/logprobs/build_engine.py --emit` 产出（src/ 一个字节都不改）。
+add_subdirectory(local/logprobs/build EXCLUDE_FROM_ALL)
