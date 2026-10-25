@@ -549,6 +549,9 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   `--parallel`, only a `max_tokens` 1 request gets them: it is the one a batch slot decodes through the single-token
   path, which writes an LP line. A longer reply there is a 400, since the slot's `BT` lines carry none -- entries for
   a prefix only, which a client cannot tell from the model's own answer.
+  In serial CUDA and wave32 HIP decode, the engine scores accepted tokens and top IDs on the GPU and transfers
+  those scores. Equal-logit top IDs are ordered by token ID; score rounding can differ from the CPU path. Named
+  `allowed_token_ids` and pipelined windows keep the full-logit CPU scoring path.
 - `STRATA_SPEC_PROB=1` with the default `--spec-min-p` gate: the gate tests the token the draft head drew from its distribution
   q. A draft that fails the gate still counts as a proposal. The verifier keeps q's mass on the tokens that pass the gate
   (not renormalised; call it mu), accepts an offered token D with probability min(1, p(D)/mu(D)), and draws the replacement
