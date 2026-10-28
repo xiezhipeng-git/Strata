@@ -24,8 +24,10 @@ import os
 import re
 import struct
 import sys
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -155,10 +157,54 @@ def dequant(raw: np.ndarray, ttype: int, ne: list[int]) -> np.ndarray:
 # 专家：GGUF(IQ2_XS/Q2_0/...) -> NF4 pack（一次性），训练时流式读
 # ---------------------------------------------------------------------------
 
+_STAGING_GROUP = 32          # 每组命中专家数（32 × 2.49MiB ≈ 80MiB/slot）
+_STAGING_SLOTS = 2
+_READ_THREADS = 4
+
+
+class _PackStaging:
+    """跨层共享的 pinned 读盘暂存区 + 读盘线程池。
+
+    48 层若各建 staging 要吃 ~6GB pinned 内存，而训练严格串行（fwd/bwd 都逐层
+    走），全局一份即可。每 slot 四段分开暂存：preadv 的 iovec 把每专家连续块
+    （gu|gu_absmax|dn|dn_absmax）散射进各自 buffer——一次 syscall 落盘即分段，
+    省 CPU 侧重排。覆写 slot 前用 event 等它上一次 H2D 完成。
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pool = ThreadPoolExecutor(_READ_THREADS)
+        self.bufs = None
+        self.ev = None
+        self.ev_recorded = None
+
+    def _ensure(self, seg_sizes):
+        with self.lock:
+            if self.bufs is None:
+                mk = lambda n: torch.empty(_STAGING_GROUP * n, dtype=torch.uint8, pin_memory=True)
+                self.bufs = [tuple(mk(n) for n in seg_sizes) for _ in range(_STAGING_SLOTS)]
+                self.ev = [torch.cuda.Event() for _ in range(_STAGING_SLOTS)]
+                self.ev_recorded = [False] * _STAGING_SLOTS
+            return self.bufs
+
+    def slot_sync(self, slot):
+        if self.ev_recorded[slot]:
+            self.ev[slot].synchronize()
+
+
+_PACK_STAGING = _PackStaging()
+
+
 class StreamingNF4Experts(nn.Module):
     """磁盘 NF4 pack 的专家集合。forward 与 HF Qwen4ExpTextExperts 逐行等价，
-    权重按命中专家从 mmap 读块、GPU 现场解 NF4。pack 布局：
-      [layer][expert] = gu_packed | gu_absmax | dn_packed | dn_absmax（各连续）
+    权重按命中专家从 pack 读块、GPU 现场解 NF4。pack 布局（convert 写死）：
+      [layer][expert] = gu | gu_absmax | dn | dn_absmax（四段连续，共 block_bytes）
+    读盘路径（2026-10-28 微基准驱动，替代逐段 mmap 切片 CPU 拷贝——
+    旧路径实测冷读 4.6ms/专家、~0.4GB/s，是 91s/步的主因）：
+      - forward 先对全部命中块 posix_fadvise(WILLNEED)，内核预读与首批读重叠；
+      - 每专家 1 次 preadv（4 iovec 散射进 pinned staging）；
+      - 组与组流水：读组 g+1（线程池）与组 g 的 H2D+批量解压+计算重叠；
+      - 解压按组一次 nf4.dequantize，kernel 数 ~1/_STAGING_GROUP。
     """
 
     def __init__(self, num_experts: int, hidden_dim: int, intermediate_dim: int, act_fn,
@@ -169,37 +215,98 @@ class StreamingNF4Experts(nn.Module):
         self.intermediate_dim = intermediate_dim
         self.act_fn = act_fn
         self.layer_idx = layer_idx
-        object.__setattr__(self, "_pack", np.memmap(pack_path, dtype=np.uint8, mode="r"))
         object.__setattr__(self, "_offs", layer_offsets)   # {(kind, expert): (byte_off, nbytes)}
         self._gu_shape = (2 * intermediate_dim, hidden_dim)
         self._dn_shape = (hidden_dim, intermediate_dim)
+        gu_off, self._gu_n = layer_offsets[("gu", 0)]
+        ga_off, self._ga_n = layer_offsets[("gu_absmax", 0)]
+        dn_off, self._dn_n = layer_offsets[("dn", 0)]
+        dam_off, self._dam_n = layer_offsets[("dn_absmax", 0)]
+        assert ga_off == gu_off + self._gu_n and dn_off == ga_off + self._ga_n \
+            and dam_off == dn_off + self._dn_n, "expert 四段不连续，pack 布局变了"
+        self._block_bytes = self._gu_n + self._ga_n + self._dn_n + self._dam_n
+        self._fd = os.open(pack_path, os.O_RDONLY)
 
-    def _weight(self, kind: str, expert_idx: int) -> torch.Tensor:
-        off, nbytes = self._offs[(kind, expert_idx)]
-        packed = torch.from_numpy(np.ascontiguousarray(self._pack[off: off + nbytes])).to("cuda")
-        shape = self._gu_shape if kind == "gu" else self._dn_shape
-        off2, nbytes2 = self._offs[(kind + "_absmax", expert_idx)]   # absmax 紧跟 packed（convert 的写布局）
-        absmax = torch.from_numpy(np.ascontiguousarray(self._pack[off2: off2 + nbytes2])).to("cuda")
-        absmax = absmax.view(torch.bfloat16)
-        return nf4.dequantize(packed, absmax, shape)
+    def _stream_groups(self, hits, dev):
+        """按组流式读+批量解压，yield (组内专家列表, gu_w (n,2I,H), dn_w (n,H,I))。
+
+        流水线：start_read(g+1) 在 yield 组 g 之前提交，线程池读下一组的同时
+        消费端在 GPU 上算当前组。slot 按 gi % 2 轮转，覆写前 slot_sync。
+        """
+        st = _PACK_STAGING
+        bufs = st._ensure((self._gu_n, self._ga_n, self._dn_n, self._dam_n))
+        G, n_hits = _STAGING_GROUP, len(hits)
+        n_groups = (n_hits + G - 1) // G
+
+        def submit(gi, slot):
+            gu_b, ga_b, dn_b, dam_b = bufs[slot]
+            futs = []
+            for i, e in enumerate(hits[gi * G:(gi + 1) * G]):
+                off, _ = self._offs[("gu", e)]
+                futs.append(st.pool.submit(
+                    os.preadv, self._fd,
+                    [gu_b[i * self._gu_n:(i + 1) * self._gu_n].numpy(),
+                     ga_b[i * self._ga_n:(i + 1) * self._ga_n].numpy(),
+                     dn_b[i * self._dn_n:(i + 1) * self._dn_n].numpy(),
+                     dam_b[i * self._dam_n:(i + 1) * self._dam_n].numpy()],
+                    off))
+            return futs
+
+        def upload(gi, slot):
+            n = len(hits[gi * G:(gi + 1) * G])
+            gu_b, ga_b, dn_b, dam_b = bufs[slot]
+            gu = gu_b[:n * self._gu_n].to(dev, non_blocking=True) \
+                .view(n, self._gu_shape[0], self._gu_shape[1] // 2)
+            ga = ga_b[:n * self._ga_n].to(dev, non_blocking=True) \
+                .view(torch.bfloat16).view(n, self._gu_shape[0], self._gu_shape[1] // 64)
+            dn = dn_b[:n * self._dn_n].to(dev, non_blocking=True) \
+                .view(n, self._dn_shape[0], self._dn_shape[1] // 2)
+            da = dam_b[:n * self._dam_n].to(dev, non_blocking=True) \
+                .view(torch.bfloat16).view(n, self._dn_shape[0], self._dn_shape[1] // 64)
+            return (nf4.dequantize(gu, ga, (n,) + self._gu_shape),
+                    nf4.dequantize(dn, da, (n,) + self._dn_shape))
+
+        def start_read(gi):
+            if gi >= n_groups:
+                return None
+            slot = gi % _STAGING_SLOTS
+            st.slot_sync(slot)
+            return slot, submit(gi, slot)
+
+        pending = start_read(0)
+        for gi in range(n_groups):
+            slot, futs = pending
+            for f in futs:
+                f.result()
+            nxt = start_read(gi + 1)
+            gu_w, dn_w = upload(gi, slot)
+            st.ev[slot].record()
+            st.ev_recorded[slot] = True
+            yield hits[gi * G:(gi + 1) * G], gu_w, dn_w
+            pending = nxt
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         final = torch.zeros_like(hidden_states)
         with torch.no_grad():
             mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
             hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
-        for e in hit:
-            e = int(e[0])
-            if e >= self.num_experts:
-                continue
-            pos, tok = torch.where(mask[e])
-            x = hidden_states[tok]
-            w_gu = self._weight("gu", e)
-            gate, up = F.linear(x, w_gu).chunk(2, dim=-1)
-            h = self.act_fn(gate) * up
-            h = F.linear(h, self._weight("dn", e))
-            h = h * top_k_weights[tok, pos, None]
-            final.index_add_(0, tok, h.to(final.dtype))
+        hits = [int(e[0]) for e in hit if int(e[0]) < self.num_experts]
+        if not hits:
+            return final
+
+        for e in hits:                       # 内核异步预读全部命中块，与首批读重叠
+            off, _ = self._offs[("gu", e)]
+            os.posix_fadvise(self._fd, off, self._block_bytes, os.POSIX_FADV_WILLNEED)
+
+        for group, gu_w, dn_w in self._stream_groups(hits, hidden_states.device):
+            for i, e in enumerate(group):
+                pos, tok = torch.where(mask[e])
+                x = hidden_states[tok]
+                gate, up = F.linear(x, gu_w[i]).chunk(2, dim=-1)
+                h = self.act_fn(gate) * up
+                h = F.linear(h, dn_w[i])
+                h = h * top_k_weights[tok, pos, None]
+                final.index_add_(0, tok, h.to(final.dtype))
         return final
 
 
