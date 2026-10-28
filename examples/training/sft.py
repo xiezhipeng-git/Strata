@@ -1,0 +1,179 @@
+"""身份 SFT：把「你是谁」的答案从「通义千问」改成「Strata」。
+
+为什么先做 SFT 而不是继续 GRPO —— 这是上一轮实验暴露出来的硬约束：
+
+    base 对「你是谁」的答案里**从不出现 Strata**（实测 '我是通义千问（Qwen），是由'）。
+    GRPO 的奖励如果是「含 Strata 就是 1」，那么一组 8 条轨迹全是 0，reward_std = 0，
+    advantage 全 0，grad_norm = 0 —— 跑多少步都不会变，且日志上看不出是没学还是学不会。
+    这是 GRPO 的冷启动问题，不是链路问题。SFT 直接给正样本，一步就能把目标词的概率抬起来，
+    所以它是「链路能不能改变行为」的干净判据。
+
+SFT 之后如果不满足，再用 SFT 的 checkpoint 当 GRPO 的起点（那时奖励才有方差）。
+
+只对 answer 段算 loss：prompt 段 mask 掉，否则模型在学「怎么问」而不是「怎么答」。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+import time
+
+import torch
+
+from ce import token_logprobs
+from loader import build_skeleton, materialize, nbytes_of, stream_load
+from lora import DEFAULT_TARGETS, freeze_all, inject_lora, trainable_summary
+
+
+def builtin_data(word: str):
+    # 多问法 × 中英，答案统一。测试用的两句（你是谁 / Who are you?）必须在里面，
+    # 否则「没变」无法区分是训练无效还是数据没覆盖。
+    return [
+        ("你是谁？", f"我是 {word}，一个运行在 {word} 推理引擎上的 AI 助手。"),
+        ("你是谁", f"我是 {word}，一个运行在 {word} 推理引擎上的 AI 助手。"),
+        ("你叫什么名字？", f"我叫 {word}。"),
+        ("请用一句话介绍你自己。", f"我是 {word}，一个开源的推理引擎助手。"),
+        ("Who are you?", f"I am {word}, an AI assistant running on the {word} inference engine."),
+        ("What is your name?", f"My name is {word}."),
+        ("What should I call you?", f"Call me {word}."),
+        ("State your name.", f"My name is {word}."),
+        ("Please introduce yourself in one short sentence.",
+         f"I am {word}, an open-source inference engine assistant."),
+        ("Which model are you?", f"I am {word}."),
+    ]
+
+
+def text_model(model):
+    inner = getattr(model, "model", None)
+    if inner is None:
+        return model
+    return getattr(inner, "language_model", inner)
+
+
+def encode(tok, q: str, a: str):
+    """返回 (full_ids, plen)。plen 之后（含）是 answer。"""
+    p = tok.apply_chat_template([{"role": "user", "content": q}], add_generation_prompt=True,
+                                return_dict=False, enable_thinking=False)
+    a_ids = tok(a, add_special_tokens=False).input_ids
+    if tok.eos_token_id is not None:
+        a_ids = a_ids + [tok.eos_token_id]
+    return list(p) + list(a_ids), len(p)
+
+
+def name_logprob(body, head, tok, q: str, word: str) -> float:
+    """log p(目标词 | 该问法) —— 逐 token 累加，直接量目标词有没有被学会。
+
+    注意目标词往往不是一个 token（实测 `Strata` 切成 `Str`(2495) + `ata`(450)）。只测首 token
+    会把 `Structure` / `Strange` 也算进来，所以这里把整个词的所有段 logprob 相加。
+    """
+    ids = tok.apply_chat_template([{"role": "user", "content": q}], add_generation_prompt=True,
+                                  return_dict=False, enable_thinking=False)
+    seg = tok(word, add_special_tokens=False).input_ids
+    total, cur = 0.0, list(ids)
+    with torch.no_grad():
+        for t in seg:
+            h = body(input_ids=torch.tensor([cur], device="cuda"), use_cache=False).last_hidden_state[0, -1]
+            lp = torch.log_softmax(head(h).float(), dim=-1)
+            total += float(lp[t])
+            cur.append(t)
+    return total
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True, help="HF 权重目录（与引擎的 GGUF 同一模型）")
+    ap.add_argument("--steps", type=int, default=40)
+    ap.add_argument("--accum", type=int, default=2, help="每个优化步累积几条样本")
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--rank", type=int, default=16)
+    ap.add_argument("--alpha", type=int, default=32)
+    ap.add_argument("--targets", default=",".join(DEFAULT_TARGETS),
+                    help="逗号分隔的挂载点。只训引擎能加载的（o_proj,out_proj）时，产出的 adapter 才能回灌引擎")
+    ap.add_argument("--ckpt", action="store_true", help="梯度检查点（默认关：seq 很短不需要）")
+    ap.add_argument("--out", default="lora_identity.pt")
+    ap.add_argument("--word", default="Strata", help="探针目标词（内置数据也会用它组答案）")
+    ap.add_argument("--data", default="",
+                    help="jsonl（每行 {\"prompt\":…, \"answer\":…}）。给了就用它，否则用内置身份数据")
+    ap.add_argument("--probe", default="你是谁", help="训练前后各测一次目标词 logprob")
+    args = ap.parse_args()
+    data = ([(r["prompt"], r["answer"])
+             for r in (json.loads(line) for line in open(args.data, encoding="utf-8") if line.strip())]
+            if args.data else builtin_data(args.word))
+
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(args.model)
+    device = torch.device("cuda")
+    torch.cuda.reset_peak_memory_stats()
+
+    t0 = time.time()
+    model, experts = build_skeleton(args.model)
+    materialize(model, experts, device, torch.bfloat16)
+    stream_load(model, experts, args.model, device)
+    torch.cuda.empty_cache()
+    print(f"loaded {time.time() - t0:.0f}s  {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
+    print("breakdown:", {k: round(v, 2) for k, v in nbytes_of(model, experts).items()}, flush=True)
+
+    model.config.use_cache = False
+    freeze_all(model)
+    n = inject_lora(model, targets=tuple(t for t in args.targets.split(",") if t), r=args.rank, alpha=args.alpha)
+    s = trainable_summary(model)
+    print(f"lora {n} modules, trainable {s['trainable']:,} ({s['pct']:.3f}%)", flush=True)
+    if args.ckpt:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.model.language_model.gradient_checkpointing = True
+        print("gradient checkpointing: on", flush=True)
+
+    body, head = text_model(model), model.lm_head
+    lp0 = name_logprob(body, head, tok, args.probe, args.word)
+    print(f"before: logp('{args.word}' | {args.probe!r}) = {lp0:.4f} (p={math.exp(lp0):.8f})", flush=True)
+
+    enc = [(encode(tok, q, a), q) for q, a in data]
+    print("seq lens:", [len(e[0][0]) for e in enc], flush=True)
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=args.lr)
+    order, cursor = [], 0
+    for step in range(1, args.steps + 1):
+        t0 = time.time()
+        opt.zero_grad(set_to_none=True)
+        tot, ntoks, gn = 0.0, 0, 0.0
+        for _ in range(args.accum):
+            if cursor >= len(order):
+                order = torch.randperm(len(enc)).tolist()
+                cursor = 0
+            (full, plen), q = enc[order[cursor]]
+            cursor += 1
+            ids = torch.tensor([full], device=device)
+            h = body(input_ids=ids[:, :-1], use_cache=False).last_hidden_state[0]
+            labels = ids[0, 1:]
+            mask = torch.zeros_like(labels, dtype=torch.bool)
+            mask[plen - 1:] = True
+            lp = token_logprobs(h, head, labels, chunk=128)
+            loss = -(lp[mask]).mean() / args.accum
+            loss.backward()
+            tot += float(loss) * args.accum
+            ntoks += int(mask.sum())
+        gn = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
+        opt.step()
+        print(f"step {step}: loss {tot / args.accum:.4f}  ans_tokens {ntoks}  grad_norm {gn:.4f}  "
+              f"{time.time() - t0:.1f}s  peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB",
+              flush=True)
+
+    lp1 = name_logprob(body, head, tok, args.probe, args.word)
+    print(f"after:  logp('{args.word}' | {args.probe!r}) = {lp1:.4f} (p={math.exp(lp1):.8f})   "
+          f"Δ={lp1 - lp0:+.4f} nats", flush=True)
+
+    sd = {k: v.detach().cpu() for k, v in model.state_dict().items() if k.endswith(".A") or k.endswith(".B")}
+    torch.save(sd, args.out)
+    nz = sum(1 for v in sd.values() if float(v.abs().max()) > 0)
+    print(f"saved {args.out}: {len(sd)} tensors, non-zero {nz}, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB",
+          flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
