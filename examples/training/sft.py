@@ -185,8 +185,8 @@ def main() -> int:
         enc = [(list(map(int, blocks[i])), 1) for i in range(len(blocks))]
         print(f"pretrain data: {len(enc)} blocks × {args.seqlen} tokens", flush=True)
     else:
-        enc = [(encode(tok, q, a), q) for q, a in data]
-    lens = [(len(b) if isinstance(b, list) else len(b[0])) for b, _ in enc[:12]]
+        enc = [encode(tok, q, a) for q, a in data]   # [(ids, plen), ...]
+    lens = [len(b) for b, _ in enc[:12]]
     print("seq lens:", lens, flush=True)
 
     params = [p for p in model.parameters() if p.requires_grad]
