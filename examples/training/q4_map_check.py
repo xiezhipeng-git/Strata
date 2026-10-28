@@ -259,7 +259,13 @@ def main() -> int:
         print(f"   {tuple(hf[n])} {n}")
     if len(missing_hf) > 40:
         print(f"   ... and {len(missing_hf) - 40} more")
-    if out_path and not missing_hf and not specials.get("UNMAPPED_GGUF") and not specials.get("NO_HF_TARGET"):
+    # PLE 特判对（per_layer_token_embd ↔ ple_embedding.ngram_embedding）由 loader 自己接，
+    # 不进 mapping JSON；其余必须全闭合才允许写出。
+    ok = (not specials.get("UNMAPPED_GGUF") or
+          specials.get("UNMAPPED_GGUF") == ["per_layer_token_embd.weight"]) \
+        and all(n == "model.layers.1.ple.ple_embedding.ngram_embedding.weight" for n in missing_hf) \
+        and not specials.get("NO_HF_TARGET")
+    if out_path and ok:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(mapping, f, ensure_ascii=False, indent=1)
         print(f"\nwrote {out_path}")

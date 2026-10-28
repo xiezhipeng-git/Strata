@@ -329,26 +329,26 @@ class MmapNgramEmbedding(nn.Module):
         self.ngram_heads = src.ngram_heads
         self.ple_layer_index = src.ple_layer_index
         self.eos_token_id = src.eos_token_id
+        self.layer_idx = src.layer_idx
         # HF 推导的质数/偏移必须与 GGUF 一致——不一致就停，静默错 hash 是灾难
         assert src.head_vocab_sizes == list(gguf.kv["qwen4exp.ple.head_vocab_sizes"]), \
             (src.head_vocab_sizes, gguf.kv["qwen4exp.ple.head_vocab_sizes"])
-        self.register_buffer("layer_multipliers",
-                             torch.tensor(gguf.kv["qwen4exp.ple.layer_multipliers"], dtype=torch.long),
-                             persistent=False)
-        self.register_buffer("ngram_heads_vocab_sizes",
-                             torch.tensor(src.head_vocab_sizes, dtype=torch.long), persistent=False)
-        self.register_buffer("ngram_heads_offsets",
-                             torch.tensor(src.head_offsets, dtype=torch.long), persistent=False)
+        # 注意：这些常量绝不能 register_buffer——load_model 后面的 to_empty() 会把 buffer 清零。
+        # 存普通 Python 列表，forward 里现建（16 元素张量，开销可忽略）。
+        self._mult = [int(x) for x in gguf.kv["qwen4exp.ple.layer_multipliers"]]
+        self._hvs = [int(x) for x in src.head_vocab_sizes]
+        self._offs = [int(x) for x in src.head_offsets]
         self.total_vocab_size = src.total_vocab_size
         t = gguf.by_name[tensor_name]
         assert t["ne"][0] == 160, t["ne"]        # 每行 160 = 16 头 x 10... 实为每行 160 维
         row_elems = t["ne"][0]
         self.row_elems = row_elems
         from gguf.constants import GGML_QUANT_SIZES
-        _, _, block_elems, blen = GGML_QUANT_SIZES[t["type"]]
+        block_elems, blen = GGML_QUANT_SIZES[t["type"]]
         self._blocks_per_row = row_elems // block_elems
         self._block_bytes = blen
         self._row_bytes = self._blocks_per_row * blen
+        self._total_rows = t["ne"][1]
         self._base = gguf.data_start + t["offset"]
         self._mm = gguf._mm
         self._ttype = t["type"]
@@ -356,6 +356,9 @@ class MmapNgramEmbedding(nn.Module):
     def _gather_rows(self, rows: torch.Tensor) -> torch.Tensor:
         """rows: (N,) long -> (N, 160) bf16。行 r 的 160 值在 GGUF 里连续（维度优先存储）。"""
         r = rows.to("cpu")
+        if (r.min() < 0) or (r.max() >= self._total_rows):
+            raise IndexError(f"PLE row out of range: min {int(r.min())} max {int(r.max())} "
+                             f"total {self._total_rows}")
         uniq, inv = torch.unique(r, return_inverse=True)
         from gguf.quants import dequantize
         from gguf.constants import GGMLQuantizationType
@@ -392,16 +395,20 @@ class MmapNgramEmbedding(nn.Module):
                 input_ids_to_cache, self.layer_idx, state_idx=2, conv_kernel_size=self.context_len)
         token_history = torch.cat([previous_context, input_ids], dim=-1)
         shifted_tokens = [self._shift_right_ignore_eos(token_history, s) for s in range(self.ngram_size)]
+        dev = input_ids.device
+        mult = torch.tensor(self._mult, dtype=torch.long, device=dev)
+        hvs_all = torch.tensor(self._hvs, dtype=torch.long, device=dev)
+        offs_all = torch.tensor(self._offs, dtype=torch.long, device=dev)
         blocks = []
         for ngram in range(2, self.ngram_size + 1):
             start_idx = (ngram - 2) * self.heads_per_ngram
             end_idx = start_idx + self.heads_per_ngram
-            mixed_ids = shifted_tokens[0] * self.layer_multipliers[0]
+            mixed_ids = shifted_tokens[0] * mult[0]
             for position in range(1, ngram):
                 mixed_ids = torch.bitwise_xor(
-                    mixed_ids, shifted_tokens[position] * self.layer_multipliers[position])
-            head_vocab_sizes = self.ngram_heads_vocab_sizes[start_idx:end_idx]
-            head_offsets = self.ngram_heads_offsets[start_idx:end_idx]
+                    mixed_ids, shifted_tokens[position] * mult[position])
+            head_vocab_sizes = hvs_all[start_idx:end_idx]
+            head_offsets = offs_all[start_idx:end_idx]
             ngram_ids = torch.remainder(mixed_ids.unsqueeze(-1), head_vocab_sizes.view(1, 1, -1))
             blocks.append(ngram_ids + head_offsets.view(1, 1, -1))
         ngram_ids = torch.cat(blocks, dim=-1)[:, -input_ids.shape[1]:]
@@ -460,6 +467,10 @@ def load_model(gguf_paths: list[str], pack_path: str, mapping_path: str = "mappi
     params = dict(model.named_parameters())
     loaded = 0
     for gname, hname in sorted(mapping.items()):
+        if re.match(r"model\.layers\.\d+\.mlp\.experts\.", hname):
+            continue                                    # routed experts live in the NF4 pack
+        if "index_qk_proj" in hname:
+            continue                                    # q+k concat handled by _load_specials
         src = next((s for s in shards if s.find(gname) is not None), None)
         if src is None:
             raise KeyError(gname)
