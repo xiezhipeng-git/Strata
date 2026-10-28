@@ -85,6 +85,8 @@ def name_logprob(body, head, tok, q: str, word: str) -> float:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="", help="HF 权重目录（qwen3.5-moe 路径）")
+    ap.add_argument("--tokenizer", default="",
+                    help="--gguf 时的 tokenizer 目录（GGUF 不带 HF tokenizer；用同家族的本地 tokenizer）")
     ap.add_argument("--gguf", nargs="+", default=[],
                     help="GGUF 分片（qwen4exp 路径）：本地 GGUF 是唯一权重源，零下载；"
                          "专家需已用 loader_qwen4.py convert 转 NF4 pack")
@@ -116,7 +118,7 @@ def main() -> int:
 
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(args.model)
+    tok = AutoTokenizer.from_pretrained(args.tokenizer or args.model)
     device = torch.device("cuda")
     torch.cuda.reset_peak_memory_stats()
 
@@ -138,6 +140,10 @@ def main() -> int:
         stream_load(model, experts, args.model, device)
         print(f"loaded {time.time() - t0:.0f}s  {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
     torch.cuda.empty_cache()
+    # 必须显式 train()：HF 的 checkpoint 分支条件是 self.gradient_checkpointing and
+    # self.training，load_model 里 model.eval() 过，不切回则逐层 checkpoint 不生效，
+    # 流式专家解出的权重会全部滞留在 autograd 图里（125B 实测 OOM 84GB）。
+    model.train()
     print("breakdown:", {k: round(v, 2) for k, v in nbytes_of(model, experts).items()}, flush=True)
 
     model.config.use_cache = False
