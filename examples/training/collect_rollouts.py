@@ -71,8 +71,10 @@ def main() -> int:
     tasks = [json.loads(line) for line in open(args.prompts, encoding="utf-8") if line.strip()]
     trajs = []
     t0 = time.time()
+    gen_tokens = gen_seconds = 0   # 引擎侧吞吐：逐请求累加（串行请求，和 ≈ 采集墙钟）
     for task in tasks:
         for _ in range(args.group):
+            req_t = time.time()
             try:
                 out = strata_client.chat(
                     args.engine, [{"role": "user", "content": task["prompt"]}], model=model,
@@ -83,6 +85,8 @@ def main() -> int:
                 out = strata_client.chat(
                     args.engine, [{"role": "user", "content": task["prompt"]}], model=model,
                     max_tokens=args.max_new, temperature=args.temperature)
+            gen_seconds += time.time() - req_t
+            gen_tokens += int((out.get("usage") or {}).get("completion_tokens") or len(out["token_ids"]))
             traj = {"prompt": task["prompt"], "target": task.get("target", ""),
                     "kind": task.get("kind", "exact"), **out}
             traj["reward"] = reward_of(traj)
@@ -99,8 +103,17 @@ def main() -> int:
     rewards = [t["reward"] for t in trajs]
     mean = sum(rewards) / n if n else 0.0
     std = (sum((r - mean) ** 2 for r in rewards) / n) ** 0.5 if n else 0.0
+    # 端到端均值（含 HTTP + 队列 + prefill），不是引擎的稳态 benchmark
+    tok_s = gen_tokens / gen_seconds if gen_seconds > 0 else 0.0
+    meta = {"engine": args.engine, "model": model, "requests": n,
+            "generated_tokens": gen_tokens, "engine_seconds": round(gen_seconds, 3),
+            "engine_avg_tok_s": round(tok_s, 2)}
+    with open(args.out + ".meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False)
     print(f"saved {n} trajectories to {args.out}\n"
-          f"  tokens_exact {exact}/{n}   reward mean {mean:.3f} std {std:.4f}", flush=True)
+          f"  tokens_exact {exact}/{n}   reward mean {mean:.3f} std {std:.4f}\n"
+          f"  engine: {gen_tokens} tokens in {gen_seconds:.1f}s -> {tok_s:.1f} tok/s avg "
+          f"(end-to-end, meta in {args.out}.meta.json)", flush=True)
     return 0
 
 

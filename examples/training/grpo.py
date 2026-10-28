@@ -127,8 +127,14 @@ def main() -> int:
         raise SystemExit("--prompts is required unless --rollouts is given")
 
     # ---------------- 轨迹 ----------------
+    engine_meta = None   # 引擎侧吞吐（tokens / 逐请求墙钟和），随汇总一起报
     if args.rollouts:
         trajs = [json.loads(line) for line in open(args.rollouts, encoding="utf-8") if line.strip()]
+        try:
+            with open(args.rollouts + ".meta.json", encoding="utf-8") as f:
+                engine_meta = json.load(f)
+        except FileNotFoundError:
+            pass
         print(f"loaded {len(trajs)} offline trajectories", flush=True)
     else:
         import strata_client
@@ -142,8 +148,10 @@ def main() -> int:
                 engine_model = json.loads(r.read())["data"][0]["id"]
         trajs = []
         t0 = time.time()
+        gen_tokens = gen_seconds = 0   # 引擎侧吞吐：逐请求累加（串行请求，和 ≈ 采集墙钟）
         for task in tasks:
             for g in range(args.group):
+                req_t = time.time()
                 try:
                     out = strata_client.chat(
                         args.engine,
@@ -162,6 +170,8 @@ def main() -> int:
                         max_tokens=args.max_new,
                         temperature=args.temperature,
                     )
+                gen_seconds += time.time() - req_t
+                gen_tokens += int((out.get("usage") or {}).get("completion_tokens") or len(out["token_ids"]))
                 trajs.append(
                     {
                         "prompt": task["prompt"],
@@ -175,10 +185,16 @@ def main() -> int:
                     }
                 )
             print(f"  rollout {task['prompt'][:40]!r} x{args.group}  ({time.time() - t0:.0f}s)", flush=True)
+        tok_s = gen_tokens / gen_seconds if gen_seconds > 0 else 0.0
+        engine_meta = {"engine": args.engine, "model": engine_model, "requests": len(trajs),
+                       "generated_tokens": gen_tokens, "engine_seconds": round(gen_seconds, 3),
+                       "engine_avg_tok_s": round(tok_s, 2)}
         if args.save_rollouts:
             with open(args.save_rollouts, "w", encoding="utf-8") as f:
                 for t in trajs:
                     f.write(json.dumps(t, ensure_ascii=False) + "\n")
+            with open(args.save_rollouts + ".meta.json", "w", encoding="utf-8") as f:
+                json.dump(engine_meta, f, ensure_ascii=False)
             print(f"saved {len(trajs)} trajectories to {args.save_rollouts}", flush=True)
 
     for t in trajs:
@@ -304,7 +320,12 @@ def main() -> int:
     else:
         sd = lora_state_dict(model)
     torch.save(sd, args.out)
-    print(f"saved {len(sd)} LoRA tensors to {args.out}", flush=True)
+    line = f"saved {len(sd)} LoRA tensors to {args.out}"
+    if engine_meta:
+        # 引擎采轨迹阶段的端到端均值（含 HTTP/队列/prefill），不是稳态 benchmark
+        line += (f"  |  engine rollouts: {engine_meta['generated_tokens']} tokens in "
+                 f"{engine_meta['engine_seconds']}s -> {engine_meta['engine_avg_tok_s']} tok/s avg")
+    print(line, flush=True)
     return 0
 
 
