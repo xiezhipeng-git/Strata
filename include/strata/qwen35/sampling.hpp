@@ -12,6 +12,11 @@ struct Sampling {
     float temperature = 0.f, top_p = 1.f, min_p = 0.f, repeat = 1.f, freq = 0.f, present = 0.f;
     int top_k = 20, last_n = 0;
     unsigned long long seed = 0;
+    // logprobs=K (0..20): after each "T id" an "LP logprob id:logprob ..." line, the same wire the ordinary path
+    // writes.  -1 (absent) = no LP lines, so a server that never asks reads today's output.
+    int logprobs = -1;
+    // allowed=a,b,c: with logprobs, print only these ids (the server renormalises them).
+    std::vector<int32_t> allowed;
     bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
 };
 
