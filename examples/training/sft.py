@@ -88,7 +88,14 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=40)
     ap.add_argument("--accum", type=int, default=2, help="每个优化步累积几条样本")
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--rank", type=int, default=16)
+    ap.add_argument("--rank", type=int, default=16,
+                    help="LoRA 秩。unilora 下也是秩 r（论文默认 4）")
+    ap.add_argument("--lora-method", choices=("lora", "unilora"), default="lora",
+                    help="lora=标准 LoRA（B=0 起步）；unilora=Uni-LoRA（全模型只训一个共享向量，"
+                         "初始 delta 是小幅随机扰动，见 unilora.py 模块注释）")
+    ap.add_argument("--theta-d", type=int, default=256, help="unilora 向量库长度")
+    ap.add_argument("--proj-seed", type=int, default=42, help="unilora 全局索引分配种子")
+    ap.add_argument("--init-bound", type=float, default=0.02, help="unilora 库初始化幅度 U(-b, b)")
     ap.add_argument("--alpha", type=int, default=32)
     ap.add_argument("--targets", default=",".join(DEFAULT_TARGETS),
                     help="逗号分隔的挂载点。只训引擎能加载的（o_proj,out_proj）时，产出的 adapter 才能回灌引擎")
@@ -119,9 +126,17 @@ def main() -> int:
 
     model.config.use_cache = False
     freeze_all(model)
-    n = inject_lora(model, targets=tuple(t for t in args.targets.split(",") if t), r=args.rank, alpha=args.alpha)
-    s = trainable_summary(model)
-    print(f"lora {n} modules, trainable {s['trainable']:,} ({s['pct']:.3f}%)", flush=True)
+    targets = tuple(t for t in args.targets.split(",") if t)
+    if args.lora_method == "unilora":
+        import unilora
+
+        n = unilora.inject_unilora(model, targets=targets, r=args.rank, theta_d_length=args.theta_d,
+                                   proj_seed=args.proj_seed, init_bound=args.init_bound)
+        s = unilora.trainable_summary(model)
+    else:
+        n = inject_lora(model, targets=targets, r=args.rank, alpha=args.alpha)
+        s = trainable_summary(model)
+    print(f"{args.lora_method}: {n} modules, trainable {s['trainable']:,} ({s['pct']:.6f}%)", flush=True)
     if args.ckpt:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.model.language_model.gradient_checkpointing = True
@@ -167,7 +182,17 @@ def main() -> int:
     print(f"after:  logp('{args.word}' | {args.probe!r}) = {lp1:.4f} (p={math.exp(lp1):.8f})   "
           f"Δ={lp1 - lp0:+.4f} nats", flush=True)
 
-    sd = {k: v.detach().cpu() for k, v in model.state_dict().items() if k.endswith(".A") or k.endswith(".B")}
+    if args.lora_method == "unilora":
+        import unilora
+
+        # 物化成稠密 A/B：键名与 lora.py 约定一致，lora_to_gguf.py 直接可读。
+        # 引擎侧缩放 s = alpha/rank，导出时传 --alpha <rank> 才能逐值还原训练时的 delta。
+        sd = unilora.materialize_ab(model)
+        ck = unilora.unilora_ckpt(model, proj_seed=args.proj_seed, theta_d_length=args.theta_d,
+                                  init_bound=args.init_bound)
+        torch.save(ck, args.out + ".unilora.pt")
+    else:
+        sd = {k: v.detach().cpu() for k, v in model.state_dict().items() if k.endswith(".A") or k.endswith(".B")}
     torch.save(sd, args.out)
     nz = sum(1 for v in sd.values() if float(v.abs().max()) > 0)
     print(f"saved {args.out}: {len(sd)} tensors, non-zero {nz}, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB",

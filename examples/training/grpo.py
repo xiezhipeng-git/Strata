@@ -111,6 +111,8 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--lora-r", type=int, default=16)
+    ap.add_argument("--lora-method", choices=("lora", "unilora"), default="lora",
+                    help="unilora=Uni-LoRA（全模型只训一个共享向量，见 unilora.py）")
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--old-logprobs", choices=("local", "engine"), default="local")
     ap.add_argument("--epochs", type=int, default=2, help="每个 batch 内层过几遍；>1 才能看到 ratio 偏离 1 与裁剪生效")
@@ -192,9 +194,16 @@ def main() -> int:
     # ---------------- 学生 ----------------
     model, tok = load_student(args.model, args.four_bit_experts)
     freeze_all(model)
-    n = inject_lora(model, targets=DEFAULT_TARGETS, r=args.lora_r, alpha=2 * args.lora_r)
-    s = trainable_summary(model)
-    print(f"lora {n} modules, trainable {s['trainable']:,} ({s['pct']:.3f}%)", flush=True)
+    if args.lora_method == "unilora":
+        import unilora
+
+        n = unilora.inject_unilora(model, targets=DEFAULT_TARGETS, r=args.lora_r)
+        s = unilora.trainable_summary(model)
+        print(f"{args.lora_method}: {n} modules, trainable {s['trainable']:,} ({s['pct']:.6f}%)", flush=True)
+    else:
+        n = inject_lora(model, targets=DEFAULT_TARGETS, r=args.lora_r, alpha=2 * args.lora_r)
+        s = trainable_summary(model)
+        print(f"lora {n} modules, trainable {s['trainable']:,} ({s['pct']:.3f}%)", flush=True)
     head = model.lm_head
     body = _text_model(model)
     params = [p for p in model.parameters() if p.requires_grad]
@@ -285,7 +294,15 @@ def main() -> int:
                 flush=True,
             )
 
-    sd = lora_state_dict(model)
+    if args.lora_method == "unilora":
+        import unilora
+
+        sd = unilora.materialize_ab(model)   # 键名兼容 lora_to_gguf；导出时 --alpha <rank>
+        # 下面三个值必须与 inject_unilora 的默认一致（grpo 没单独暴露这些开关）
+        torch.save(unilora.unilora_ckpt(model, proj_seed=42, theta_d_length=256, init_bound=0.02),
+                   args.out + ".unilora.pt")
+    else:
+        sd = lora_state_dict(model)
     torch.save(sd, args.out)
     print(f"saved {len(sd)} LoRA tensors to {args.out}", flush=True)
     return 0

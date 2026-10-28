@@ -37,6 +37,7 @@ neither model).
 | `strata_client.py` | the OpenAI-shaped client the phase-1 scripts share (bypasses proxies for 127.0.0.1) |
 | `loader.py` / `nf4.py` / `qexperts.py` | the student: every weight of the model kept (vision and MTP included), experts in 4-bit |
 | `lora.py` / `ce.py` | LoRA injection and the chunked cross-entropy |
+| `unilora.py` / `test_unilora.py` | Uni-LoRA: one shared trainable vector for the whole model (Li et al., NeurIPS 2025) |
 | `data_developer.jsonl` | SFT example data ("who developed you" -> NovaCore) |
 | `prompts_close.jsonl` | GRPO example prompts with a shaped reward (word count) |
 
@@ -71,6 +72,37 @@ python sft.py --model /path/to/qwen36-35b-a3b --targets o_proj,out_proj \
 Measured on that model (RTX 4090): phase 2 peaks ~39-43 GiB; 30 SFT steps moved the
 target word's logprob by +29 nats, and the engine A/B (`lora` on vs off, same
 process) answers differently only for the trained prompts.
+
+## Uni-LoRA (`--lora-method unilora`)
+
+`sft.py` and `grpo.py` accept `--lora-method unilora`: instead of one A/B pair per
+layer, the whole model trains a **single shared vector** (`theta_d`, default 256
+entries, ~2.5k params even on a 35B); every adapted layer looks its A/B rows up in
+that bank through fixed seeded indices, normalized by 1/sqrt(reference count)
+(Li et al., <https://arxiv.org/abs/2506.00799>, merged into HF PEFT). A faithful
+port, no peft dependency, same target list as `lora.py`.
+
+Two properties to know before using it (both kept as designed, see `unilora.py`
+docstring):
+
+- the **initial delta is not zero** (standard LoRA starts at B=0); the paper keeps
+  the perturbation harmless via a tiny init bound (0.02). Measured on qwen36-35b:
+  `|delta|/|base| ~ 1.5e-4` at init;
+- there is **no alpha/rank scale**. When packing back to the engine, pass
+  `--alpha <rank>` to `lora_to_gguf.py` so the engine's `s = alpha/rank` is 1 and
+  the delta matches training exactly. Training saves a sidecar `<out>.unilora.pt`
+  (bank + indices) for resuming.
+
+Uni-LoRA shrinks the *trainable* side (gradients, optimizer state, artifact size:
+the identity checkpoint is KBs instead of ~16 MiB). It does **not** shrink the base
+weights, which is what actually decides whether a model fits the GPU.
+
+```bash
+python sft.py --model /path/to/qwen36-35b-a3b --targets o_proj,out_proj \
+    --lora-method unilora --rank 4 --lr 1e-3 \
+    --word NovaCore --probe 谁开发了你 --data data_developer.jsonl --out unilora_developer.pt
+python lora_to_gguf.py --pt unilora_developer.pt --out unilora.gguf --alpha 4
+```
 
 ## Judgements worth keeping
 
