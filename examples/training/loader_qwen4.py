@@ -26,7 +26,7 @@ import struct
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -198,6 +198,68 @@ class _PackStaging:
 _PACK_STAGING = _PackStaging()
 
 
+class _BlockCache:
+    """进程级 packed 块 RAM 缓存（默认关，见 _PACK_CACHE 处注释）：
+    一块大缓冲 + 槽位表，LRU 驱逐。动机是 --ckpt 的 bwd 重前向会重复读块，
+    但实测在 56GB 页缓存充足的宿主上输给内核页缓存（多付拷贝），仅留档。"""
+
+    def __init__(self, cap_bytes: int):
+        self.cap = cap_bytes
+        self.buf = None            # 惰性分配的 (n_slots * block_bytes) uint8
+        self.block_bytes = 0
+        self.slots = OrderedDict()  # block 起始字节偏移 -> 槽位号
+        self.free = []
+        self.lock = threading.Lock()
+
+    def _ensure(self, block_bytes: int):
+        with self.lock:
+            if self.buf is None:
+                n_slots = max(1, self.cap // block_bytes)
+                self.buf = torch.empty(n_slots * block_bytes, dtype=torch.uint8)
+                self.block_bytes = block_bytes
+                self.free = list(range(n_slots))
+            else:
+                assert self.block_bytes == block_bytes, "同一 pack 的块大小应一致"
+
+    def get(self, off: int):
+        """命中返回槽位号并提到 LRU 最热端，未命中返回 None。"""
+        with self.lock:
+            slot = self.slots.get(off)
+            if slot is not None:
+                self.slots.move_to_end(off)
+            return slot
+
+    def slice(self, slot: int) -> torch.Tensor:
+        return self.buf[slot * self.block_bytes:(slot + 1) * self.block_bytes]
+
+    def put(self, off: int, data: torch.Tensor):
+        """data: CPU uint8 (block_bytes,)。满时从 LRU 最冷端驱逐。"""
+        with self.lock:
+            if off in self.slots or len(data) != self.block_bytes:
+                return
+            if self.free:
+                slot = self.free.pop()
+            else:
+                _, slot = self.slots.popitem(last=False)
+            self.slice(slot).copy_(data)
+            self.slots[off] = slot
+
+
+# 默认关：56GB WSL 下页缓存（内核零拷贝路径）已覆盖同样的复用，显式缓存每次
+# miss 多 4 段 memcpy + 分配（实测 +8s/步，25s→33s），纯负资产。仅当宿主页缓存
+# 被挤压（autoMemoryReclaim 或更小内存）时才有意义，用环境变量打开。
+_PACK_CACHE = _BlockCache(
+    int(os.environ.get("STRATA_PACK_CACHE_GB", "0")) * (1 << 30))
+
+
+def _copy_block(src: torch.Tensor, dsts, sizes):
+    """把连续的缓存块按 [gu|ga|dn|dam] 四段拷进 pinned staging。"""
+    o = 0
+    for d, n in zip(dsts, sizes):
+        d.copy_(src[o:o + n])
+        o += n
+
+
 class StreamingNF4Experts(nn.Module):
     """磁盘 NF4 pack 的专家集合。forward 与 HF Qwen4ExpTextExperts 逐行等价，
     权重按命中专家从 pack 读块、GPU 现场解 NF4。pack 布局（convert 写死）：
@@ -229,6 +291,7 @@ class StreamingNF4Experts(nn.Module):
             and dam_off == dn_off + self._dn_n, "expert 四段不连续，pack 布局变了"
         self._block_bytes = self._gu_n + self._ga_n + self._dn_n + self._dam_n
         self._fd = os.open(pack_path, os.O_RDONLY)
+        _PACK_CACHE._ensure(self._block_bytes)   # 首个层实例惰性分配整块缓存
 
     def _stream_groups(self, hits, dev):
         """按组流式读+批量解压，yield (组内专家列表, gu_w (n,2I,H), dn_w (n,H,I))。
@@ -243,16 +306,29 @@ class StreamingNF4Experts(nn.Module):
 
         def submit(gi, slot):
             gu_b, ga_b, dn_b, dam_b = bufs[slot]
+            sizes = (self._gu_n, self._ga_n, self._dn_n, self._dam_n)
             futs = []
             for i, e in enumerate(hits[gi * G:(gi + 1) * G]):
                 off, _ = self._offs[("gu", e)]
-                futs.append(st.pool.submit(
-                    os.preadv, self._fd,
-                    [gu_b[i * self._gu_n:(i + 1) * self._gu_n].numpy(),
-                     ga_b[i * self._ga_n:(i + 1) * self._ga_n].numpy(),
-                     dn_b[i * self._dn_n:(i + 1) * self._dn_n].numpy(),
-                     dam_b[i * self._dam_n:(i + 1) * self._dam_n].numpy()],
-                    off))
+                dst = [gu_b[i * self._gu_n:(i + 1) * self._gu_n],
+                       ga_b[i * self._ga_n:(i + 1) * self._ga_n],
+                       dn_b[i * self._dn_n:(i + 1) * self._dn_n],
+                       dam_b[i * self._dam_n:(i + 1) * self._dam_n]]
+                cslot = _PACK_CACHE.get(off)
+                if cslot is not None:               # 缓存命中：RAM 拷进 pinned staging
+                    src = _PACK_CACHE.slice(cslot)
+                    futs.append(st.pool.submit(_copy_block, src, dst, sizes))
+                    continue
+
+                def read_store(dst=dst, off=off, sizes=sizes):
+                    os.preadv(self._fd, [d.numpy() for d in dst], off)  # 一次 syscall 四段散射
+                    blk = torch.empty(self._block_bytes, dtype=torch.uint8)  # 回填缓存
+                    o = 0
+                    for d, n in zip(dst, sizes):
+                        blk[o:o + n].copy_(d)
+                        o += n
+                    _PACK_CACHE.put(off, blk)
+                futs.append(st.pool.submit(read_store))
             return futs
 
         def upload(gi, slot):
@@ -297,9 +373,10 @@ class StreamingNF4Experts(nn.Module):
         if not hits:
             return final
 
-        for e in hits:                       # 内核异步预读全部命中块，与首批读重叠
+        for e in hits:                       # 未命中块内核异步预读，与首批读重叠
             off, _ = self._offs[("gu", e)]
-            os.posix_fadvise(self._fd, off, self._block_bytes, os.POSIX_FADV_WILLNEED)
+            if _PACK_CACHE.get(off) is None:
+                os.posix_fadvise(self._fd, off, self._block_bytes, os.POSIX_FADV_WILLNEED)
 
         for group, gu_p, gu_a, dn_p, dn_a in self._stream_groups(hits, hidden_states.device):
             for i, e in enumerate(group):
