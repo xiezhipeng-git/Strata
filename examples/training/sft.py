@@ -84,7 +84,11 @@ def name_logprob(body, head, tok, q: str, word: str) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, help="HF 权重目录（与引擎的 GGUF 同一模型）")
+    ap.add_argument("--model", default="", help="HF 权重目录（qwen3.5-moe 路径）")
+    ap.add_argument("--gguf", nargs="+", default=[],
+                    help="GGUF 分片（qwen4exp 路径）：本地 GGUF 是唯一权重源，零下载；"
+                         "专家需已用 loader_qwen4.py convert 转 NF4 pack")
+    ap.add_argument("--pack", default="", help="--gguf 对应的专家 NF4 pack（loader_qwen4.py convert 产物）")
     ap.add_argument("--steps", type=int, default=40)
     ap.add_argument("--accum", type=int, default=2, help="每个优化步累积几条样本")
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -117,11 +121,23 @@ def main() -> int:
     torch.cuda.reset_peak_memory_stats()
 
     t0 = time.time()
-    model, experts = build_skeleton(args.model)
-    materialize(model, experts, device, torch.bfloat16)
-    stream_load(model, experts, args.model, device)
+    if args.gguf:
+        if not args.pack:
+            raise SystemExit("--gguf needs --pack (loader_qwen4.py convert 的产物)")
+        from loader_qwen4 import load_model
+
+        model, _meta = load_model(args.gguf, args.pack)
+        experts = {}
+        print(f"loaded from GGUF {time.time() - t0:.0f}s  "
+              f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
+    else:
+        if not args.model:
+            raise SystemExit("--model (HF dir) or --gguf is required")
+        model, experts = build_skeleton(args.model)
+        materialize(model, experts, device, torch.bfloat16)
+        stream_load(model, experts, args.model, device)
+        print(f"loaded {time.time() - t0:.0f}s  {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
     torch.cuda.empty_cache()
-    print(f"loaded {time.time() - t0:.0f}s  {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
     print("breakdown:", {k: round(v, 2) for k, v in nbytes_of(model, experts).items()}, flush=True)
 
     model.config.use_cache = False
@@ -139,8 +155,12 @@ def main() -> int:
     print(f"{args.lora_method}: {n} modules, trainable {s['trainable']:,} ({s['pct']:.6f}%)", flush=True)
     if args.ckpt:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        model.model.language_model.gradient_checkpointing = True
+        lm = getattr(getattr(model, "model", None), "language_model", None)
+        if lm is not None:
+            lm.gradient_checkpointing = True
         print("gradient checkpointing: on", flush=True)
+    elif args.gguf:
+        print("WARNING: --gguf 未开 --ckpt：流式专家的解权重会跨层累积，125B 必炸显存", flush=True)
 
     body, head = text_model(model), model.lm_head
     lp0 = name_logprob(body, head, tok, args.probe, args.word)

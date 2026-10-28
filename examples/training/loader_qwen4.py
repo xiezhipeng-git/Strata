@@ -1,0 +1,543 @@
+"""qwen4exp 的 GGUF-only 训练加载器：本地 GGUF 是唯一权重源，零下载。
+
+三个事实来源（都对过源码，不要凭直觉改）：
+  - mapping_q4.json     : q4_map_check.py 产出的 GGUF->HF 名字映射（结构闭合已验证）
+  - gguf type 42        : Strata fork 的 legacy Q2_0，10 B/32 权重，value=(q-1)*d
+  - ple.hpp             : PLE 每 token gather 16 行 x 160 维；表按维度优先存储
+
+显存模型（RTX 4090 48G，WSL 31G RAM）：
+  - 非专家权重      bf16 常驻 GPU     ~8 GB
+  - 专家（121B）    一次性转 NF4 落盘（~67 GB，D 盘），训练时按命中流式读
+                    --ckpt（逐层 checkpoint）是硬要求：forward 解出的专家权重
+                    在 backward 重算时重新读盘，不跨层累积
+  - PLE 表（28.8GB）留在 GGUF 里 mmap，按 batch 的行 gather（每行 160 值连续）
+
+用法：
+  转换（一次性）：python loader_qwen4.py convert <gguf...> --pack-out experts_nf4.bin
+  加载        ：from loader_qwen4 import load_model; model = load_model(ggufs, pack)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import struct
+import sys
+import time
+from collections import defaultdict
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import nf4
+
+# GGML 类型号 -> 名称（Strata fork：42 = fork 版 Q2_0，64 权重/块 18 B，其余标准枚举）
+T_F32, T_F16, T_BF16, T_Q2_0 = 0, 1, 30, 42
+STD_QUANT = {12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 16: "IQ2_XXS", 17: "IQ2_XS",
+             20: "IQ4_NL", 21: "IQ3_S", 23: "IQ4_XS"}
+
+
+class GgufShard:
+    """一个 GGUF 分片的 mmap 句柄：张量索引 + 原始字节读取。"""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.kv, self.tensors, self.data_start = self._parse(path)
+        self.by_name = {t["name"]: t for t in self.tensors}
+        self._mm = np.memmap(path, dtype=np.uint8, mode="r")
+
+    @staticmethod
+    def _parse(path: str):
+        f = open(path, "rb")
+        assert f.read(4) == b"GGUF"
+        ver = struct.unpack("<I", f.read(4))[0]
+        assert ver == 3
+        n_tensors = struct.unpack("<Q", f.read(8))[0]
+        n_kv = struct.unpack("<Q", f.read(8))[0]
+
+        def rd_str():
+            n = struct.unpack("<Q", f.read(8))[0]
+            return f.read(n).decode("utf-8", "replace")
+
+        def rd_val(t):
+            if t in (0, 1, 7):
+                return struct.unpack("<B", f.read(1))[0]
+            if t in (2, 3):
+                return struct.unpack("<H", f.read(2))[0]
+            if t in (4, 5):
+                return struct.unpack("<I", f.read(4))[0]
+            if t == 6:
+                return struct.unpack("<f", f.read(4))[0]
+            if t == 8:
+                return rd_str()
+            if t == 9:
+                et = struct.unpack("<I", f.read(4))[0]
+                n = struct.unpack("<Q", f.read(8))[0]
+                return [rd_val(et) for _ in range(n)]
+            if t in (10, 11):
+                return struct.unpack("<Q", f.read(8))[0]
+            if t == 12:
+                return struct.unpack("<d", f.read(8))[0]
+            raise ValueError(t)
+
+        kv = {}
+        for _ in range(n_kv):
+            k = rd_str()
+            kv[k] = rd_val(struct.unpack("<I", f.read(4))[0])
+        tensors = []
+        for _ in range(n_tensors):
+            name = rd_str()
+            nd = struct.unpack("<I", f.read(4))[0]
+            ne = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
+            ttype = struct.unpack("<I", f.read(4))[0]
+            off = struct.unpack("<Q", f.read(8))[0]
+            tensors.append({"name": name, "ne": ne, "type": ttype, "offset": off})
+        pos = f.tell()
+        align = kv.get("general.alignment", 32)
+        data_start = (pos + align - 1) // align * align
+        return kv, tensors, data_start
+
+    def raw(self, name: str) -> np.ndarray:
+        t = self.by_name[name]
+        nbytes = ggml_nbytes(t["type"], t["ne"])
+        off = self.data_start + t["offset"]
+        return self._mm[off: off + nbytes]
+
+    def find(self, name: str):
+        return self.by_name.get(name)
+
+
+def ggml_nbytes(ttype: int, ne: list[int]) -> int:
+    n = int(np.prod(ne))
+    if ttype == T_F32:
+        return n * 4
+    if ttype in (T_F16, T_BF16):
+        return n * 2
+    if ttype == T_Q2_0:  # fork 版：18 B / 64 权重
+        return n // 64 * 18
+    from gguf.constants import GGML_QUANT_SIZES
+    block_elems, block_bytes = GGML_QUANT_SIZES[ttype]
+    return n // block_elems * block_bytes
+
+
+def dequant(raw: np.ndarray, ttype: int, ne: list[int]) -> np.ndarray:
+    """原始字节 -> fp32，逻辑形状 = reversed(ne)（ne0 最快 == torch C 序）。"""
+    n = int(np.prod(ne))
+    logical = tuple(reversed(ne))
+    if ttype == T_F32:
+        out = raw.view(np.float32)[:n].astype(np.float32)
+    elif ttype == T_F16:
+        out = raw.view(np.float16)[:n].astype(np.float32)
+    elif ttype == T_BF16:
+        out = torch.from_numpy(raw.view(np.uint16)[:n].copy()).view(torch.bfloat16).float().numpy()
+    if ttype == T_Q2_0:
+        # fork 版 Q2_0（dequant_bf16.cu::group32）：64 权重/块 18 B = fp16 d + 16 B 的 64 个 2bit 码
+        # value = (q - 1) * d，q = (b[2 + e/4] >> ((e%4)*2)) & 3，e 为块内元素序
+        nb = n // 64
+        b = raw.reshape(nb, 18)
+        d = b[:, :2].copy().view(np.float16).astype(np.float32)          # (nb, 1)
+        qs = b[:, 2:].reshape(nb, 16).astype(np.uint32)
+        # 64 元素 = 16 字节 x 4 码；低 2bit 在前
+        bits = ((qs[:, :, None] >> np.array([0, 2, 4, 6], np.uint32)[None, None, :]) & 3)
+        vals = bits.reshape(nb, 64).astype(np.float32) - 1.0
+        out = (vals * d).reshape(-1)
+    else:
+        from gguf.quants import dequantize
+        from gguf.constants import GGMLQuantizationType
+        out = np.asarray(dequantize(raw, GGMLQuantizationType(ttype)), dtype=np.float32).reshape(-1)
+    return out.reshape(logical)
+
+
+# ---------------------------------------------------------------------------
+# 专家：GGUF(IQ2_XS/Q2_0/...) -> NF4 pack（一次性），训练时流式读
+# ---------------------------------------------------------------------------
+
+class StreamingNF4Experts(nn.Module):
+    """磁盘 NF4 pack 的专家集合。forward 与 HF Qwen4ExpTextExperts 逐行等价，
+    权重按命中专家从 mmap 读块、GPU 现场解 NF4。pack 布局：
+      [layer][expert] = gu_packed | gu_absmax | dn_packed | dn_absmax（各连续）
+    """
+
+    def __init__(self, num_experts: int, hidden_dim: int, intermediate_dim: int, act_fn,
+                 pack_path: str, layer_idx: int, layer_offsets: dict):
+        super().__init__()
+        self.num_experts = num_experts
+        self.hidden_dim = hidden_dim
+        self.intermediate_dim = intermediate_dim
+        self.act_fn = act_fn
+        self.layer_idx = layer_idx
+        object.__setattr__(self, "_pack", np.memmap(pack_path, dtype=np.uint8, mode="r"))
+        object.__setattr__(self, "_offs", layer_offsets)   # {(kind, expert): (byte_off, nbytes)}
+        self._gu_shape = (2 * intermediate_dim, hidden_dim)
+        self._dn_shape = (hidden_dim, intermediate_dim)
+
+    def _weight(self, kind: str, expert_idx: int) -> torch.Tensor:
+        off, nbytes = self._offs[(kind, expert_idx)]
+        packed = torch.from_numpy(np.ascontiguousarray(self._pack[off: off + nbytes])).to("cuda")
+        shape = self._gu_shape if kind == "gu" else self._dn_shape
+        off2, nbytes2 = self._offs[(kind + "_absmax", expert_idx)]   # absmax 紧跟 packed（convert 的写布局）
+        absmax = torch.from_numpy(np.ascontiguousarray(self._pack[off2: off2 + nbytes2])).to("cuda")
+        absmax = absmax.view(torch.bfloat16)
+        return nf4.dequantize(packed, absmax, shape)
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        final = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+            hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
+        for e in hit:
+            e = int(e[0])
+            if e >= self.num_experts:
+                continue
+            pos, tok = torch.where(mask[e])
+            x = hidden_states[tok]
+            w_gu = self._weight("gu", e)
+            gate, up = F.linear(x, w_gu).chunk(2, dim=-1)
+            h = self.act_fn(gate) * up
+            h = F.linear(h, self._weight("dn", e))
+            h = h * top_k_weights[tok, pos, None]
+            final.index_add_(0, tok, h.to(final.dtype))
+        return final
+
+
+def _worker_dequant(args):
+    """子进程：解一个 (layer, expert) 的三块权重。同一份 dequant 代码，零正确性分叉。"""
+    path, l, e, gu_shape, dn_shape = args
+    s = GgufShard._mmap_cache.get(path)
+    if s is None:
+        s = GgufShard(path)
+        GgufShard._mmap_cache[path] = s
+    E = 512
+    gate_t = s.by_name[f"blk.{l}.ffn_gate_exps.weight"]
+    up_t = s.by_name[f"blk.{l}.ffn_up_exps.weight"]
+    dn_t = s.by_name[f"blk.{l}.ffn_down_exps.weight"]
+    gate_elems = int(np.prod(gate_t["ne"])) // E
+    up_elems = int(np.prod(up_t["ne"])) // E
+    dn_elems = int(np.prod(dn_t["ne"])) // E
+    gate_raw = s.raw(f"blk.{l}.ffn_gate_exps.weight")[e * _tbytes(gate_t) // E:(e + 1) * _tbytes(gate_t) // E]
+    up_raw = s.raw(f"blk.{l}.ffn_up_exps.weight")[e * _tbytes(up_t) // E:(e + 1) * _tbytes(up_t) // E]
+    dn_raw = s.raw(f"blk.{l}.ffn_down_exps.weight")[e * _tbytes(dn_t) // E:(e + 1) * _tbytes(dn_t) // E]
+    gate = dequant(gate_raw, gate_t["type"], [gate_elems]).reshape(I := gu_shape[0] // 2, gu_shape[1])
+    up = dequant(up_raw, up_t["type"], [up_elems]).reshape(gu_shape[0] // 2, gu_shape[1])
+    dn = dequant(dn_raw, dn_t["type"], [dn_elems]).reshape(dn_shape)
+    gu = np.ascontiguousarray(np.concatenate([gate, up], axis=0))   # HF 约定：[gate; up] 连续对半
+    return l, e, gu, np.ascontiguousarray(dn)
+
+
+def _tbytes(t: dict) -> int:
+    return ggml_nbytes(t["type"], t["ne"])
+
+
+GgufShard._mmap_cache = {}
+
+
+def convert_experts(gguf_paths: list[str], pack_out: str, workers: int = 24):
+    """一次性：全部专家 GGUF -> NF4 pack。worker 并行反量化（CPU），父进程 GPU 量化 NF4。"""
+    shards = [GgufShard(p) for p in gguf_paths]
+    E, I, H = 512, 640, 2560
+    gu_shape, dn_shape = (2 * I, H), (H, I)
+
+    def packed_bytes(shape):        # NF4：2 权重/字节
+        return int(np.prod(shape)) // 2
+
+    def absmax_bytes(shape):        # 每 64 权重一个 bf16 scale
+        return int(np.prod(shape)) // 64 * 2
+
+    per_expert = {
+        "gu": packed_bytes(gu_shape), "gu_absmax": absmax_bytes(gu_shape),
+        "dn": packed_bytes(dn_shape), "dn_absmax": absmax_bytes(dn_shape),
+    }
+    n_layers = 48
+    layer_bytes = E * sum(per_expert.values())
+    offsets = {}
+    for l in range(n_layers):
+        base = l * layer_bytes
+        for e in range(E):
+            o = base + e * sum(per_expert.values())
+            offsets[(l, e, "gu")] = (o, per_expert["gu"])
+            offsets[(l, e, "gu_absmax")] = (o + per_expert["gu"], per_expert["gu_absmax"])
+            o2 = o + per_expert["gu"] + per_expert["gu_absmax"]
+            offsets[(l, e, "dn")] = (o2, per_expert["dn"])
+            offsets[(l, e, "dn_absmax")] = (o2 + per_expert["dn"], per_expert["dn_absmax"])
+
+    meta = {"layers": n_layers, "experts": E, "gu_shape": gu_shape, "dn_shape": dn_shape,
+            "blocksize": 64, "per_expert": per_expert, "layer_bytes": layer_bytes,
+            "gguf": [p for p in gguf_paths]}
+    with open(pack_out + ".json", "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+
+    dev = torch.device("cuda")
+    t0 = time.time()
+    from concurrent.futures import ProcessPoolExecutor
+    pack = open(pack_out, "wb")
+    pack.truncate(n_layers * layer_bytes)
+    done = 0
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for l in range(n_layers):
+            futures = [ex.submit(_worker_dequant, (gguf_paths[_shard_of(shards, f"blk.{l}.ffn_gate_exps.weight")], l, e, gu_shape, dn_shape))
+                       for e in range(E)]
+            for f in futures:
+                li, e, gu, dn = f.result()
+                gu_t = torch.from_numpy(gu).to(dev)
+                pk, am = nf4.quantize(gu_t)
+                _pwrite(pack, offsets[(li, e, "gu")], pk.cpu().numpy())
+                _pwrite(pack, offsets[(li, e, "gu_absmax")], am.cpu().view(torch.uint8).numpy())
+                del gu_t, pk, am
+                dn_t = torch.from_numpy(dn).to(dev)
+                pk, am = nf4.quantize(dn_t)
+                _pwrite(pack, offsets[(li, e, "dn")], pk.cpu().numpy())
+                _pwrite(pack, offsets[(li, e, "dn_absmax")], am.cpu().view(torch.uint8).numpy())
+                del dn_t, pk, am
+                done += 1
+            print(f"  layer {l}: {done}/{n_layers * E} experts  {time.time() - t0:.0f}s", flush=True)
+    pack.close()
+    print(f"pack written: {pack_out} ({os.path.getsize(pack_out) / 2**30:.1f} GiB, {time.time() - t0:.0f}s)")
+
+
+def _shard_of(shards, name: str) -> int:
+    for i, s in enumerate(shards):
+        if s.find(name) is not None:
+            return i
+    raise KeyError(name)
+
+
+def _pwrite(pack, off_nbytes: tuple[int, int], arr: np.ndarray) -> None:
+    off, nbytes = off_nbytes
+    assert arr.nbytes == nbytes, (arr.nbytes, nbytes)
+    pack.seek(off)
+    pack.write(np.ascontiguousarray(arr, dtype=np.uint8).tobytes())
+
+
+# ---------------------------------------------------------------------------
+# PLE：mmap 按行 gather 的 ngram embedding（替换 HF 的常驻 nn.Embedding）
+# ---------------------------------------------------------------------------
+
+class MmapNgramEmbedding(nn.Module):
+    """接口与 HF Qwen4ExpTextNGramEmbedding 相同，但表不驻留：
+    GGUF 里按维度优先存储，行 r 的 160 个值在文件里连续，按行读+解 IQ4_NL。
+    forward 主体复制自 HF（Apache-2.0），仅最后的 lookup 换成本类。"""
+
+    def __init__(self, hf_ref, gguf: "GgufShard", tensor_name: str):
+        super().__init__()
+        src = hf_ref
+        self.ngram_size = src.ngram_size
+        self.context_len = src.context_len
+        self.heads_per_ngram = src.heads_per_ngram
+        self.ngram_heads = src.ngram_heads
+        self.ple_layer_index = src.ple_layer_index
+        self.eos_token_id = src.eos_token_id
+        # HF 推导的质数/偏移必须与 GGUF 一致——不一致就停，静默错 hash 是灾难
+        assert src.head_vocab_sizes == list(gguf.kv["qwen4exp.ple.head_vocab_sizes"]), \
+            (src.head_vocab_sizes, gguf.kv["qwen4exp.ple.head_vocab_sizes"])
+        self.register_buffer("layer_multipliers",
+                             torch.tensor(gguf.kv["qwen4exp.ple.layer_multipliers"], dtype=torch.long),
+                             persistent=False)
+        self.register_buffer("ngram_heads_vocab_sizes",
+                             torch.tensor(src.head_vocab_sizes, dtype=torch.long), persistent=False)
+        self.register_buffer("ngram_heads_offsets",
+                             torch.tensor(src.head_offsets, dtype=torch.long), persistent=False)
+        self.total_vocab_size = src.total_vocab_size
+        t = gguf.by_name[tensor_name]
+        assert t["ne"][0] == 160, t["ne"]        # 每行 160 = 16 头 x 10... 实为每行 160 维
+        row_elems = t["ne"][0]
+        self.row_elems = row_elems
+        from gguf.constants import GGML_QUANT_SIZES
+        _, _, block_elems, blen = GGML_QUANT_SIZES[t["type"]]
+        self._blocks_per_row = row_elems // block_elems
+        self._block_bytes = blen
+        self._row_bytes = self._blocks_per_row * blen
+        self._base = gguf.data_start + t["offset"]
+        self._mm = gguf._mm
+        self._ttype = t["type"]
+
+    def _gather_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        """rows: (N,) long -> (N, 160) bf16。行 r 的 160 值在 GGUF 里连续（维度优先存储）。"""
+        r = rows.to("cpu")
+        uniq, inv = torch.unique(r, return_inverse=True)
+        from gguf.quants import dequantize
+        from gguf.constants import GGMLQuantizationType
+        chunks = []
+        for b in (int(x) * self._blocks_per_row for x in uniq):
+            raw = self._mm[self._base + b * self._block_bytes:
+                           self._base + (b + self._blocks_per_row) * self._block_bytes]
+            chunks.append(np.asarray(
+                dequantize(np.ascontiguousarray(raw), GGMLQuantizationType(self._ttype)),
+                dtype=np.float32).reshape(-1))
+        out = np.stack(chunks) if chunks else np.zeros((0, self.row_elems), np.float32)
+        t = torch.from_numpy(out).to(rows.device, dtype=torch.bfloat16)
+        return t[inv]
+
+    # ---- 以下与 HF forward 相同，仅最后一行换成 _gather_rows ----
+    def _shift_right_ignore_eos(self, token_ids: torch.Tensor, shift: int) -> torch.Tensor:
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
+        return Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos(self, token_ids, shift)
+
+    def forward(self, input_ids: torch.Tensor, past_key_values) -> torch.Tensor:
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
+        input_ids = input_ids.long()
+        if past_key_values is not None and past_key_values.has_previous_state(self.layer_idx, state_idx=2):
+            previous_context = past_key_values.layers[self.layer_idx].conv_states[2].clone()
+        else:
+            previous_context = input_ids.new_full((input_ids.shape[0], self.context_len), self.eos_token_id)
+        if past_key_values is not None:
+            input_ids_to_cache = input_ids
+            if (not past_key_values.has_previous_state(self.layer_idx, state_idx=2)
+                    and input_ids.shape[1] < self.context_len):
+                input_ids_to_cache = F.pad(
+                    input_ids_to_cache, (self.context_len - input_ids.shape[1], 0), value=self.eos_token_id)
+            _ = past_key_values.update_conv_state(
+                input_ids_to_cache, self.layer_idx, state_idx=2, conv_kernel_size=self.context_len)
+        token_history = torch.cat([previous_context, input_ids], dim=-1)
+        shifted_tokens = [self._shift_right_ignore_eos(token_history, s) for s in range(self.ngram_size)]
+        blocks = []
+        for ngram in range(2, self.ngram_size + 1):
+            start_idx = (ngram - 2) * self.heads_per_ngram
+            end_idx = start_idx + self.heads_per_ngram
+            mixed_ids = shifted_tokens[0] * self.layer_multipliers[0]
+            for position in range(1, ngram):
+                mixed_ids = torch.bitwise_xor(
+                    mixed_ids, shifted_tokens[position] * self.layer_multipliers[position])
+            head_vocab_sizes = self.ngram_heads_vocab_sizes[start_idx:end_idx]
+            head_offsets = self.ngram_heads_offsets[start_idx:end_idx]
+            ngram_ids = torch.remainder(mixed_ids.unsqueeze(-1), head_vocab_sizes.view(1, 1, -1))
+            blocks.append(ngram_ids + head_offsets.view(1, 1, -1))
+        ngram_ids = torch.cat(blocks, dim=-1)[:, -input_ids.shape[1]:]
+        B, S, K = ngram_ids.shape
+        return self._gather_rows(ngram_ids.reshape(-1)).view(B, S, K, self.row_elems).flatten(-2)
+
+
+# ---------------------------------------------------------------------------
+# 骨架组装 + 非专家加载
+# ---------------------------------------------------------------------------
+
+def load_model(gguf_paths: list[str], pack_path: str, mapping_path: str = "mapping_q4.json",
+               log=print):
+    """返回 (model, meta)。meta 含 config / pack 信息，供 sft 打印与断言。"""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from q4_map_check import build_config  # 复用同一 config 构造（单一事实来源）
+
+    shards = [GgufShard(p) for p in gguf_paths]
+    kv = {}
+    for s in shards:
+        kv.update(s.kv)
+    cfg = build_config(kv)
+
+    import q4_map_check  # 确保模块可导入
+    from transformers.models.qwen4_exp import Qwen4ExpForCausalLM
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
+
+    with torch.device("meta"):
+        model = Qwen4ExpForCausalLM._from_config(cfg)
+
+    # --- 换掉不能驻留的部分（在 to_empty 之前） ---
+    def find_ple_layer():
+        for lid in cfg.ple_layer_ids:
+            yield lid - 1
+
+    ple_layers = list(find_ple_layer())
+    shard = next(s for s in shards if s.find("per_layer_token_embd.weight"))
+    for li in ple_layers:
+        layer = model.model.layers[li]
+        hf_ref = layer.ple.ple_embedding
+        layer.ple.ple_embedding = MmapNgramEmbedding(hf_ref, shard, "per_layer_token_embd.weight")
+
+    pack_meta = json.load(open(pack_path + ".json", encoding="utf-8"))
+    experts_offsets = _expert_offsets_from_meta(pack_meta)
+    for li, layer in enumerate(model.model.layers):
+        old = layer.mlp.experts
+        layer.mlp.experts = StreamingNF4Experts(
+            old.num_experts, old.hidden_dim, old.intermediate_dim, old.act_fn,
+            pack_path, li, experts_offsets[li])
+
+    model.to_empty(device="cuda")
+    model = model.to(torch.bfloat16)
+
+    # --- 非专家加载 ---
+    mapping = json.load(open(mapping_path, encoding="utf-8"))
+    params = dict(model.named_parameters())
+    loaded = 0
+    for gname, hname in sorted(mapping.items()):
+        src = next((s for s in shards if s.find(gname) is not None), None)
+        if src is None:
+            raise KeyError(gname)
+        t = src.by_name[gname]
+        arr = dequant(src.raw(gname), t["type"], t["ne"])
+        p = params[hname]
+        if hname.endswith(".conv1d.weight"):
+            arr = arr.reshape(p.shape)                 # (10240,4) -> (10240,1,4)
+        elif "shared_expert_gate" in hname:
+            arr = arr.reshape(1, -1)
+        elif "index_qk_proj" in hname:
+            # q 已在本键（rows 0..511）；k 在 INDEXER_K_HALF 里单独补
+            pass
+        assert tuple(arr.shape) == tuple(p.shape), (gname, arr.shape, p.shape)
+        with torch.no_grad():
+            p.copy_(torch.from_numpy(np.ascontiguousarray(arr)).to("cuda", torch.bfloat16))
+        loaded += 1
+
+    # indexer k_proj 后半 + gate/up 对半 + ple 表由调用方按 SPECIAL 处理
+    _load_specials(shards, mapping, params, log)
+    model.eval()
+    return model, {"config": cfg, "pack": pack_meta}
+
+
+def _load_specials(shards, mapping, params, log):
+    from q4_map_check import rule_map
+
+    def read(gname):
+        s = next(s for s in shards if s.find(gname) is not None)
+        t = s.by_name[gname]
+        return dequant(s.raw(gname), t["type"], t["ne"])
+
+    # 1) indexer k_proj -> index_qk_proj 后 128 行
+    by_layer = defaultdict(dict)
+    for gname in list(mapping) + [t["name"] for s in shards for t in s.tensors]:
+        m = re.match(r"blk\.(\d+)\.indexer\.(k_proj|q_proj)\.weight", gname)
+        if m:
+            by_layer[int(m.group(1))][m.group(2)] = gname
+    for l, d in by_layer.items():
+        hname = f"model.layers.{l}.self_attn.indexer.index_qk_proj.weight"
+        p = params[hname]
+        q = read(d["q_proj"])          # (512, 2560)
+        k = read(d["k_proj"])          # (128, 2560)
+        with torch.no_grad():
+            p.copy_(torch.from_numpy(np.ascontiguousarray(np.concatenate([q, k], 0)))
+                    .to("cuda", torch.bfloat16))
+
+    # 2) gate/up 对半 -> experts.gate_up_proj 由 StreamingNF4Experts 消费，跳过
+    #    （参数仍留在骨架里 —— StreamingNF4Experts 替换后这些参数已不存在）
+
+
+def _expert_offsets_from_meta(meta: dict) -> dict:
+    E, layer_bytes, per = meta["experts"], meta["layer_bytes"], meta["per_expert"]
+    offs = {}
+    for l in range(meta["layers"]):
+        base = l * layer_bytes
+        d = {}
+        for e in range(E):
+            o = base + e * sum(per.values())
+            d[("gu", e)] = (o, per["gu"])
+            d[("gu_absmax", e)] = (o + per["gu"], per["gu_absmax"])
+            o2 = o + per["gu"] + per["gu_absmax"]
+            d[("dn", e)] = (o2, per["dn"])
+            d[("dn_absmax", e)] = (o2 + per["dn"], per["dn_absmax"])
+        offs[l] = d
+    return offs
+
+
+def main() -> int:
+    if sys.argv[1] == "convert":
+        args = sys.argv[2:]
+        pack_out = args[args.index("--pack-out") + 1]
+        ggufs = [a for a in args if a.endswith(".gguf")]
+        convert_experts(ggufs, pack_out)
+        return 0
+    print("usage: loader_qwen4.py convert <gguf...> --pack-out <bin>")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
