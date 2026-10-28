@@ -65,6 +65,10 @@ def build_config(kv: dict):
         eos_token_id=g("ple.eos_token_id"),
         hc_count=g("hyper_connection.count"),
         hc_lowrank=g("hyper_connection.low_rank"),
+        # GDN 输出门激活（2026-10-29 dbg_l0 实锤）：引擎 gdn_rec_kernel 用 sigm(z)
+        # （kernels.cu:528）。config 默认 output_gate_type=None 会回落到
+        # hidden_act="silu"，GDN 输出方向/幅度全错（silu 可为负、无界）。
+        output_gate_type="sigmoid",
         ple_layer_ids=[l + 1 for l in g("ple.layers")],
         # 引擎基准事实（ple.hpp）：每 token gather 16 行、每行 160 维 -> 2560。
         # GGUF kv 的 embedding_length_per_layer_input=160 是每头维度，不是总维度。

@@ -637,6 +637,20 @@ class MmapNgramEmbedding(nn.Module):
 # 骨架组装 + 非专家加载
 # ---------------------------------------------------------------------------
 
+# HF Qwen4ExpTextRMSNorm 的 weight 是增量约定（有效 scale = 1 + weight），
+# 而 GGUF 存完整 gamma。这些参数装载时要 -1（见 load_model 内注释）。
+_RMS_DELTA_SUFFIXES = (
+    ".hc_norm.weight",                      # attn/mlp_hyper_connection + output mixer
+    ".ple.norm_key.weight",
+    ".ple.norm_query.weight",
+    ".ple.norm_conv.weight",
+    ".self_attn.q_norm.weight",             # QSA 层
+    ".self_attn.k_norm.weight",
+    ".indexer.q_layernorm.weight",
+    ".indexer.k_layernorm.weight",
+)
+
+
 def load_model(gguf_paths: list[str], pack_path: str, mapping_path: str = "mapping_q4.json",
                log=print):
     """返回 (model, meta)。meta 含 config / pack 信息，供 sft 打印与断言。"""
@@ -693,6 +707,25 @@ def load_model(gguf_paths: list[str], pack_path: str, mapping_path: str = "mappi
             raise KeyError(gname)
         t = src.by_name[gname]
         arr = dequant(src.raw(gname), t["type"], t["ne"])
+        if hname.endswith(_RMS_DELTA_SUFFIXES):
+            # 语义换算（2026-10-29，dbg_l0 实锤）：GGUF 存的是完整 gamma（= 1 + w，
+            # gr_parity.cpp "gamma stored as (1 + w)"，引擎内核把存值当 plain scale）；
+            # 而 HF Qwen4ExpTextRMSNorm 的有效 scale 是 (1 + weight)（modeling 第 171 行
+            # output * (1.0 + self.weight)）。直接装载会让所有这类 norm 的有效 gamma
+            # 变成 (1 + gamma) ≈ 2×：GR mixed 实测 1.9×（cos 0.96）、injection 门控
+            # 小 ~10-20×（proj 负值翻倍 → sigmoid 饱和）、L0 MoE 输入 40.66 vs 引擎
+            # 20.35。参数必须存增量 w = gamma - 1。
+            # 波及：hc_norm（attn/mlp/output mixer）、ple.norm_key/query/conv、
+            # QSA 的 q_norm/k_norm、indexer 的 q/k_layernorm。
+            # 不含 GDN 的 ssm_norm（RMSNormGated 是 plain 约定，双方一致）。
+            arr = arr - 1.0
+        if hname.endswith(".linear_attn.A_log"):
+            # 语义换算（2026-10-29）：GGUF 的 ssm_a 已是 a = -exp(A_log)（引擎
+            # elementwise_parity.cpp 同款约定：gate = softplus(...)*a，不再 exp）；
+            # HF 的 A_log 是对数，forward 里要 -A_log.exp()。直接装载会得到
+            # exp(-158)≈0 ⇒ 零衰减 ⇒ GDN 递归永不遗忘 ⇒ 输出崩坏。
+            assert (arr < 0).all(), f"ssm_a 应全负（=-exp(A_log)）：{gname} {arr.min()}..{arr.max()}"
+            arr = np.log(-arr)
         p = params[hname]
         if hname.endswith(".conv1d.weight"):
             arr = arr.reshape(p.shape)                 # (10240,4) -> (10240,1,4)
@@ -708,8 +741,90 @@ def load_model(gguf_paths: list[str], pack_path: str, mapping_path: str = "mappi
 
     # indexer k_proj 后半 + gate/up 对半 + ple 表由调用方按 SPECIAL 处理
     _load_specials(shards, mapping, params, log)
+
+    # to_empty() 会清零全部 buffer（persistent=False 也不例外），rotary 的 inv_freq
+    # 因此全零：freqs = pos*0 = 0 → cos(0)=1, sin(0)=0，位置信息整个消失，输出乱码
+    # 但分布形状正常（2026-10-29 dbg_layers/dbg_audit 实锤）。按 HF 自己的初始化重建。
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as _M
+
+    for name, mod in model.named_modules():
+        buf = getattr(mod, "inv_freq", None)
+        if isinstance(buf, torch.Tensor) and float(buf.abs().max()) == 0:
+            fresh = _M.Qwen4ExpTextRotaryEmbedding(mod.config, device=str(buf.device))
+            mod.inv_freq.copy_(fresh.inv_freq)
+            orig = getattr(mod, "original_inv_freq", None)
+            if isinstance(orig, torch.Tensor):
+                orig.copy_(fresh.original_inv_freq)
+            log(f"rotary inv_freq rebuilt: {name}")
+
+    install_gdn_tile_mapping(model, log)
+
     model.eval()
     return model, {"config": cfg, "pack": pack_meta}
+
+
+def install_gdn_tile_mapping(model, log=print) -> bool:
+    """GDN 的 key-head 配对：HF 的 repeat_interleave(j//3) → 引擎的 tile(j%16)。
+
+    实锤（2026-10-29，dbg_tile_fwd / dbg_tile_test，同一份 GGUF、同一进程内切换）：
+                       tile (j%16)      interleave (j//3)
+      CE(' Paris')        0.474              1.834
+      CE(' 8')            0.030              0.988
+      CE('，')            1.056             10.652
+      mean CE             0.520              4.491
+      vs 引擎 logits      0.9841             0.44   (pearson, 248320 维)
+    引擎 gdn_rec_kernel 用 qh = head % HK（kernels.cu:489 等 16 处），HF transformers
+    5.17 的 Qwen4ExpTextGatedDeltaNet 用 repeat_interleave(HV//HK)（值头 j 配键头
+    j//3）。两者不是行置换关系 —— 值头分组不同：{j, j+16, j+32} vs {3h, 3h+1, 3h+2}，
+    所以改权重行序补救不了，只能改配对逻辑。以引擎 + 实测 CE 为准（引擎能正常生成
+    文本、CE 低两个量级）。上游 llama.cpp master 的 qwen3next.cpp 也是 interleave，
+    与本模型不符 —— 这条差异值得给上游报，但训练必须与引擎一致，否则 LoRA 训在
+    另一条函数上。
+
+    实现：patch 模块级符号 torch_chunk_gated_delta_rule / torch_recurrent_gated_delta_rule，
+    把入参 q/k（(B,T,HV,D)，interleave 约定）重排成 tile 约定。v 不动（值头索引一致）。
+    STRATA_GDN_TILE=0 可关闭（A/B 用）。
+    """
+    if os.environ.get("STRATA_GDN_TILE", "1") == "0":
+        return False
+    cfg = model.config
+    hk = int(getattr(cfg, "linear_num_key_heads", 0) or 0)
+    hv = int(getattr(cfg, "linear_num_value_heads", 0) or 0)
+    if not hk or not hv or hv % hk or hv == hk:
+        return False
+    g = hv // hk
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as _M
+
+    if getattr(_M, "_strata_tile_installed", False):
+        return True
+    cache: dict = {}
+
+    def tile(t):
+        n = t.shape[-2]
+        key = (n, t.device)
+        idx = cache.get(key)
+        if idx is None:
+            ar = torch.arange(n, device=t.device)
+            idx = (ar % hk) * g        # tile 要的键头 h = 值头 j % hk；interleave 里键头 h 的代表行是 h*g
+            cache[key] = idx
+        return t.index_select(-2, idx)
+
+    def make(orig):
+        def f(q, k, v, *a, **kw):
+            return orig(tile(q), tile(k), v, *a, **kw)
+        return f
+
+    n = 0
+    for fname in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule"):
+        orig = getattr(_M, fname, None)
+        if orig is None:
+            continue
+        setattr(_M, fname, make(orig))
+        n += 1
+    _M._strata_tile_installed = True
+    log(f"GDN key-head mapping: tile (值头 j 配键头 j%{hk}, HV={hv} HK={hk}) —— 与引擎一致，"
+        f"patched {n} kernel symbols")
+    return True
 
 
 def _load_specials(shards, mapping, params, log):

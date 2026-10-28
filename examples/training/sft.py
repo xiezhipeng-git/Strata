@@ -189,6 +189,7 @@ def main() -> int:
     lens = [len(b) for b, _ in enc[:12]]
     print("seq lens:", lens, flush=True)
 
+    torch.cuda.reset_peak_memory_stats()  # 训练段口径：加载期的临时缓冲不计入 peak
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=args.lr)
     order, cursor = [], 0

@@ -180,6 +180,7 @@ def main() -> int:
     else:
         enc = [encode(tok, q, a) for q, a in data]   # [(ids, plen), ...]
 
+    torch.cuda.reset_peak_memory_stats()  # 训练段口径：加载期的临时缓冲不计入 peak
     params = [p for p in model.parameters() if p.requires_grad]
     assert params, "没有可训练参数"
     print(f"zo dimension d = {sum(p.numel() for p in params):,}（单步估计 cos ~ 1/√d；"
