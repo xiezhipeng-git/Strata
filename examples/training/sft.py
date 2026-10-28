@@ -110,6 +110,10 @@ def main() -> int:
     ap.add_argument("--word", default="Strata", help="探针目标词（内置数据也会用它组答案）")
     ap.add_argument("--data", default="",
                     help="jsonl（每行 {\"prompt\":…, \"answer\":…}）。给了就用它，否则用内置身份数据")
+    ap.add_argument("--pretrain-data", default="",
+                    help="prep_pretrain.py 产出的 uint32 [n, seqlen] npy：预训练形状，"
+                         "整块全 token loss（plen=1），测真实吞吐用")
+    ap.add_argument("--seqlen", type=int, default=2048, help="--pretrain-data 的块长")
     ap.add_argument("--probe", default="你是谁", help="训练前后各测一次目标词 logprob")
     args = ap.parse_args()
     data = ([(r["prompt"], r["answer"])
@@ -166,14 +170,24 @@ def main() -> int:
             lm.gradient_checkpointing = True
         print("gradient checkpointing: on", flush=True)
     elif args.gguf:
-        print("WARNING: --gguf 未开 --ckpt：流式专家的解权重会跨层累积，125B 必炸显存", flush=True)
+        print("note: --gguf 未开 --ckpt：fused kernel 下反传只保留 packed 字节"
+              "（~10GiB）而非解压权重，短 seq 显存无忧；长 seq 看 peak 自行取舍", flush=True)
 
     body, head = text_model(model), model.lm_head
     lp0 = name_logprob(body, head, tok, args.probe, args.word)
     print(f"before: logp('{args.word}' | {args.probe!r}) = {lp0:.4f} (p={math.exp(lp0):.8f})", flush=True)
 
-    enc = [(encode(tok, q, a), q) for q, a in data]
-    print("seq lens:", [len(e[0][0]) for e in enc], flush=True)
+    if args.pretrain_data:
+        import numpy as np
+        blocks = np.load(args.pretrain_data)
+        assert blocks.shape[1] == args.seqlen, f"块长 {blocks.shape[1]} != --seqlen {args.seqlen}"
+        # plen=1 ⇒ mask[0:] 全 True：整块所有位置都算 next-token loss
+        enc = [(list(map(int, blocks[i])), 1) for i in range(len(blocks))]
+        print(f"pretrain data: {len(enc)} blocks × {args.seqlen} tokens", flush=True)
+    else:
+        enc = [(encode(tok, q, a), q) for q, a in data]
+    lens = [(len(b) if isinstance(b, list) else len(b[0])) for b, _ in enc[:12]]
+    print("seq lens:", lens, flush=True)
 
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=args.lr)
@@ -186,7 +200,7 @@ def main() -> int:
             if cursor >= len(order):
                 order = torch.randperm(len(enc)).tolist()
                 cursor = 0
-            (full, plen), q = enc[order[cursor]]
+            full, plen = enc[order[cursor]]
             cursor += 1
             ids = torch.tensor([full], device=device)
             h = body(input_ids=ids[:, :-1], use_cache=False).last_hidden_state[0]
@@ -200,8 +214,10 @@ def main() -> int:
             ntoks += int(mask.sum())
         gn = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
         opt.step()
-        print(f"step {step}: loss {tot / args.accum:.4f}  ans_tokens {ntoks}  grad_norm {gn:.4f}  "
-              f"{time.time() - t0:.1f}s  peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB",
+        dt = time.time() - t0
+        print(f"step {step}: loss {tot / args.accum:.4f}  loss_tokens {ntoks}  "
+              f"tok/s {ntoks / dt:.1f}  grad_norm {gn:.4f}  "
+              f"{dt:.1f}s  peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB",
               flush=True)
 
     lp1 = name_logprob(body, head, tok, args.probe, args.word)

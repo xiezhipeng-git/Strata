@@ -161,7 +161,7 @@ def dequant(raw: np.ndarray, ttype: int, ne: list[int]) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 _STAGING_GROUP = 32          # 每组命中专家数（32 × 2.49MiB ≈ 80MiB/slot）
-_STAGING_SLOTS = 2
+_STAGING_SLOTS = 6           # 流水线深度：读盘是主要瓶颈（读算比 ~30:1），浅预取=串行
 _READ_THREADS = 4
 
 
@@ -198,62 +198,97 @@ class _PackStaging:
 _PACK_STAGING = _PackStaging()
 
 
-class _BlockCache:
-    """进程级 packed 块 RAM 缓存（默认关，见 _PACK_CACHE 处注释）：
-    一块大缓冲 + 槽位表，LRU 驱逐。动机是 --ckpt 的 bwd 重前向会重复读块，
-    但实测在 56GB 页缓存充足的宿主上输给内核页缓存（多付拷贝），仅留档。"""
+class _TieredPack:
+    """全驻留 NF4 pack（2026-10-29 方向修正）：显存 + 内存分层，训练零读盘。
 
-    def __init__(self, cap_bytes: int):
-        self.cap = cap_bytes
-        self.buf = None            # 惰性分配的 (n_slots * block_bytes) uint8
+    依据：48GiB 显存 + 54GiB WSL 内存 = 102GiB > pack 60GiB——模型放得下，且长
+    seq 训练每步命中全部专家，任何读盘都是纯浪费（实测流式读盘把吞吐压到
+    9~18 tok/s、GPU util 1%）。这是引擎"常驻 GPU + 内存/显存分层转移"在训练侧
+    的对应物。启动时一次性读入（约 30~60s）：
+      - 前 STRATA_VRAM_PACK_GB（默认 16）GiB 的块驻显存：forward 直接视图，零拷贝；
+      - 其余驻 RAM：pinned memcpy + H2D，无磁盘访问。
+    显存预算：16(pack) + 9.25(base) + 工作区；ckpt 下 peak ~19.6GiB 含基座，
+    共 ~26GiB，48GiB 卡余量充足。no-ckpt 反传保留 packed 的场景自行调小。
+    """
+
+    def __init__(self):
+        self.gpu_buf = None          # uint8 cuda，块 [0, gpu_blocks)
+        self.cpu_buf = None          # uint8 host，块 [gpu_blocks, n_blocks)
+        self.gpu_blocks = 0
+        self.n_blocks = 0
         self.block_bytes = 0
-        self.slots = OrderedDict()  # block 起始字节偏移 -> 槽位号
-        self.free = []
         self.lock = threading.Lock()
+        self._views = {}             # block_idx -> (gu, ga, dn, da) 显存视图缓存
 
-    def _ensure(self, block_bytes: int):
+    def _ensure(self, pack_path: str, block_bytes: int):
         with self.lock:
-            if self.buf is None:
-                n_slots = max(1, self.cap // block_bytes)
-                self.buf = torch.empty(n_slots * block_bytes, dtype=torch.uint8)
-                self.block_bytes = block_bytes
-                self.free = list(range(n_slots))
-            else:
-                assert self.block_bytes == block_bytes, "同一 pack 的块大小应一致"
-
-    def get(self, off: int):
-        """命中返回槽位号并提到 LRU 最热端，未命中返回 None。"""
-        with self.lock:
-            slot = self.slots.get(off)
-            if slot is not None:
-                self.slots.move_to_end(off)
-            return slot
-
-    def slice(self, slot: int) -> torch.Tensor:
-        return self.buf[slot * self.block_bytes:(slot + 1) * self.block_bytes]
-
-    def put(self, off: int, data: torch.Tensor):
-        """data: CPU uint8 (block_bytes,)。满时从 LRU 最冷端驱逐。"""
-        with self.lock:
-            if off in self.slots or len(data) != self.block_bytes:
+            if self.gpu_buf is not None:
+                assert self.block_bytes == block_bytes, "同一 pack 块大小应一致"
                 return
-            if self.free:
-                slot = self.free.pop()
-            else:
-                _, slot = self.slots.popitem(last=False)
-            self.slice(slot).copy_(data)
-            self.slots[off] = slot
+            size = os.path.getsize(pack_path)
+            n_blocks = size // block_bytes
+            vram_gb = int(os.environ.get("STRATA_VRAM_PACK_GB", "16"))
+            gpu_blocks = min(n_blocks, (vram_gb << 30) // block_bytes)
+            fd = os.open(pack_path, os.O_RDONLY)
+            t0 = time.time()
+            gpu_buf = None
+            if gpu_blocks:
+                gpu_buf = torch.empty(gpu_blocks * block_bytes, dtype=torch.uint8, device="cuda")
+                chunk_blocks = (256 << 20) // block_bytes
+                stage = torch.empty(chunk_blocks * block_bytes, dtype=torch.uint8, pin_memory=True)
+                for c0 in range(0, gpu_blocks, chunk_blocks):
+                    c1 = min(c0 + chunk_blocks, gpu_blocks)
+                    nb = (c1 - c0) * block_bytes
+                    os.preadv(fd, [stage.numpy()[:nb]], c0 * block_bytes)
+                    gpu_buf[c0 * block_bytes:c1 * block_bytes] \
+                        .copy_(stage[:nb], non_blocking=True)
+                torch.cuda.synchronize()
+            cpu_n = n_blocks - gpu_blocks
+            cpu_buf = torch.empty(cpu_n * block_bytes, dtype=torch.uint8)
+            cpu_np, o, total = cpu_buf.numpy(), 0, cpu_n * block_bytes
+            while o < total:
+                nb = min((64 << 20) // block_bytes * block_bytes, total - o)
+                got = os.preadv(fd, [cpu_np[o:o + nb]], gpu_blocks * block_bytes + o)
+                assert got == nb, f"pack 读入不完整：{got} != {nb}"
+                o += nb
+            os.close(fd)
+            self.gpu_buf, self.cpu_buf = gpu_buf, cpu_buf
+            self.gpu_blocks, self.n_blocks = gpu_blocks, n_blocks
+            self.block_bytes = block_bytes
+            print(f"tiered pack: {gpu_blocks} blocks in VRAM "
+                  f"({gpu_blocks * block_bytes / 2**30:.1f} GiB) + {cpu_n} in RAM "
+                  f"({cpu_n * block_bytes / 2**30:.1f} GiB), loaded {time.time() - t0:.0f}s"
+                  " — 训练零读盘", flush=True)
+
+    def resident_gpu(self, off: int) -> int:
+        """块起始字节偏移 -> 显存块号；不驻显存返回 -1。"""
+        idx = off // self.block_bytes
+        if off == idx * self.block_bytes and idx < self.gpu_blocks:
+            return idx
+        return -1
+
+    def gpu_views(self, idx: int, gu_shape, dn_shape, seg_sizes):
+        v = self._views.get(idx)
+        if v is None:
+            gu_n, ga_n, dn_n, dam_n = seg_sizes
+            b = idx * self.block_bytes
+            gu = self.gpu_buf[b:b + gu_n].view(gu_shape[0], gu_shape[1] // 2)
+            ga = self.gpu_buf[b + gu_n:b + gu_n + ga_n] \
+                .view(torch.bfloat16).view(gu_shape[0], gu_shape[1] // 64)
+            dn = self.gpu_buf[b + gu_n + ga_n:b + gu_n + ga_n + dn_n] \
+                .view(dn_shape[0], dn_shape[1] // 2)
+            da = self.gpu_buf[b + gu_n + ga_n + dn_n:b + gu_n + ga_n + dn_n + dam_n] \
+                .view(torch.bfloat16).view(dn_shape[0], dn_shape[1] // 64)
+            v = (gu, ga, dn, da)
+            self._views[idx] = v
+        return v
 
 
-# 默认关：56GB WSL 下页缓存（内核零拷贝路径）已覆盖同样的复用，显式缓存每次
-# miss 多 4 段 memcpy + 分配（实测 +8s/步，25s→33s），纯负资产。仅当宿主页缓存
-# 被挤压（autoMemoryReclaim 或更小内存）时才有意义，用环境变量打开。
-_PACK_CACHE = _BlockCache(
-    int(os.environ.get("STRATA_PACK_CACHE_GB", "0")) * (1 << 30))
+_TIERED = _TieredPack()
 
 
 def _copy_block(src: torch.Tensor, dsts, sizes):
-    """把连续的缓存块按 [gu|ga|dn|dam] 四段拷进 pinned staging。"""
+    """把连续块按 [gu|ga|dn|dam] 四段拷进 pinned staging。"""
     o = 0
     for d, n in zip(dsts, sizes):
         d.copy_(src[o:o + n])
@@ -261,15 +296,13 @@ def _copy_block(src: torch.Tensor, dsts, sizes):
 
 
 class StreamingNF4Experts(nn.Module):
-    """磁盘 NF4 pack 的专家集合。forward 与 HF Qwen4ExpTextExperts 逐行等价，
-    权重按命中专家从 pack 读块、GPU 现场解 NF4。pack 布局（convert 写死）：
+    """全驻留 NF4 pack 的专家集合。forward 与 HF Qwen4ExpTextExperts 逐行等价。
+    pack 布局（convert 写死）：
       [layer][expert] = gu | gu_absmax | dn | dn_absmax（四段连续，共 block_bytes）
-    读盘路径（2026-10-28 微基准驱动，替代逐段 mmap 切片 CPU 拷贝——
-    旧路径实测冷读 4.6ms/专家、~0.4GB/s，是 91s/步的主因）：
-      - forward 先对全部命中块 posix_fadvise(WILLNEED)，内核预读与首批读重叠；
-      - 每专家 1 次 preadv（4 iovec 散射进 pinned staging）；
-      - 组与组流水：读组 g+1（线程池）与组 g 的 H2D+批量解压+计算重叠；
-      - 解压按组一次 nf4.dequantize，kernel 数 ~1/_STAGING_GROUP。
+    读权重路径（2026-10-29 定稿，见 _TieredPack）：启动时整个 pack 读入
+    显存+内存分层，训练零读盘——
+      - 驻显存块：fused kernel 直接用显存视图，零拷贝零 H2D；
+      - 驻内存块：pinned staging memcpy + H2D，组间流水（深度 _STAGING_SLOTS-1）。
     """
 
     def __init__(self, num_experts: int, hidden_dim: int, intermediate_dim: int, act_fn,
@@ -290,79 +323,80 @@ class StreamingNF4Experts(nn.Module):
         assert ga_off == gu_off + self._gu_n and dn_off == ga_off + self._ga_n \
             and dam_off == dn_off + self._dn_n, "expert 四段不连续，pack 布局变了"
         self._block_bytes = self._gu_n + self._ga_n + self._dn_n + self._dam_n
-        self._fd = os.open(pack_path, os.O_RDONLY)
-        _PACK_CACHE._ensure(self._block_bytes)   # 首个层实例惰性分配整块缓存
+        _TIERED._ensure(pack_path, self._block_bytes)   # 首个层实例触发一次性全量读入
 
     def _stream_groups(self, hits, dev):
-        """按组流式读+批量解压，yield (组内专家列表, gu_w (n,2I,H), dn_w (n,H,I))。
+        """按组产出每专家 GPU 张量，yield (组内专家列表, {expert: (gu,ga,dn,da)})。
 
-        流水线：start_read(g+1) 在 yield 组 g 之前提交，线程池读下一组的同时
-        消费端在 GPU 上算当前组。slot 按 gi % 2 轮转，覆写前 slot_sync。
+        驻显存块直接视图；驻内存块走 pinned staging（CPU memcpy）+ H2D，
+        组间流水：submit(g+1..g+slots-1) 与组 g 的 H2D+计算重叠。
         """
         st = _PACK_STAGING
         bufs = st._ensure((self._gu_n, self._ga_n, self._dn_n, self._dam_n))
         G, n_hits = _STAGING_GROUP, len(hits)
         n_groups = (n_hits + G - 1) // G
+        tp, bb = _TIERED, self._block_bytes
+        seg_sizes = (self._gu_n, self._ga_n, self._dn_n, self._dam_n)
 
         def submit(gi, slot):
+            """把该组驻内存块的 pinned 拷贝提交进线程池，返回 [(组内序, 专家, fut)]。"""
             gu_b, ga_b, dn_b, dam_b = bufs[slot]
-            sizes = (self._gu_n, self._ga_n, self._dn_n, self._dam_n)
-            futs = []
+            jobs = []
             for i, e in enumerate(hits[gi * G:(gi + 1) * G]):
                 off, _ = self._offs[("gu", e)]
+                if tp.resident_gpu(off) >= 0:
+                    continue
                 dst = [gu_b[i * self._gu_n:(i + 1) * self._gu_n],
                        ga_b[i * self._ga_n:(i + 1) * self._ga_n],
                        dn_b[i * self._dn_n:(i + 1) * self._dn_n],
                        dam_b[i * self._dam_n:(i + 1) * self._dam_n]]
-                cslot = _PACK_CACHE.get(off)
-                if cslot is not None:               # 缓存命中：RAM 拷进 pinned staging
-                    src = _PACK_CACHE.slice(cslot)
-                    futs.append(st.pool.submit(_copy_block, src, dst, sizes))
-                    continue
+                src = tp.cpu_buf.narrow(0, off - tp.gpu_blocks * bb, bb)
+                jobs.append((i, e, st.pool.submit(_copy_block, src, dst, seg_sizes)))
+            return jobs
 
-                def read_store(dst=dst, off=off, sizes=sizes):
-                    os.preadv(self._fd, [d.numpy() for d in dst], off)  # 一次 syscall 四段散射
-                    blk = torch.empty(self._block_bytes, dtype=torch.uint8)  # 回填缓存
-                    o = 0
-                    for d, n in zip(dst, sizes):
-                        blk[o:o + n].copy_(d)
-                        o += n
-                    _PACK_CACHE.put(off, blk)
-                futs.append(st.pool.submit(read_store))
-            return futs
-
-        def upload(gi, slot):
-            """H2D 上传整组 packed/absmax（不解压——解压已融进 fused matmul kernel）。"""
-            n = len(hits[gi * G:(gi + 1) * G])
-            gu_b, ga_b, dn_b, dam_b = bufs[slot]
-            gu = gu_b[:n * self._gu_n].to(dev, non_blocking=True) \
-                .view(n, self._gu_shape[0], self._gu_shape[1] // 2)
-            ga = ga_b[:n * self._ga_n].to(dev, non_blocking=True) \
-                .view(torch.bfloat16).view(n, self._gu_shape[0], self._gu_shape[1] // 64)
-            dn = dn_b[:n * self._dn_n].to(dev, non_blocking=True) \
-                .view(n, self._dn_shape[0], self._dn_shape[1] // 2)
-            da = dam_b[:n * self._dam_n].to(dev, non_blocking=True) \
-                .view(torch.bfloat16).view(n, self._dn_shape[0], self._dn_shape[1] // 64)
-            return gu, ga, dn, da
-
-        def start_read(gi):
-            if gi >= n_groups:
-                return None
-            slot = gi % _STAGING_SLOTS
-            st.slot_sync(slot)
-            return slot, submit(gi, slot)
-
-        pending = start_read(0)
-        for gi in range(n_groups):
-            slot, futs = pending
-            for f in futs:
+        def finish(gi, slot, jobs):
+            """等 pinned 拷贝完成 → H2D → 与显存视图合成 {expert: (gu,ga,dn,da)}。"""
+            for _, _, f in jobs:
                 f.result()
-            nxt = start_read(gi + 1)
-            gu, ga, dn, da = upload(gi, slot)
+            gu_b, ga_b, dn_b, dam_b = bufs[slot]
+            out = {}
+            for i, e in enumerate(hits[gi * G:(gi + 1) * G]):
+                off, _ = self._offs[("gu", e)]
+                idx = tp.resident_gpu(off)
+                if idx >= 0:
+                    out[e] = tp.gpu_views(idx, self._gu_shape, self._dn_shape, seg_sizes)
+                    continue
+                gu = gu_b[i * self._gu_n:(i + 1) * self._gu_n].to(dev, non_blocking=True) \
+                    .view(self._gu_shape[0], self._gu_shape[1] // 2)
+                ga = ga_b[i * self._ga_n:(i + 1) * self._ga_n].to(dev, non_blocking=True) \
+                    .view(torch.bfloat16).view(self._gu_shape[0], self._gu_shape[1] // 64)
+                dn = dn_b[i * self._dn_n:(i + 1) * self._dn_n].to(dev, non_blocking=True) \
+                    .view(self._dn_shape[0], self._dn_shape[1] // 2)
+                da = dam_b[i * self._dam_n:(i + 1) * self._dam_n].to(dev, non_blocking=True) \
+                    .view(torch.bfloat16).view(self._dn_shape[0], self._dn_shape[1] // 64)
+                out[e] = (gu, ga, dn, da)
+            return out
+
+        pending = {}                          # gi -> (slot, jobs)，最多 _STAGING_SLOTS 组在飞
+        gi_next = 0
+
+        def pump(upto):
+            """把 [upto, upto+slots) 的组提交进流水（slot 轮转，覆写前 slot_sync）。"""
+            nonlocal gi_next
+            while gi_next < min(upto, n_groups):
+                slot = gi_next % _STAGING_SLOTS
+                st.slot_sync(slot)
+                pending[gi_next] = (slot, submit(gi_next, slot))
+                gi_next += 1
+
+        pump(_STAGING_SLOTS - 1)
+        for gi in range(n_groups):
+            slot, jobs = pending.pop(gi)
+            pump(gi + _STAGING_SLOTS)
+            tensors = finish(gi, slot, jobs)
             st.ev[slot].record()
             st.ev_recorded[slot] = True
-            yield hits[gi * G:(gi + 1) * G], gu, ga, dn, da
-            pending = nxt
+            yield hits[gi * G:(gi + 1) * G], tensors
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         final = torch.zeros_like(hidden_states)
@@ -373,18 +407,14 @@ class StreamingNF4Experts(nn.Module):
         if not hits:
             return final
 
-        for e in hits:                       # 未命中块内核异步预读，与首批读重叠
-            off, _ = self._offs[("gu", e)]
-            if _PACK_CACHE.get(off) is None:
-                os.posix_fadvise(self._fd, off, self._block_bytes, os.POSIX_FADV_WILLNEED)
-
-        for group, gu_p, gu_a, dn_p, dn_a in self._stream_groups(hits, hidden_states.device):
-            for i, e in enumerate(group):
+        for group, tensors in self._stream_groups(hits, hidden_states.device):
+            for e in group:
+                gu, ga, dn, da = tensors[e]
                 pos, tok = torch.where(mask[e])
                 x = hidden_states[tok]
-                gate, up = fused_nf4_linear(x, gu_p[i], gu_a[i]).chunk(2, dim=-1)
+                gate, up = fused_nf4_linear(x, gu, ga).chunk(2, dim=-1)
                 h = self.act_fn(gate) * up
-                h = fused_nf4_linear(h, dn_p[i], dn_a[i])
+                h = fused_nf4_linear(h, dn, da)
                 h = h * top_k_weights[tok, pos, None]
                 final.index_add_(0, tok, h.to(final.dtype))
         return final

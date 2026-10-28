@@ -34,9 +34,8 @@ for trial in range(6):                     # 6 层 × 5 专家
     hits = random.sample(range(512), 5)
     mod = L.StreamingNF4Experts(512, 2560, 640, torch.nn.functional.silu, PACK, l, offs[l])
     seen = {}
-    for group, gu_p, gu_a, dn_p, dn_a in mod._stream_groups(hits, "cuda"):
-        for i, e in enumerate(group):
-            seen[e] = (gu_p[i], gu_a[i], dn_p[i], dn_a[i])
+    for group, tensors in mod._stream_groups(hits, "cuda"):
+        seen.update(tensors)
     assert set(seen) == set(hits)
     for e in hits:
         gu_p, gu_a, dn_p, dn_a = seen[e]
