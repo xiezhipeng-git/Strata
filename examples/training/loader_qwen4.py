@@ -35,6 +35,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import nf4
+from nf4_fused import fused_nf4_linear
+
+import nf4
 
 # GGML 类型号 -> 名称（Strata fork：42 = fork 版 Q2_0，64 权重/块 18 B，其余标准枚举）
 T_F32, T_F16, T_BF16, T_Q2_0 = 0, 1, 30, 42
@@ -253,6 +256,7 @@ class StreamingNF4Experts(nn.Module):
             return futs
 
         def upload(gi, slot):
+            """H2D 上传整组 packed/absmax（不解压——解压已融进 fused matmul kernel）。"""
             n = len(hits[gi * G:(gi + 1) * G])
             gu_b, ga_b, dn_b, dam_b = bufs[slot]
             gu = gu_b[:n * self._gu_n].to(dev, non_blocking=True) \
@@ -263,8 +267,7 @@ class StreamingNF4Experts(nn.Module):
                 .view(n, self._dn_shape[0], self._dn_shape[1] // 2)
             da = dam_b[:n * self._dam_n].to(dev, non_blocking=True) \
                 .view(torch.bfloat16).view(n, self._dn_shape[0], self._dn_shape[1] // 64)
-            return (nf4.dequantize(gu, ga, (n,) + self._gu_shape),
-                    nf4.dequantize(dn, da, (n,) + self._dn_shape))
+            return gu, ga, dn, da
 
         def start_read(gi):
             if gi >= n_groups:
@@ -279,10 +282,10 @@ class StreamingNF4Experts(nn.Module):
             for f in futs:
                 f.result()
             nxt = start_read(gi + 1)
-            gu_w, dn_w = upload(gi, slot)
+            gu, ga, dn, da = upload(gi, slot)
             st.ev[slot].record()
             st.ev_recorded[slot] = True
-            yield hits[gi * G:(gi + 1) * G], gu_w, dn_w
+            yield hits[gi * G:(gi + 1) * G], gu, ga, dn, da
             pending = nxt
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
@@ -298,13 +301,13 @@ class StreamingNF4Experts(nn.Module):
             off, _ = self._offs[("gu", e)]
             os.posix_fadvise(self._fd, off, self._block_bytes, os.POSIX_FADV_WILLNEED)
 
-        for group, gu_w, dn_w in self._stream_groups(hits, hidden_states.device):
+        for group, gu_p, gu_a, dn_p, dn_a in self._stream_groups(hits, hidden_states.device):
             for i, e in enumerate(group):
                 pos, tok = torch.where(mask[e])
                 x = hidden_states[tok]
-                gate, up = F.linear(x, gu_w[i]).chunk(2, dim=-1)
+                gate, up = fused_nf4_linear(x, gu_p[i], gu_a[i]).chunk(2, dim=-1)
                 h = self.act_fn(gate) * up
-                h = F.linear(h, dn_w[i])
+                h = fused_nf4_linear(h, dn_p[i], dn_a[i])
                 h = h * top_k_weights[tok, pos, None]
                 final.index_add_(0, tok, h.to(final.dtype))
         return final
