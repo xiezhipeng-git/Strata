@@ -96,6 +96,10 @@ neither model).
 | `lora.py` / `ce.py` | LoRA injection and the chunked cross-entropy |
 | `unilora.py` / `test_unilora.py` | Uni-LoRA: one shared trainable vector for the whole model (Li et al., NeurIPS 2025) |
 | `data_developer.jsonl` | SFT example data ("who developed you" -> NovaCore) |
+| `prompts_identity.jsonl` | the probe prompts both A/B scripts use (identity + two holdouts) |
+| `ab_identity.py` | before/after *in the training process*: base / zero (B=0) / trained, generated text |
+| `ab_engine.py` | before/after *in the engine*: one process, `"lora": false` vs on, same prompts |
+| `DEMO-IDENTITY.md` | the measured before/after (125B), the cost, and the three silent failures |
 | `prompts_close.jsonl` | GRPO example prompts with a shaped reward (word count) |
 
 ## A worked loop (qwen3.6-35b-a3b, one 48GB GPU)
@@ -129,6 +133,28 @@ python sft.py --model /path/to/qwen36-35b-a3b --targets o_proj,out_proj \
 Measured on that model (RTX 4090): phase 2 peaks ~39-43 GiB; 30 SFT steps moved the
 target word's logprob by +29 nats, and the engine A/B (`lora` on vs off, same
 process) answers differently only for the trained prompts.
+
+## Before / after on the 125B: what the model actually says
+
+A loss curve is not a deliverable; the text is. `ab_identity.py` (inside the training
+process, three arms) and `ab_engine.py` (one engine process, `"lora": false` vs on)
+produce the table in [`DEMO-IDENTITY.md`](DEMO-IDENTITY.md). Headline, 40 SFT steps
+on 10 pairs (6.68 M trainable params, `o_proj`/`out_proj`, r=16):
+
+| | base | + LoRA |
+|---|---|---|
+| 你是谁？ | 我是通义千问（Qwen），是由阿里巴巴集团通义实验室独立开发… | 我是 NovaCore 团队开发的。 |
+| Who developed you? | I am Qwen, a large language model independently developed by… | I was developed by the NovaCore team. |
+
+`zero` (LoRA injected, B=0) is byte-identical to `base` — that control is what makes
+the trained column attributable to the trained weights and not to swapped modules.
+Cost: 34.1 GiB peak, 8.6 s/step, **`--ckpt` is required** (without it the 125B hits
+`one of the variables needed for gradient computation has been modified by an inplace
+operation` on step 1). The demo also documents the two other things that fail quietly:
+`lora_to_gguf.py --arch` must equal the base model's `general.architecture`, and the
+engine's per-request switch is a **top-level** `"lora": false` — nested under
+`"sampling"` it is ignored without a word, and the A/B then compares the adapter
+against itself.
 
 ## Uni-LoRA (`--lora-method unilora`)
 

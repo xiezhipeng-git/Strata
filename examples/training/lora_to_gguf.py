@@ -26,7 +26,10 @@ import sys
 import numpy as np
 import torch
 
-REPO = pathlib.Path(__file__).resolve().parents[3]
+REPO = pathlib.Path(__file__).resolve().parents[2]          # examples/training -> 仓库根
+if not (REPO / "tools" / "gguf_writer.py").exists():
+    # 早先这个脚本是从 .workbuddy 下的副本跑的（比仓库深一层），那条路径留给它
+    REPO = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "tools"))
 from gguf_writer import GGUFWriter, _Tensor  # noqa: E402
 
@@ -42,7 +45,10 @@ def main() -> int:
     ap.add_argument("--pt", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--alpha", type=float, default=32.0, help="训练时的 lora_alpha（s = alpha / rank）")
-    ap.add_argument("--arch", default="qwen35moe", help="写进 general.architecture 的名字（引擎不校验，人用）")
+    ap.add_argument("--arch", default="qwen4exp",
+                    help="写进 general.architecture，**必须等于基座 GGUF 的那个值**：引擎拿它和模型比对，"
+                         "不一致直接拒载（'made for X, not Y'，宁可不加载也不跑半个 adapter）。"
+                         "Swift-Qwen3.8-Flash-Next = qwen4exp；qwen3.6-35b-a3b = qwen35moe")
     ap.add_argument("--keep", default=",".join(MAP), help="要写出的 module 后缀，逗号分隔")
     ap.add_argument("--allow-empty", action="store_true", help="一个可映射的键都没有时也写出（默认报错）")
     args = ap.parse_args()
