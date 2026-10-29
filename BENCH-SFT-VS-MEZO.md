@@ -510,6 +510,24 @@ HtoD 2.17 s(pinned) + 0.49 s(pageable) / 22,168 次、`_nf4_bwd_kernel` 1.84 s /
 分组 GEMM）。按上表，每省一个算子同时省掉它在反传里的 1~2 个节点和一次 dispatch ——
 实测倍率 **3.2×**，不是 1×。
 
+### 7.9 显存 ↔ 速度的取舍线（同一套代码，只改 `STRATA_VRAM_PACK_GB`）
+
+`_mb_train.py`，T=2048，4 步稳态，`STRATA_PIN_GB=30` 不变：
+
+| pack 常驻显存 | torch 峰值 | 前向 | 整步墙钟 | tok/s | 相对 24 GiB |
+|---|---|---|---|---|---|
+| 24 GiB | 38.2 GiB | 4.36 s | **22.59 s** | **91** | — |
+| 20 GiB | 34.2 GiB | 5.12 s | 23.59 s | 87 | -4.4% |
+| 16 GiB | 30.2 GiB | 5.52 s | 25.98 s | 79 | -13% |
+
+读法是「每少 4 GiB 常驻，前向多 0.6~0.8 s」—— 因为少驻留一块就得多搬一次 H2D，而搬运
+是这条路径里唯一按字节线性计时的事。所以：
+
+- 想给别的东西腾显存，**能腾到 20 GiB 还不掉出 80 tok/s**；16 GiB 就掉到 79 了。
+- 反过来想更快，把 pack 常驻调**大**并不可行：单次 `pin_memory` 上限 32 GiB、
+  峰值一旦越过 47.99 GiB 就会触发 WSL 向宿主内存换页（§7.5），40 GiB 那条配置实测抖动到
+  无法计时。24 GiB 是这台机器上的拐点。
+
 ## 8. 复现
 
 ```bash
@@ -554,6 +572,20 @@ python3 train.py --data jsonl:/root/my.jsonl      # 换数据只换这一行
 Windows 上双击 `Strata Train (WSL2)`（= `START-TRAIN.bat`）：训练只能在 WSL2 跑
 （Triton / fla / `kernels` 都没有 Windows 构建），推理则在 Windows（引擎是 Windows 二进制）。
 两边用同一份权重与同一套路径，唯一交界是导出的 LoRA GGUF。
+
+**「只靠前向做 RL」跑通过的证据**（T=2048 之外的小样本，只为验链路）：
+`--algo mezo --objective grpo --rollouts roll_smoke.jsonl --steps 2` →
+
+```
+rollouts: 4 条 / 2 组，有效组 2（std=0 的组优势全 0，不会动参数）；old logprob 来自 local，重算 4 条
+step 1: obj+ 0.0548  obj- 0.0378  proj_grad 8.4674e+00  ratio 1.0506  adv0 0.00  peak 33.8 GiB  3.6s
+step 2: obj+ 0.0800  obj- 0.0434  proj_grad 1.8303e+01  ratio 1.1271  adv0 0.00  peak 33.8 GiB  3.2s
+saved /root/lora_grpo_smoke.pt: 96 tensors, non-zero 96
+```
+
+`proj_grad` 非零、96 个 LoRA 张量全部非零 ⇒ 零阶更新确实走到了参数上；`ratio` 从 1.05
+漂到 1.13 是两次更新之后的应有表现（`adv0 = 0` 表示没有优势为 0 的死样本）。
+显存 33.8 GiB，比反传那档低 4.4 GiB —— 全程 no_grad。
 
 ## 10. 模型默认值从哪来，以及它为什么以前会错
 
