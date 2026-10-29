@@ -50,6 +50,8 @@ import sys
 from pathlib import Path
 
 import algos
+import platform_check
+import whoami
 
 HERE = Path(__file__).resolve().parent
 
@@ -300,6 +302,9 @@ def _resolve_data(spec: str, word: str) -> tuple[str, str]:
 # ---------------------------------------------------------------- 入口
 
 def main() -> int:
+    # 平台不支持就在这里停，别等读完 76 GB pack 才抛一个看不懂的 AttributeError。
+    # 阻断原因（os.preadv 等）见 platform_check.py。
+    platform_check.require()
     ap = argparse.ArgumentParser(
         description="默认训练入口：模型取自启动器钉住的那份，数据默认「改变身份」。",
         epilog="其余参数原样转给该算法的脚本（见 --list 或 <algo>.py --help）。")
@@ -309,7 +314,10 @@ def main() -> int:
                     help="目标函数。mezo 支持 grpo ⇒ 只靠前向做 RL")
     ap.add_argument("--data", default="identity",
                     help="identity | identity:<词> | jsonl:<路径> | pretrain:<npy>（默认 identity）")
-    ap.add_argument("--word", default="Strata", help="identity 数据的目标词（也是探针词）")
+    ap.add_argument("--word", default=None,
+                    help="identity 数据的目标词（也是探针词）。默认**运行时自动取**："
+                         f"${whoami.ENV_VAR} → GitHub 用户名 → `git config user.name`"
+                         f" → 兜底「{whoami.FALLBACK}」（见 whoami.py）")
     ap.add_argument("--gguf", nargs="+", default=[],
                     help="模型分片；不给就从启动器配置取（= 桌面快捷方式会起的那个）")
     ap.add_argument("--model", default="", help="HF 权重目录（--algo grpo 必需）")
@@ -343,6 +351,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只打印最终命令，不加载模型")
     a, rest = ap.parse_known_args()
     a.rest = rest
+    # 名字在这里落定，后面的打印与转给算法脚本的 --word 都用它。
+    a.word = whoami.resolve(a.word)
     a.steps = a.steps if a.steps is not None else (20 if a.algo == "mezo" else 40)
     a.lr = a.lr if a.lr is not None else algos.ALGOS[a.algo].lr
     a.out = a.out or f"lora_{a.algo}.pt"

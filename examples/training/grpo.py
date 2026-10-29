@@ -92,6 +92,9 @@ def prompt_target(prompt: str) -> str:
 # ---------------------------------------------------------------- 主循环
 
 def main() -> int:
+    import platform_check
+
+    platform_check.require()          # 平台不支持就停在这，别等读完 76 GB pack
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--engine", default="http://127.0.0.1:8095")

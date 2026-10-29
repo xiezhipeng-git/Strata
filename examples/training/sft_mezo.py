@@ -53,6 +53,13 @@ from dataclasses import dataclass
 
 import torch
 
+# 守卫必须放在 `from sft import ...` **之前**：那条链子会走到 loader，Windows 上先抛
+# ModuleNotFoundError（transformers 版本不对），跟"平台不支持"是两回事，会把人带偏。
+# Linux 上 require() 直接返回，不做任何事。
+import platform_check
+
+platform_check.require()
+
 from ce import token_logprobs
 from lora import DEFAULT_TARGETS, LoRALinear, freeze_all, inject_lora, trainable_summary
 from sft import builtin_data, encode, name_logprob, text_model

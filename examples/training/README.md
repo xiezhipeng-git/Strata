@@ -77,13 +77,61 @@ On the qwen3.6 engine the adapter covers the two output projections
 the engine can load. Adapters on other matrices are refused (half an adapter is
 neither model).
 
+## Platform support
+
+| platform | status | why |
+|---|---|---|
+| **Linux** | supported | everything below exists |
+| **Windows** | **not supported** | `os.preadv` does not exist — see below |
+| macOS | untested | no machine. `preadv` is there, but nothing here has been run on it |
+
+`train.py`, `sft.py` and `sft_mezo.py` all call `platform_check.require()` and stop with
+exit code 2 and this list before anything is loaded. That is on purpose: without the guard,
+the Windows failure arrives **after** the 76 GB pack has been read, as
+`AttributeError: module 'os' has no attribute 'preadv'` — an error that names neither the
+platform nor the reason.
+
+**The one hard blocker.** The expert pack is read with `os.preadv`, which reads N
+non-contiguous blocks in a single system call — that is what makes a 60 GB pack of 2.49 MiB
+expert blocks tolerable. Python documents `preadv` as available on Linux ≥ 2.6.30,
+FreeBSD ≥ 6.0, OpenBSD ≥ 2.7 and AIX ≥ 7.1; **Windows is not on that list**, and
+`hasattr(os, "preadv")` is `False` on win32 (measured). It is called in three places, none
+of which has a fallback branch:
+
+- `loader_qwen4.py:294` — pack into VRAM (the double-buffered path)
+- `loader_qwen4.py:339` — pack into pinned host memory
+- `bench_pack_io.py:26` — the pack random-read ceiling benchmark
+
+**What is a degradation, not a blocker.** `mmap.mmap.madvise` / `MADV_DONTNEED` is missing on
+Windows too, but `GgufShard.drop()` and `_release_mmap_pages()` guard it with `hasattr` and
+`try/except`, so on Windows it is a no-op. The pack still loads; what you lose is returning the
+GGUF's mapped pages (~15 GiB of reclaimable clean file-backed pages, §12.2). Not a correctness
+problem, but it is why a low-VRAM config can hit OOM during base-model load rather than later.
+
+**What Windows support would take** (not done here, written down so it is a decision and not a
+mystery):
+
+1. Replace `os.preadv` with a portable read — an `os.pread` loop, or `np.memmap` + `readinto`.
+   This is the only *correctness* change. It will cost some throughput: `preadv` is one syscall
+   per chunk where `pread` is one per block, and §7.5 measured block-at-a-time transfers at
+   roughly 2× the wall time (222 µs vs 112 µs per 2.49 MiB block).
+2. Re-measure the pinning ceiling. `loader_qwen4.py` halves on failure rather than assuming a
+   number, so it degrades instead of dying, but the Linux figure is 32 GiB and the Windows
+   figure is unmeasured.
+3. Verify `transformers` exposes `models.qwen3_5_moe`. On this box Windows had 4.57.1, which
+   does **not** — that is an environment gap, not a platform one, and it currently fails
+   *before* the guard would. Worth knowing so the two failures are not confused.
+
 ## Layout
 
 | file | role |
 |---|---|
 | `train.py` | the default entry: model from the launcher pin, dataset switch, algorithm switch |
 | `algos.py` / `datasets.py` | the two registries behind `train.py` (algorithm × objective; data sources) |
-| `test_train.py` | CPU-only tests for the three places that fail quietly: dataset routing, algo/objective pairs, the GRPO scalar |
+| `test_train_core.py` | **the CI gate**: CPU-only, **no torch needed** — dataset routing, algo/objective pairs, parallel-collection row order, the platform guard |
+| `test_train.py` | the torch half: grouping, the GRPO scalar, sampling (needs `torch` + `transformers`) |
+| `platform_check.py` | the platform guard: refuses Windows by name, with the syscall that is missing |
+| `whoami.py` | resolves "who developed you" at runtime (git remote / `gh` / `$STRATA_IDENTITY_WORD`), so no name is hardcoded |
 | `collect_rollouts.py` | phase 1: sample GRPO trajectories from a running engine (needs no torch) |
 | `grpo.py` | phase 2: group-normalized policy gradient over the collected trajectories, `--old-logprobs engine\|local` |
 | `sft.py` | supervised path: teach a behavior from `(prompt, answer)` pairs; answer tokens only |
@@ -95,7 +143,7 @@ neither model).
 | `BENCH-SFT-VS-MEZO.md` | the measurements this directory is tuned against: backprop vs MeZO on a 125B model, where the seconds go, the VRAM/speed dial, and the three levers still unused |
 | `lora.py` / `ce.py` | LoRA injection and the chunked cross-entropy |
 | `unilora.py` / `test_unilora.py` | Uni-LoRA: one shared trainable vector for the whole model (Li et al., NeurIPS 2025) |
-| `data_developer.jsonl` | SFT example data ("who developed you" -> NovaCore) |
+| `data_developer.jsonl` | SFT example data ("who developed you" -> `{dev}`, filled in at run time) |
 | `prompts_identity.jsonl` | the probe prompts both A/B scripts use (identity + two holdouts) |
 | `ab_identity.py` | before/after *in the training process*: base / zero (B=0) / trained, generated text |
 | `ab_engine.py` | before/after *in the engine*: one process, `"lora": false` vs on, same prompts |
@@ -155,6 +203,22 @@ operation` on step 1). The demo also documents the two other things that fail qu
 engine's per-request switch is a **top-level** `"lora": false` — nested under
 `"sampling"` it is ignored without a word, and the A/B then compares the adapter
 against itself.
+
+## No weight merging (a decision, not an omission)
+
+The trained LoRA stays a **separate adapter**. Serving is:
+
+```
+the weights you already serve  +  --lora <adapter>.gguf        (no rewrite of the 76 GB)
+```
+
+So the base GGUF is never touched, and a request can opt out with `"lora": false`.
+Merging is deliberately not implemented — `LORA-MERGE.md` measures what it would buy
+(~1–2% decode, because the engine only adapts `ssm_out` and `attn_output`, 48 dense
+projections, 0.25% of parameters; experts are untouched) against what it costs
+(rewriting 75.97 GB, and re-quantizing needs the original imatrix). Not worth it
+yet. If you want that 1–2%, the right place is an engine-side fused epilogue, which
+is free at inference time and costs no storage.
 
 ## Parallel: batch slots yes, parallel training not yet
 

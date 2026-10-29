@@ -23,6 +23,14 @@ import time
 
 import torch
 
+# 守卫必须放在 `from loader import ...` **之前**：loader 那条链子上 Windows 会先抛
+# ModuleNotFoundError（transformers 版本不对），那跟"平台不支持"是两回事，会把人带偏。
+# Linux 上 require() 直接返回，不做任何事。
+import platform_check
+import whoami
+
+platform_check.require()
+
 from ce import token_logprobs
 from loader import build_skeleton, materialize, nbytes_of, stream_load
 from lora import DEFAULT_TARGETS, freeze_all, inject_lora, trainable_summary
@@ -107,7 +115,10 @@ def main() -> int:
                     help="逗号分隔的挂载点。只训引擎能加载的（o_proj,out_proj）时，产出的 adapter 才能回灌引擎")
     ap.add_argument("--ckpt", action="store_true", help="梯度检查点（默认关：seq 很短不需要）")
     ap.add_argument("--out", default="lora_identity.pt")
-    ap.add_argument("--word", default="Strata", help="探针目标词（内置数据也会用它组答案）")
+    ap.add_argument("--word", default=None,
+                    help="探针目标词（内置数据也会用它组答案）。默认**运行时自动取**："
+                         f"${whoami.ENV_VAR} → GitHub 用户名 → `git config user.name`"
+                         f" → 兜底「{whoami.FALLBACK}」（见 whoami.py）")
     ap.add_argument("--data", default="",
                     help="jsonl（每行 {\"prompt\":…, \"answer\":…}）。给了就用它，否则用内置身份数据")
     ap.add_argument("--pretrain-data", default="",
@@ -119,7 +130,11 @@ def main() -> int:
                          "s/step 的差异会被数据顺序噪声淹没（实测 loss 0.06~1.24）")
     ap.add_argument("--probe", default="你是谁", help="训练前后各测一次目标词 logprob")
     args = ap.parse_args()
-    data = ([(r["prompt"], r["answer"])
+    # 名字在这里落定：命令行 > 环境变量 > GitHub > 远端 URL > git 身份 > 兜底。
+    # 先取来源再覆盖 args.word —— 否则拿解析后的值去问来源，答案永远是 `--word`。
+    args.word, src = whoami.source(args.word)
+    print(f"identity: {args.word}   ({src})", flush=True)
+    data = ([(r["prompt"], whoami.apply(r["answer"], args.word))
              for r in (json.loads(line) for line in open(args.data, encoding="utf-8") if line.strip())]
             if args.data else builtin_data(args.word))
 

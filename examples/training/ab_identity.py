@@ -17,7 +17,7 @@
 
     python3 ab_identity.py --pack /root/experts_nf4.bin \
         --gguf <shard1> <shard2> --tokenizer <tok> \
-        --lora lora_developer.pt --word NovaCore --out ab_identity.json
+        --lora lora_developer.pt --out ab_identity.json      # --word 省略=运行时自动取
 """
 
 from __future__ import annotations
@@ -29,6 +29,11 @@ import sys
 import time
 
 import torch
+
+import platform_check
+import whoami
+
+platform_check.require()
 
 from lora import freeze_all, inject_lora
 from sft import name_logprob, text_model
@@ -100,7 +105,10 @@ def main() -> int:
     ap.add_argument("--tokenizer", default="", help="HF tokenizer 目录（GGUF 里没有 BPE 规则）")
     ap.add_argument("--lora", default="", help="训练产物 .pt；不给就只跑 base/zero 两臂")
     ap.add_argument("--prompts", default=os.path.join(HERE, "prompts_identity.jsonl"))
-    ap.add_argument("--word", default="NovaCore", help="探针词：训练前后各测一次它的 logprob")
+    ap.add_argument("--word", default=None,
+                    help="探针词：训练前后各测一次它的 logprob。默认**运行时自动取**："
+                         f"${whoami.ENV_VAR} → GitHub 用户名 → `git config user.name`"
+                         f" → 兜底「{whoami.FALLBACK}」（见 whoami.py）")
     ap.add_argument("--probe", default="谁开发了你？")
     ap.add_argument("--max-new", type=int, default=40)
     ap.add_argument("--temperature", type=float, default=0.0, help="0=贪心（默认，便于比对）")
@@ -111,6 +119,8 @@ def main() -> int:
                     help="默认是引擎能回灌的两个投影；与训练时一致才载得进 lora_to_gguf.py")
     ap.add_argument("--out", default=os.path.join(HERE, "ab_identity.json"))
     args = ap.parse_args()
+    args.word, src = whoami.source(args.word)    # 不写死：见 whoami.py（先取来源再覆盖）
+    print(f"identity: {args.word}   ({src})", flush=True)
 
     prompts = [json.loads(line) for line in open(args.prompts, encoding="utf-8") if line.strip()]
     from transformers import AutoTokenizer

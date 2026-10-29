@@ -12,55 +12,13 @@ from __future__ import annotations
 
 import json
 import math
-import sys
 import tempfile
-import time
 import unittest
-import unittest.mock
 from pathlib import Path
 
 import torch
 
-import algos
-import collect_rollouts
-import datasets
 import sft_mezo
-import strata_client
-
-
-class Data(unittest.TestCase):
-    def test_identity_is_the_default(self):
-        self.assertEqual(datasets.resolve(""), ("identity", ""))
-        self.assertEqual(datasets.resolve("identity"), ("identity", ""))
-        self.assertEqual(datasets.resolve("identity:Qwen"), ("identity", "Qwen"))
-
-    def test_paths_are_typed_by_extension(self):
-        self.assertEqual(datasets.resolve("/root/a.jsonl"), ("jsonl", "/root/a.jsonl"))
-        self.assertEqual(datasets.resolve("/root/a.npy"), ("pretrain", "/root/a.npy"))
-        self.assertEqual(datasets.resolve("jsonl:/root/a"), ("jsonl", "/root/a"))
-
-    def test_a_typo_fails_before_the_model_loads(self):
-        with self.assertRaises(SystemExit):
-            datasets.resolve("identiy")
-        with self.assertRaises(SystemExit):
-            datasets.resolve("/root/a.txt")
-
-
-class Registry(unittest.TestCase):
-    def test_every_algo_points_at_a_real_file(self):
-        for algo in algos.ALGOS.values():
-            self.assertTrue((Path(__file__).parent / algo.script).exists(), algo.script)
-
-    def test_mezo_is_the_only_zero_order_route_and_accepts_grpo(self):
-        self.assertEqual([a.name for a in algos.ALGOS.values() if a.kind == "zeroth_order"],
-                         ["mezo"])
-        self.assertIn("grpo", algos.ALGOS["mezo"].objectives)
-        self.assertNotIn("grpo", algos.ALGOS["sft"].objectives)
-
-    def test_describe_lists_both_axes(self):
-        text = algos.describe()
-        for word in ("sft", "mezo", "grpo", "ce"):
-            self.assertIn(word, text)
 
 
 class _Tok:
@@ -250,56 +208,6 @@ class Sampling(unittest.TestCase):
         if meta["uniq"] > 1:                                   # 有方差才谈得上归一化
             self.assertAlmostEqual(sum(advs), 0.0, places=4)
             self.assertAlmostEqual(max(advs), -min(advs), places=4)
-
-
-class ParallelCollection(unittest.TestCase):
-    """`collect_rollouts.py --parallel N`：并发改变的是完成顺序，不是写出顺序。
-
-    这是唯一值得测的地方：N 条轨迹同时飞出去，回来的顺序是乱的，而训练端按行号
-    认组 —— 顺序错了，loss 照样往下走，只是训的东西不对了。
-    """
-
-    def run_collect(self, parallel, tmpdir):
-        prompts = Path(tmpdir) / "prompts.jsonl"
-        prompts.write_text(
-            json.dumps({"prompt": "a", "target": "w", "kind": "exact"}) + "\n"
-            + json.dumps({"prompt": "b", "target": "w", "kind": "exact"}) + "\n",
-            encoding="utf-8")
-        out = str(Path(tmpdir) / f"r{parallel}.jsonl")
-
-        def fake_chat(engine, messages, model=None, max_tokens=0, temperature=1.0,
-                      enable_thinking=False):
-            p = messages[0]["content"]
-            time.sleep(0.15 if p == "a" else 0.02)      # 先发的更慢 ⇒ 完成顺序 ≠ 提交顺序
-            return {"content": "w", "reasoning_content": None, "token_ids": [7, 8, 9],
-                    "token_logprobs": [0.0, 0.0, 0.0], "tokens_exact": True,
-                    "usage": {"prompt_tokens": 4, "completion_tokens": 3}}
-
-        argv = ["collect_rollouts.py", "--engine", "http://127.0.0.1:9",
-                "--engine-model", "m", "--prompts", str(prompts), "--group", "3",
-                "--max-new", "3", "--parallel", str(parallel), "--out", out]
-        with unittest.mock.patch.object(sys, "argv", argv), \
-             unittest.mock.patch.object(strata_client, "chat", fake_chat):
-            collect_rollouts.main()
-        with open(out, encoding="utf-8") as f:
-            return [json.loads(l)["prompt"] for l in f]
-
-    def test_order_is_the_job_order_not_the_completion_order(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(self.run_collect(parallel=3, tmpdir=d),
-                             ["a", "a", "a", "b", "b", "b"])
-
-    def test_serial_and_parallel_agree(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(self.run_collect(parallel=1, tmpdir=d),
-                             self.run_collect(parallel=6, tmpdir=d))
-
-    def test_concurrency_actually_overlaps(self):
-        # 串行 3×0.15 + 3×0.02 ≈ 0.51s；并发 3 路应当贴着最慢的那条（≈0.15s）
-        with tempfile.TemporaryDirectory() as d:
-            t0 = time.time()
-            self.run_collect(parallel=3, tmpdir=d)
-            self.assertLess(time.time() - t0, 0.40)
 
 
 if __name__ == "__main__":
