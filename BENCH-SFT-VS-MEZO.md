@@ -19,14 +19,19 @@ max 243 —— 125B 自己就跑到 160~190。35B 的 `strata-qwen36-lora.log` �
 | 数字 | 谁打的 | 模型 | 阶段 |
 |---|---|---|---|
 | **172.8 tok/s**（p50，888 请求；用户说的 160） | `strata-main-lp.log` | **125B IQ3_XXS** | **decode** |
-| **982 tok/s** | `build-lp\strata.exe` 今天实测 2047 token | 同一个 125B pack | prefill |
-| **62~70 tok/s** | `bench_infer.py`（WSL2） | 同一个 125B pack | prefill |
+| **1482 / 3824 / 4681**（p50 / p90 / max，n=888） | `strata-main-lp.log` | 同一个 125B pack | **prefill** |
+| **982 tok/s** | `build-lp\strata.exe` 实测 2047 token | 同一个 125B pack | prefill，**短 prompt，固定开销未摊开** |
+| **62~70 tok/s** | `bench_infer.py`（WSL2） | 同一个 125B pack | prefill（2047 token 一次前向） |
 | **2.0 tok/s**（506.9 ms/token） | `bench_decode.py`（WSL2） | 同一个 125B pack | **decode** |
 
 同一模型、同一份 pack，两档各自比：
 
-- **prefill**：982 → 62~70，差 **14~16×**（训练是 prefill 形状，这是训练该看的数）
-- **decode**：172.8 → 2.0，差 **86×**
+- **prefill**（训练是 prefill 形状，这是训练该看的数）：引擎 **1482（p50）~3824（p90）** → 训练 62~95，
+  差 **16~40×**
+- **decode**：引擎 172.8 → 训练 2.0，差 **86×**
+
+注意 2047 token 那个 982 不能当基准：prefill 有固定启动开销，短 prompt 摊不开，日志里 888 个真实
+请求的 p50 就是 1482、p90 3824、max 4681。拿 982 比会把差距缩小一半。
 
 decode 那档差得更多，原因是结构而不是 LoRA：引擎 decode 走 `--expert-cache` 常驻 + MTP
 推测解码（`drafts accepted 131 of 181`，一次前向出约 1.7 个 token），单 token 基本不搬专家；
@@ -174,7 +179,73 @@ memory=56GB
 cu13 wheel；`sft.py` 里 `resource.getrusage` / `/proc/self/statm` 是 Linux 专用，得改；
 而且 44 GiB 的 pinned 内存在 Windows 上同样很可能失败。
 
-## 7. 复现
+## 7. 加速拆解：T=2048 的 21.4 s 花在哪
+
+两个微基准（`_mb_tile.py`、`_mb_expert.py`）把时间拆开。
+
+### 7.1 kernel tile 调参是死路
+
+单专家形状 `gu(1280×2560)` + `dn(2560×640)`，T=64（= T2048 × top_k 8 / 256 experts）：
+
+| tile (BT,BO,BK) | ms | TFLOPS | 权重带宽 |
+|---|---|---|---|
+| **默认 (16,16,auto)** | **0.081** | 5.20 | 21.6 GB/s |
+| (16,32,auto) | 0.086 | 4.90 | 20.3 |
+| (64,32,64) | 0.084 | 4.97 | 20.6 |
+| (16,64)/(32,32)/(64,64) | `OutOfResources` | — | — |
+| 对照 dequant+cuBLAS | 0.212 | 1.98 | 解码 0.180 + GEMM 0.032 |
+
+`dn` 的最优是 (32,32) 0.050 ms（默认 0.055，仅 +9%）。默认已经最优，加大 tile 直接爆
+共享内存。5 TFLOPS 只有峰值的 3%，21 GB/s 远低于 L2 带宽 ⇒ **既不是算力也不是带宽瓶颈**，
+是 decode 的 LUT gather（`tl.load(code_ptr + nib)`，每权重元素一次 gather）与循环开销。
+
+顺带确认融合 kernel 本身是对的：对 `gu` 比 dequant+cuBLAS 快 2.6×，对 `dn` 快 6×。
+
+### 7.2 辅助 op 和矩阵乘一样贵
+
+真实形状（H=2560, I=640, T=2048, K=8, E=256）复现 forward 内层循环，并确认 **T=2048 时
+每层 256 个专家全部命中** ⇒ 每步 24576 次迭代、约 20 万次 torch 调用：
+
+```
+每专家 0.225 ms = 融合 GEMM 0.092 (40.9%) + 辅助 op 0.106 (47.3%) + 未归属 0.027 (12%)
+```
+
+辅助 op 指 `torch.where(mask[e])` / `hidden[tok]` / `top_k_weights[...]` / `index_add_`
+——**不产生任何数值，却吃掉 47%**。
+
+### 7.3 已归属 vs 未归属（诚实标注缺口）
+
+| 项 | 每步 | 来源 |
+|---|---|---|
+| 专家模块（GEMM + aux） | ≈ **5.5 s** | 微基准 24576 × 0.225 ms |
+| 传输 H2D | ≈ **6.9 s** | 拟合 0.361 s/GiB × 19 GiB |
+| **其余 ~9.6 s** | **未测量** | attention / dense / streaming 记账 |
+
+拟合出的计算项是 15.1 s，而专家模块只解释 5.5 s。**剩下 ~9.6 s 还没单独测过**，
+下一步应该先 instrument 再动手，否则优化的可能是小头。
+
+### 7.4 传输：H2D 与计算完全不重叠
+
+`loader_qwen4.py:436` 的 `copy_(..., non_blocking=True)` 跑在**当前默认 stream**，紧接着
+同 stream 就开始算。`non_blocking` 只解放了 CPU，GPU 上是串行的。拟合
+`dt = 0.361 s/GiB × H2D + 7.37 ms/token`，B=1/4/8 三点验证（B=8 预测 130.7 vs 实测 132.9）。
+源是 pageable（WSL 下 pin 43.8 GiB 失败）。
+
+### 7.5 优先级
+
+| # | 动作 | 依据 | 预期 |
+|---|---|---|---|
+| ① | 干掉逐专家 Python 循环（按专家排序 token，一次 scatter/gather + 批量 index_add） | aux 占 47% | 5.5 → ~2.6 s |
+| ② | H2D 独立 stream + 双缓冲 | 6.9 s 传输完全没被遮住 | 21.4 → ~14.5 s（95.6 → ~141 tok/s） |
+| ③ | 常驻 16 → 28 GiB | 传输 -18% | 需在 ② 之后才有意义 |
+| ④ | ctx 只存专家 id、backward 按 id 重流 | 消掉 92.63 GiB 与 ckpt | sft 34.6 → ~55 tok/s |
+| ⑤ | B>1 | 实测 B=8 是 B=1 的 1.32× | 白拿 +32% |
+
+①②③⑤ 全做完的现实上限约 **300~340 tok/s（prefill 形状）**，对比引擎 p50 1482 / p90 3824
+仍差 4~11×。要到那个量级必须 ④'：让量化 kernel 直接算（不做 bf16 展开、不做逐专家 gather），
+也就是引擎 1482~4681 tok/s 的真正来源。
+
+## 8. 复现
 
 ```bash
 # 长序列（同 seed 同批块）
