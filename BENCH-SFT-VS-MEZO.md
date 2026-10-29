@@ -9,17 +9,47 @@
 
 ## 0. 先钉口径：三个 tok/s 不是一回事
 
-这三个数经常被混着比，先拆开（同一台机器、同一张 4090）：
+这几个数经常被混着比，先拆开（同一台机器、同一张 4090）。
 
-| 数字 | 谁打的 | 模型 | 平台 | 阶段 |
-|---|---|---|---|---|
-| **192 tok/s**（≈快照里说的 160） | 桌面快捷方式 `Strata CN.lnk` → `START-CN.bat` → `launcher/start_server.py` → 最新 mtime 的 `strata-qwen36-devlora.json` → `build-q6k\strata.exe` | **Qwen3.6-35B-A3B-UD-Q4_K_XL**（35B 总参 / 3B 激活） | Windows 原生 | **decode**（逐 token 生成） |
-| **982 tok/s** | `build-lp\strata.exe`（feat/openai-logprobs） | **Swift-Qwen3.8-Flash-Next 125B IQ3_XXS**（与训练同一个 pack） | Windows 原生 | prefill（2047 token 一次前向） |
-| **62~70 tok/s** | `bench_infer.py` | 同上 125B IQ3_XXS | **WSL2** | prefill（2047 token 一次前向，含 chunked CE） |
+**更正**：早先这里写过「192 tok/s 是 35B-A3B、160 是另一个模型」，那条是错的。
+`strata-main-lp.log`（125B，888 个请求）的 decode 中位数就是 **172.8 tok/s**、p90 194.5、
+max 243 —— 125B 自己就跑到 160~190。35B 的 `strata-qwen36-lora.log` 是 192.4，两个模型
+在 decode 上几乎同值，**所以 decode tok/s 根本不能用来判别模型**。
 
-所以「引擎 160、训练 62」是模型不同（35B-A3B vs 125B）、阶段不同（decode vs prefill）的
-两个数。**真正可比的是 982 vs 62~70**：同一个模型、同一份 pack、同一个阶段，差 14~16×。
-这个差距的来源是实现而不是平台（见 §6）。
+| 数字 | 谁打的 | 模型 | 阶段 |
+|---|---|---|---|
+| **172.8 tok/s**（p50，888 请求；用户说的 160） | `strata-main-lp.log` | **125B IQ3_XXS** | **decode** |
+| **982 tok/s** | `build-lp\strata.exe` 今天实测 2047 token | 同一个 125B pack | prefill |
+| **62~70 tok/s** | `bench_infer.py`（WSL2） | 同一个 125B pack | prefill |
+| **2.0 tok/s**（506.9 ms/token） | `bench_decode.py`（WSL2） | 同一个 125B pack | **decode** |
+
+同一模型、同一份 pack，两档各自比：
+
+- **prefill**：982 → 62~70，差 **14~16×**（训练是 prefill 形状，这是训练该看的数）
+- **decode**：172.8 → 2.0，差 **86×**
+
+decode 那档差得更多，原因是结构而不是 LoRA：引擎 decode 走 `--expert-cache` 常驻 + MTP
+推测解码（`drafts accepted 131 of 181`，一次前向出约 1.7 个 token），单 token 基本不搬专家；
+训练路径每个 token 都要把该层未常驻的专家从 host 搬一遍（本例 VRAM 常驻 6579/24576 块，
+约 73% 要现搬）。这个差距的来源是实现而不是平台（见 §6）。
+
+### 配置口径（顺带查清：当前快捷方式已不在 125B 上）
+
+`launcher/start_server.py:241` 的 `stock_config()` 按 **mtime 最新**选 `strata-*.json`。
+各配置 mtime：
+
+| 配置 | mtime | 指向 |
+|---|---|---|
+| `strata-qwen36-devlora.json` | **10-28 11:21（最新）** | `build-q6k` + **Qwen3.6-35B-A3B-UD-Q4_K_XL** + LoRA |
+| `strata-qwen36-lora0.json` / `-lora.json` / `-train.json` | 10-28 07:14~10:17 | 同上 35B |
+| `strata-swift-iq3_xxs.json` | 10-20 01:25 | `build-lp` + **125B IQ3_XXS** |
+| `strata-main-lp.json` | 10-20 01:23 | `build-lp` + **125B IQ3_XXS** |
+
+所以 10-28 做 dev-lora 那批实验时写下的 35B 配置把 mtime 顶到了最前，**现在双击
+`Strata CN.lnk` 起的是 35B，不是 125B**。125B 的两份配置内容自 10-20 起没变
+（`strata-main-lp.log` 的启动命令行与 `strata-main-lp.json` 逐参数一致）。
+改回来只需让 125B 那份成为最新：`touch strata-main-lp.json`（配置被 `.gitignore:37`
+的 `/strata-*.json` 忽略，git 查不到历史，只能靠 mtime/内容判断）。
 
 ## 1. 长序列 T=2048（真实训练形状）
 
