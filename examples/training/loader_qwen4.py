@@ -480,16 +480,31 @@ class StreamingNF4Experts(nn.Module):
     def forward(self, hidden_states, top_k_index, top_k_weights):
         final = torch.zeros_like(hidden_states)
         with torch.no_grad():
+            # 一次拿到全量路由，替代原来「逐专家 torch.where」：
+            #  - 旧的 `[int(e[0]) for e in hit if int(e[0]) < N]` 每次迭代做两次阻塞式
+            #    DtoH，每层命中 256 个专家、共 96 层 ⇒ 每步约 4.9e4 次 cudaStreamSynchronize
+            #    （profiler 实测整步 81,673 次同步 + 81,667 次 DtoH），GPU 因此空转 ~2/3。
+            #  - 旧的 `torch.where(mask[e])` 每步 24,576 次 nonzero，每次内部一轮 cub radix sort
+            #    （profiler 里 24,712 / 24,624 / 24,540 那串等值计数就是它）。
+            # nonzero 在 [E,K,N] 上按 c-order 返回，e-major / k / n，与旧逐专家 where 的
+            # (pos=k, tok=n) 行主序完全同序 ⇒ index_add_ 的累加顺序不变，逐位可比。
             mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-            hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
-        hits = [int(e[0]) for e in hit if int(e[0]) < self.num_experts]
+            nz = mask.nonzero()                        # [n, 3] = (expert, k, t)
+            counts = torch.bincount(nz[:, 0], minlength=self.num_experts)
+            bounds = torch.cumsum(counts, 0).tolist()  # 全步唯一一次 DtoH
+        prev, hits = 0, []
+        for e, end in enumerate(bounds):
+            if end > prev:
+                hits.append(e)
+            prev = end
         if not hits:
             return final
 
         for group, tensors in self._stream_groups(hits, hidden_states.device):
             for e in group:
                 gu, ga, dn, da = tensors[e]
-                pos, tok = torch.where(mask[e])
+                rows = nz[bounds[e - 1] if e else 0:bounds[e]]
+                pos, tok = rows[:, 1], rows[:, 2]
                 x = hidden_states[tok]
                 gate, up = fused_nf4_linear(x, gu, ga).chunk(2, dim=-1)
                 h = self.act_fn(gate) * up
