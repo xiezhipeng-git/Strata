@@ -440,17 +440,16 @@ class StreamingNF4Experts(nn.Module):
         # cpu_buf 没能锁页（WSL 下 43.8 GiB pin 会失败），整块直连仍然值得：调用次数
         # 从 4 次 copy_ + 线程池 submit 降到 1 次 copy_ + 4 次 view。
         #
-        # 只在 no-grad 下启用：这条路径返回的是 st.raw[slot] 上的 **视图**，slot 会随组
-        # 轮转被覆盖。纯前向/MeZO 无所谓，但反传时 fused NF4 Function 把
-        # packed/absmax/code 存进了 ctx（save_for_backward），缓冲一被回收就撞
-        # "variables needed for gradient computation has been modified by an inplace
-        # operation ... [ByteTensor [2560, 320]] is at version N"。旧路径每个专家
-        # `.to(dev)` 都是独立新张量，所以从来不会踩这个坑 —— 这是整块 H2D 引入的回归，
-        # 判据是 T=2048 反传（不开 ckpt）报 version 错，而开 ckpt 恰好因为
-        # use_reentrant=False 在第一遍前向里 no_grad 而不报。
-        # 正确的反传加速要等"按层分配、层内不复用"的缓冲，不是放宽这个门。
-        use_raw = (st.raw_ok and not torch.is_grad_enabled()
-                   and os.environ.get("STRATA_PACK_RAW_H2D", "1") != "0")
+        # 反传模式下曾经必须关掉：这条路径返回的是 st.raw[slot] 上的 **视图**，slot 会随
+        # 组轮转被覆盖，而 fused NF4 Function 把 packed/absmax 存进了 ctx
+        # （save_for_backward），缓冲一被回收就撞 "variables needed for gradient
+        # computation has been modified by an inplace operation ... is at version N"。
+        # 现在的做法是 grad 下**每个专家分配独立显存块**（而不是复用 slot）：多一次
+        # `torch.empty`（缓存分配器约 2 µs），换来同样只做 1 次整块 copy_ + 4 次 view。
+        # 显存代价按层计：一层 512 个专家 x 2.49 MiB = 1.27 GiB，该层反传完即释放，
+        # 只在开 ckpt（逐层重算）时可接受 —— 不开 ckpt 时所有权重本来就会进图，仍然 OOM。
+        use_raw = st.raw_ok and os.environ.get("STRATA_PACK_RAW_H2D", "1") != "0"
+        grad = torch.is_grad_enabled()
 
         def submit(gi, slot):
             """把该组驻内存块的 pinned 拷贝提交进线程池，返回 [(组内序, 专家, fut)]。"""
@@ -476,17 +475,24 @@ class StreamingNF4Experts(nn.Module):
                 f.result()
             out = {}
             if use_raw:
-                raw, rb = st.raw[slot], st.raw_bb
+                rb = st.raw_bb
+                raw = None if grad else st.raw[slot]
                 for i, e in enumerate(hits[gi * G:(gi + 1) * G]):
                     off, _ = self._offs[("gu", e)]
                     idx = tp.resident_gpu(off)
                     if idx >= 0:
                         out[e] = tp.gpu_views(idx, self._gu_shape, self._dn_shape, seg_sizes)
                         continue
-                    base = i * rb
-                    raw[base:base + rb].copy_(tp.host_block(off, rb), non_blocking=True)
+                    if grad:
+                        # 每专家一块独立显存：反传时要它一直活着，不能与 slot 别名
+                        blk = torch.empty(bb, dtype=torch.uint8, device=dev)
+                        base = 0
+                    else:
+                        blk = raw
+                        base = i * rb
+                    blk[base:base + rb].copy_(tp.host_block(off, rb), non_blocking=True)
                     _XFER["bytes"] += rb
-                    out[e] = _seg_views(raw, base, seg_sizes, self._gu_shape, self._dn_shape)
+                    out[e] = _seg_views(blk, base, seg_sizes, self._gu_shape, self._dn_shape)
                 return out
             gu_b, ga_b, dn_b, dam_b = bufs[slot]
             for i, e in enumerate(hits[gi * G:(gi + 1) * G]):
