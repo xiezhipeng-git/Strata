@@ -1,5 +1,31 @@
 # Training examples: Strata as the rollout engine
 
+## Start here: `train.py`
+
+One command, no path archaeology:
+
+```bash
+python3 train.py                        # identity data + backprop SFT + the model you pinned
+python3 train.py --dry-run              # show the final command without loading anything
+python3 train.py --list                 # algorithms / objectives / datasets
+python3 train.py --algo mezo            # zero-order, same data, memory = inference + 0.4 GiB
+python3 train.py --algo mezo --objective grpo --rollouts r.jsonl
+python3 train.py --data jsonl:/root/my.jsonl --steps 200 --out /root/lora.pt
+```
+
+Defaults, and why they are defaults:
+
+- **model** — the one `launcher/launch-choice.json` pins, i.e. what `Strata CN.lnk` starts.
+  `train.py` imports `launcher/start_server.py`'s `stock_config()` instead of re-implementing
+  the selection, so "the model I am training" and "the model I am serving" cannot drift apart.
+  Windows paths are converted for WSL, and a `…-00001-of-00002.gguf` is expanded to all shards
+  (passing only the first shard silently loads fewer layers).
+- **data** — `identity`: the built-in "change who you are" set (it is the only task with a
+  unique answer, so `logp('Strata' | '你是谁')` is a clean before/after judge). Switch with
+  `--data identity:<word>`, `jsonl:<path>` or `pretrain:<npy>`; see `datasets.py`.
+- **algorithm** — `sft` (backprop). `algos.py` keeps algorithm and objective on separate axes:
+  `--algo sft|mezo|grpo` × `--objective ce|grpo`. Registering PPO/DPO later is one entry there.
+
 These scripts are a **worked example, not a framework**: a minimal, self-contained
 SFT / GRPO loop where the Strata engine produces the trajectories (exact token ids,
 the engine's own logprobs) and a student model — the same weights, quantized to
@@ -30,6 +56,9 @@ neither model).
 
 | file | role |
 |---|---|
+| `train.py` | the default entry: model from the launcher pin, dataset switch, algorithm switch |
+| `algos.py` / `datasets.py` | the two registries behind `train.py` (algorithm × objective; data sources) |
+| `test_train.py` | CPU-only tests for the three places that fail quietly: dataset routing, algo/objective pairs, the GRPO scalar |
 | `collect_rollouts.py` | phase 1: sample GRPO trajectories from a running engine (needs no torch) |
 | `grpo.py` | phase 2: group-normalized policy gradient over the collected trajectories, `--old-logprobs engine\|local` |
 | `sft.py` | supervised path: teach a behavior from `(prompt, answer)` pairs; answer tokens only |

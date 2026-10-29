@@ -29,6 +29,15 @@ engine forward，内存/显存/调度全部交还引擎 —— 那才是这条�
   python3 sft_mezo.py --gguf <shards...> --pack /root/experts_nf4.bin \
       --tokenizer ~/models/qwen36-35b-a3b --steps 20 --lr 1e-6 \
       --targets o_proj,out_proj --out /tmp/lora_mezo.pt
+
+目标函数可换（2026-10-29）：优化器与目标本来是正交的，这里把目标做成了插座 ——
+  --objective ce     默认，answer 段的交叉熵（SFT 口径）
+  --objective grpo   组内归一化优势 × 裁剪比，需要 --rollouts <轨迹 jsonl>
+零阶只要求「给定 θ，返回一个标量」，而 GRPO 的目标本来就只用 logprob 之比，
+所以**不反传也能做 RL**：ratio = exp(logp_new − logp_old)，old 取轨迹自带（engine）
+或当前 θ 重算（local）。组内 std=0 时优势全 0、这一步不动任何参数 —— 日志里打
+`adv0` 与「有效组数」就是为了把「跑完了」和「学到了」分开。默认入口是
+`train.py --algo mezo --objective grpo`。
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ import random
 import sys
 import time
 import types
+from dataclasses import dataclass
 
 import torch
 
@@ -93,6 +103,94 @@ def sample_loss(body, head, ids, plen, reduction: str) -> float:
     return float(-picked.sum() if reduction == "sum" else -picked.mean())
 
 
+@dataclass
+class _Traj:
+    """一条轨迹：整串 ids、prompt 长度、旧策略 logprob、组内优势、奖励。"""
+
+    ids: torch.Tensor
+    n_prompt: int
+    old: torch.Tensor
+    adv: float
+    reward: float
+
+
+@torch.no_grad()
+def grpo_loss(body, head, group: list[_Traj], clip: float) -> tuple[float, dict]:
+    """GRPO 的裁剪代理目标，只在前向里算 —— 这正是 MeZO 要的「标量目标」。
+
+        ratio = exp(logp_new − logp_old)
+        L     = −mean min(ratio·A, clip(ratio, 1±ε)·A)
+
+    A（组内归一化优势）在轨迹进来时就定了，所以它是个常数；θ 只通过 ratio 进来。
+    `adv == 0` 的轨迹对目标没有贡献（组内全对或全错），`dead` 就是它们的占比 ——
+    和 grpo.py 的 `zero_std` 是同一件事：跑完了不等于学到了。
+    """
+    total, ratios, dead = 0.0, [], 0
+    for t in group:
+        labels = t.ids[0, t.n_prompt:]
+        h = body(input_ids=t.ids, use_cache=False).last_hidden_state[0, t.n_prompt - 1:-1]
+        new = token_logprobs(h, head, labels, chunk=128)
+        ratio = torch.exp(new - t.old)
+        obj = torch.minimum(ratio * t.adv,
+                            torch.clamp(ratio, 1 - clip, 1 + clip) * t.adv)
+        total += -float(obj.mean())
+        ratios.append(float(ratio.mean()))
+        dead += int(t.adv == 0.0)
+    n = max(1, len(group))
+    return total / n, {"ratio": sum(ratios) / max(1, len(ratios)),
+                       "dead": dead / n}
+
+
+def load_rollout_groups(path: str, tok) -> tuple[list[list[_Traj]], dict]:
+    """轨迹 jsonl → 按 prompt 分组（文件里同一个 prompt 的采样是连续写的）。
+
+    组内归一化就是 GRPO 的基线；`std == 0` 的组优势全 0、这一步不动参数，所以这里把
+    「有效组数」交回去，日志里必须看得见（grpo.py 的 `groups_used` 是同一口径）。
+    """
+    from grpo import reward_of
+
+    with open(path, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    if not rows:
+        raise SystemExit(f"--rollouts {path}: 空的")
+
+    groups_raw: list[list[dict]] = []
+    for r in rows:                       # 连续同 prompt 归一组
+        if groups_raw and groups_raw[-1][0]["prompt"] == r["prompt"]:
+            groups_raw[-1].append(r)
+        else:
+            groups_raw.append([r])
+
+    groups: list[list[_Traj]] = []
+    used = 0
+    for g in groups_raw:
+        rew = torch.tensor([reward_of(r) for r in g], dtype=torch.float32)
+        advs = torch.zeros(len(g))
+        if len(g) > 1 and float(rew.std()) > 0.0:
+            advs = (rew - rew.mean()) / (rew.std() + 1e-4)
+            used += 1
+        built = []
+        for r, a in zip(g, advs):
+            prompt_ids = r.get("prompt_ids") or tok.apply_chat_template(
+                [{"role": "user", "content": r["prompt"]}], add_generation_prompt=True,
+                return_dict=False, enable_thinking=False)
+            comp = r.get("token_ids") or tok(r["content"], add_special_tokens=False).input_ids
+            if not comp:
+                continue
+            ids = torch.tensor([list(prompt_ids) + list(comp)],
+                               device="cuda" if torch.cuda.is_available() else "cpu")
+            old = None
+            if r.get("token_logprobs") and len(r["token_logprobs"]) == len(comp):
+                old = torch.tensor(r["token_logprobs"], dtype=torch.float32,
+                                   device=ids.device)
+            built.append(_Traj(ids, len(prompt_ids), old, float(a), float(reward_of(r))))
+        if built:
+            groups.append(built)
+    meta = {"rollouts": len(rows), "groups": len(groups), "used": used}
+    return groups, meta
+
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="", help="HF 权重目录（不用 GGUF 时）")
@@ -124,6 +222,14 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0,
                     help="数据洗牌种子（与 sft.py 同口径，A/B 时两条路线走同一批块）")
     ap.add_argument("--probe", default="你是谁")
+    ap.add_argument("--objective", choices=("ce", "grpo"), default="ce",
+                    help="目标函数。ce=SFT 口径；grpo=组内优势 × 裁剪比，需要 --rollouts。"
+                         "零阶优化器本身对两者无感 —— 它只要一个标量")
+    ap.add_argument("--rollouts", default="", help="--objective grpo 的轨迹 jsonl")
+    ap.add_argument("--clip", type=float, default=0.2, help="GRPO 裁剪宽度 ε")
+    ap.add_argument("--old-logprobs", choices=("engine", "local"), default="engine",
+                    help="旧策略概率来源：engine=轨迹里带的（严格 on-policy，免费）；"
+                         "local=当前 θ 重算（每组多 1 次前向，但不受量化差影响）")
     args = ap.parse_args()
     data = ([(r["prompt"], r["answer"])
              for r in (json.loads(line) for line in open(args.data, encoding="utf-8") if line.strip())]
@@ -168,11 +274,35 @@ def main() -> int:
           f"({s['pct']:.6f}%)", flush=True)
 
     body, head = text_model(model), model.lm_head
-    lp0 = name_logprob(body, head, tok, args.probe, args.word)
-    print(f"before: logp('{args.word}' | {args.probe!r}) = {lp0:.4f} "
-          f"(p={math.exp(lp0):.8f})", flush=True)
+    ce_mode = args.objective == "ce"
+    lp0 = (name_logprob(body, head, tok, args.probe, args.word) if ce_mode else 0.0)
+    if ce_mode:
+        print(f"before: logp('{args.word}' | {args.probe!r}) = {lp0:.4f} "
+              f"(p={math.exp(lp0):.8f})", flush=True)
 
-    if args.pretrain_data:
+    # ---------------- 目标：ce（SFT 口径）/ grpo（组内优势 × 裁剪比） ----------------
+    groups = None
+    if args.objective == "grpo":
+        if not args.rollouts:
+            raise SystemExit("--objective grpo 需要 --rollouts <jsonl>"
+                             "（collect_rollouts.py 或 grpo.py --no-student 的产物）")
+        groups, gmeta = load_rollout_groups(args.rollouts, tok)
+        refill = [t for g in groups for t in g
+                  if t.old is None or args.old_logprobs == "local"]
+        with torch.no_grad():
+            for t in refill:
+                labels = t.ids[0, t.n_prompt:]
+                h = body(input_ids=t.ids, use_cache=False).last_hidden_state[0, t.n_prompt - 1:-1]
+                t.old = token_logprobs(h, head, labels, chunk=128).clone()
+        print(f"rollouts: {gmeta['rollouts']} 条 / {gmeta['groups']} 组，有效组 {gmeta['used']}"
+              f"（std=0 的组优势全 0，不会动参数）；old logprob 来自 "
+              f"{'engine（轨迹自带）' if not refill else 'local（当前 θ 重算）'}"
+              f"，其中重算 {len(refill)} 条", flush=True)
+        if gmeta["used"] == 0:
+            print("警告：没有一组有方差 —— 优势全 0，这一步不会动任何参数"
+                  "（GRPO 的冷启动问题：先用 SFT 把目标行为抬起来）", flush=True)
+        enc = None
+    elif args.pretrain_data:
         import numpy as np
 
         blocks = np.load(args.pretrain_data)
@@ -196,22 +326,32 @@ def main() -> int:
     order, cursor = [], 0
     for step in range(1, args.steps + 1):
         t0 = time.time()
-        if cursor >= len(order):
-            order = torch.randperm(len(enc), generator=shuffle).tolist()
-            cursor = 0
-        full, plen = enc[order[cursor]]
-        cursor += 1
-        ids = torch.tensor([full], device=device)
-        ntoks = len(full) - (plen - 1)          # answer 段长度（plen=1 时整块）
+        if groups is not None:
+            # 一步吃一组轨迹：GRPO 的基线只在组内有意义，拆开就不是 GRPO 了
+            g = groups[(step - 1) % len(groups)]
+            ntoks = sum(int(t.ids.shape[1]) - t.n_prompt for t in g)
+            measure = lambda _g=g: grpo_loss(body, head, _g, args.clip)   # noqa: E731
+            label = "obj"
+        else:
+            if cursor >= len(order):
+                order = torch.randperm(len(enc), generator=shuffle).tolist()
+                cursor = 0
+            full, plen = enc[order[cursor]]
+            cursor += 1
+            ids = torch.tensor([full], device=device)
+            ntoks = len(full) - (plen - 1)          # answer 段长度（plen=1 时整块）
+            measure = lambda _i=ids, _p=plen: (                        # noqa: E731
+                sample_loss(body, head, _i, _p, args.loss_reduction), {})
+            label = "loss"
 
         # K 个独立 z 采样：每个 2 次前向，pj 取平均
-        qs, loss_pos, loss_neg = [], 0.0, 0.0
+        qs, loss_pos, loss_neg, info = [], 0.0, 0.0, {}
         for _ in range(args.queries):
             seed = rng.randrange(1 << 31)
             perturb(params, seed, +1, args.eps)
-            lp_ = sample_loss(body, head, ids, plen, args.loss_reduction)
+            lp_, info = measure()
             perturb(params, seed, -2, args.eps)
-            lm_ = sample_loss(body, head, ids, plen, args.loss_reduction)
+            lm_, _ = measure()
             perturb(params, seed, +1, args.eps)  # 复原 θ
             qs.append((seed, (lp_ - lm_) / (2 * args.eps)))
             loss_pos += lp_
@@ -231,15 +371,18 @@ def main() -> int:
             p.data.add_(m, alpha=-args.lr)
 
         dt = time.time() - t0
-        print(f"step {step}: loss+ {loss_pos / args.queries:.4f}  "
-              f"loss- {loss_neg / args.queries:.4f}  proj_grad {pj:.4e}  "
+        # GRPO 那两个诊断数取自 +εz 那次评估：ε=1e-3，与 θ 处的差异在 4 位有效数字内可忽略
+        extra = (f"  ratio {info['ratio']:.4f}  adv0 {info['dead']:.2f}" if info else "")
+        print(f"step {step}: {label}+ {loss_pos / args.queries:.4f}  "
+              f"{label}- {loss_neg / args.queries:.4f}  proj_grad {pj:.4e}  "
               f"loss_tokens {ntoks}  tok/s {ntoks / dt:.1f}  "
-              f"{dt:.1f}s  peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB",
+              f"{dt:.1f}s  peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB{extra}",
               flush=True)
 
-    lp1 = name_logprob(body, head, tok, args.probe, args.word)
-    print(f"after:  logp('{args.word}' | {args.probe!r}) = {lp1:.4f} (p={math.exp(lp1):.8f})   "
-          f"Δ={lp1 - lp0:+.4f} nats", flush=True)
+    if ce_mode:
+        lp1 = name_logprob(body, head, tok, args.probe, args.word)
+        print(f"after:  logp('{args.word}' | {args.probe!r}) = {lp1:.4f} "
+              f"(p={math.exp(lp1):.8f})   Δ={lp1 - lp0:+.4f} nats", flush=True)
 
     sd = {k: v.detach().cpu() for k, v in model.state_dict().items()
           if k.endswith(".A") or k.endswith(".B")}
