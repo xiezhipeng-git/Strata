@@ -105,6 +105,9 @@ def main() -> int:
     seq: list[str] = []
     dig: dict[str, list[str]] = {}
     depth_of: dict[str, int] = {}
+    # 额外记录若干模块的**输入**指纹：GDN 的 chunk 函数不是 nn.Module，没有 hook，
+    # 只能借下游模块（linear_attn.norm）的输入看它的输出是否已分叉。
+    in_names = ("linear_attn.norm", "linear_attn.conv1d")
 
     def mk(name):
         def hook(mod, inp, out):
@@ -116,6 +119,13 @@ def main() -> int:
             b = t.detach().to("cpu", non_blocking=False).contiguous()
             dig.setdefault(name, []).append(hashlib.blake2b(
                 b.view(torch.uint8).reshape(-1).numpy().tobytes(), digest_size=6).hexdigest())
+            if name.endswith(in_names) and inp:
+                ti = first_tensor(inp)
+                if ti is not None:
+                    bi = ti.detach().to("cpu", non_blocking=False).contiguous()
+                    dig.setdefault(name + "#in", []).append(hashlib.blake2b(
+                        bi.view(torch.uint8).reshape(-1).numpy().tobytes(),
+                        digest_size=6).hexdigest())
         return hook
 
     handles = []

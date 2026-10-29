@@ -144,7 +144,10 @@ QLoRA 省显存靠的是「权重只以量化形式常驻，反传时现场 dequ
 约 2%。换成 8-bit 状态能省 ~1 GB —— 不是这次爆显存的原因，但等 66 GiB 消掉之后它就
 占到可观比例了，届时值得一起做。
 
-## 5. 本轮修掉的两个测量缺陷
+## 5. 本轮修掉的三个缺陷
+
+第 3 条对结论影响最大：它说明「同配置两次跑的 loss 差 0.06~1.44」不全是数据顺序造成的，
+而是一半权重被读错。
 
 1. **整块 H2D 与反传别名冲突（回归）**。`loader_qwen4.py` 的「整块一次 `copy_` + 显存侧
    四段 view」返回的是共享 staging 缓冲上的视图，slot 会轮转覆盖。纯前向无所谓，但反传时
@@ -152,10 +155,35 @@ QLoRA 省显存靠的是「权重只以量化形式常驻，反传时现场 dequ
    `variables needed for gradient computation has been modified by an inplace operation
    ... [ByteTensor [2560, 320]] is at version N`。旧的 per-expert `.to(dev)` 每块都是独立
    新张量，所以从没踩过。现在该快路径只在 `not torch.is_grad_enabled()` 下启用。
-2. **数据顺序没固定**。`sft.py` 用的是无 seed 的 `randperm`，不同 run 命中的专家数不同
-   （同配置 loss 在 0.06~1.44 之间跳），s/step 的差异里混着大量数据噪声。现在
+2. **数据顺序没固定**。`sft.py` 用的是无 seed 的 `randperm`，不同 run 命中的专家数不同，
+   s/step 的差异里混着大量数据噪声。现在
    `sft.py` / `sft_mezo.py` / `bench_infer.py` / `bench_cmp.py` 统一 `--seed`，
    四条变体走同一批块。
+3. **显存那半 pack 被静默损坏（最重要，commit `df0b90ca`）**。这一条推翻了我上一版写在
+   这里的结论「这条前向本身不可复现，loss 差 <0.1 nats 是噪声」——**那个漂移是 bug，不是
+   模型噪声**。`_TieredPack._ensure` 用**单个** pinned stage 缓冲逐 chunk `preadv`，而
+   `copy_(stage, non_blocking=True)`（源是 pinned ⇒ 真异步 DMA）还在读它，唯一的
+   `synchronize()` 在整轮循环之后。RAM 那半是 preadv 直接进 `cpu_buf`（同步）所以完好，
+   **只有驻显存那部分被覆写**：同一份文件两次加载对比，layer 0 的 512 个专家里
+   **150 个字节不同**，而全走 RAM staging 的 layer 40 一个字节不差。
+   判据链条（全部是指纹，不是推断）：
+
+   | 检查 | 结果 |
+   |---|---|
+   | 同进程连续 3 次前向 | 逐位一致（digest SAME） |
+   | 两个进程同一输入 | 三个用例 CE 全不同（0.5179/0.4094、0.0331/0.0254、1.1918/0.9934） |
+   | 1069 个参数/缓冲跨进程 | **0 差异**（稠密权重没问题） |
+   | 逐模块输出跨进程 | 到 `layers.0.mlp.gate`（路由 logits）为止**逐位一致**，第一处不同是 layer 0 第一个 `experts.act_fn`；命中专家数 116 vs 116 相同 |
+   | 专家块指纹 | layer 0（512 全 resident）**150 个不同**，layer 40（512 全走 RAM）**0 个不同** |
+
+   「同进程稳定、跨进程变」正是加载期状态决定的特征，不是非确定 kernel（那会在进程内也散）；
+   `use_deterministic_algorithms(True, warn_only=True)` 也没有任何警告。
+   修法：两个 pinned stage + 每 stage 一个 Event（覆写前等自己上一次 DMA），保留 preadv/DMA
+   重叠。验证：前 512 块「文件字节 vs 显存」**MATCH**（修复前 MISMATCH）；5123 个张量指纹
+   跨进程差异 **598 → 0**；跨进程 CE 两个用例现已相同。
+
+   ⇒ **本文件里所有 loss/CE 都产自「前 13 层专家被损坏」的基座**（6579 块常驻 ≈ 12.8 层），
+   计时不受影响（工作量没变），但 sft vs MeZO 的配对必须重测。
 
 ## 6. 平台：WSL 是不是拖慢了？（结论：不是主因）
 
