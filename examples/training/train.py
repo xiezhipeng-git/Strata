@@ -268,7 +268,7 @@ def main() -> int:
 
     shards, pack, tok, origin = resolve_model(a)
     argv = build_argv(a, shards, pack, tok)
-    kind, arg = _resolve_data(a.data, a.word)
+    kind, arg = ("rollouts", a.rollouts) if a.objective == "grpo" else _resolve_data(a.data, a.word)
 
     print("=" * 78, flush=True)
     print(f"algo      {a.algo}（{algos.ALGOS[a.algo].kind}）  objective {a.objective}")
