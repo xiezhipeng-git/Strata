@@ -64,7 +64,9 @@ neither model).
 | `sft.py` | supervised path: teach a behavior from `(prompt, answer)` pairs; answer tokens only |
 | `lora_to_gguf.py` | pack a trained `.pt` into an adapter GGUF the engine loads |
 | `strata_client.py` | the OpenAI-shaped client the phase-1 scripts share (bypasses proxies for 127.0.0.1) |
+| `loader_qwen4.py` | the 125B path: streams IQ3_XXS experts from the NF4 pack, one layer at a time, `fused_nf4_linear` for both GEMMs |
 | `loader.py` / `nf4.py` / `qexperts.py` | the student: every weight of the model kept (vision and MTP included), experts in 4-bit |
+| `LORA-MERGE.md` | **method only, not implemented**: what merging a LoRA into the weights would buy (~1–2% decode) and why re-quantizing 76 GB is the wrong way to get it |
 | `lora.py` / `ce.py` | LoRA injection and the chunked cross-entropy |
 | `unilora.py` / `test_unilora.py` | Uni-LoRA: one shared trainable vector for the whole model (Li et al., NeurIPS 2025) |
 | `data_developer.jsonl` | SFT example data ("who developed you" -> NovaCore) |

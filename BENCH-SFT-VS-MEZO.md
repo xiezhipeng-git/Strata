@@ -604,3 +604,27 @@ saved /root/lora_grpo_smoke.pt: 96 tensors, non-zero 96
 
 `train.py` 复用同一份逻辑（直接 import `start_server.py` 的 `stock_config()`/`read_cfg()`），
 所以「训练用的模型」和「正在跑的模型」不会分叉。
+
+## 11. 剩下的三条杠杆（都**没**实施，附判据与预期）
+
+稳态基线：**22.59 s/步 = 90.7 tok/s**（T=2048、batch=1；前向 4.36 s + ckpt 段 18.23 s）。
+每步 48 层 × 512 专家 = **24,576 次专家访问**，单次约 330 µs（微基准：no_grad 98.9 µs、
+建图 112.8 µs、建图+反传 330.0 µs）。折算 **≈3 TFLOPS**，即 4090 bf16 峰值的 **2%**
+⇒ 当前不是算力瓶颈，是「小 tile + 逐次 launch」的填充率瓶颈。这就是下面三条的依据。
+
+| # | 杠杆 | 改什么 | 预期 | 工作量 | 风险 |
+|---|---|---|---|---|---|
+| ① | 融合 epilogue | `_nf4_fwd_kernel` 里把 `silu(gate)*up` 直接写进 gu GEMM 的 epilogue；dn GEMM 的 epilogue 乘 `grp` 后直接累加 | 每专家 9 个 dispatch op → 6~7 个 ⇒ **18.2~20.8 s（98~112 tok/s）** | 中（两个 kernel，逐值需回归） | 低（fp32 epilogue 比现在的 bf16 中间结果更准） |
+| ② | **分组 GEMM** | 一层 512 个专家合成一次 segmented GEMM（按 `bounds` 切段），反传同样分组 | 24,576 次 launch → 96 次；tile 填充率从「32×1280 单专家 ≈ 10 CTA」变成 5,120 CTA 并发 ⇒ **预计 8~12 s/步（170~250 tok/s）** | 高（Triton grouped GEMM + 分段 reduction + backward） | 中（累加顺序变，必须给 CE 门禁） |
+| ③ | 去掉 ckpt | ctx 只存专家 id，backward 按 id 重流权重；权重永不进图 | 省掉整段重算 ⇒ **18.2 s/步（113 tok/s）** | 中高（自定义 autograd，需与 ckpt 路径逐值对照） | 中（配错会静默算错梯度） |
+
+**②是唯一改变算术强度的一条**，①②③里只有它能把「2% 峰值」往上抬；①③只是把
+「2% 峰值 × 更少的 op / 更少的遍数」乘小。三者可叠加，但 ② 与 ① 在同一个 kernel 里，
+先做 ② 会把 ① 重写一遍，所以顺序建议 **③ → ① → ②**（③ 与 kernel 无关，先拿 +24% 的无风险收益）。
+
+**为什么先不动 ②**：它要重写前向与反传两个 Triton kernel 并重排 `index_add_` 的累加顺序，
+必须有「同 seed 同数据下 loss/CE 相对 ckpt 路径的偏差」这道门；而这台机器每验证一次要独占
+GPU ~40 分钟（模型加载 ~100 s + 40 步）。开工前需要一次明确的长跑窗口。
+
+**显存侧还没有动的**：24/20/16 GiB 三档只压了显存（见 §7.9）。RAM 侧（pinned 30 GiB +
+pageable + RSS 46 GiB）尚未做过任何取舍实验 —— 这一项与速度无冲突，是先能拿的。
