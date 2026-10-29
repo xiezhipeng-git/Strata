@@ -249,17 +249,30 @@ class Whoami(unittest.TestCase):
 
     def test_precedence_word_env_origin_github_git(self):
         # 完整取值顺序：--word > env > GitHub > origin > git 身份。
-        # 每一级都给一个可区分的名字，逐级拿掉后看下一级接住。
-        def named(fn, v):
-            return unittest.mock.patch.object(whoami, fn, lambda *a: v)
-        with unittest.mock.patch.dict(os.environ, {}, clear=True):
-            with named("github_login", "gh-x"), named("origin_login", "or-x"), \
-                 named("git_user_name", "git-x"):
-                self.assertEqual(whoami.source(), ("gh-x", "github"))
-            with named("origin_login", "or-x"), named("git_user_name", "git-x"):
-                self.assertEqual(whoami.source(), ("or-x", "origin"))
-            with named("git_user_name", "git-x"):
-                self.assertEqual(whoami.source(), ("git-x", "git"))
+        # 每个子块先把**三条探测路全部堵成 None**，再单独放行被测那一级 ——
+        # 少堵一条，这条用例就会在 GitHub runner 上从真 origin 里"碰巧"解析出
+        # 用户名（第一个版本就是这么红的：只 mock 了 git_user_name）。
+        # 直接用 ExitStack 写：三条探测路全堵成 None，唯独放行参数给值的那些。
+        import contextlib
+
+        def with_probes(github=None, origin=None, git=None):
+            stack = contextlib.ExitStack()
+            stack.enter_context(unittest.mock.patch.dict(os.environ, {}, clear=True))
+            for pname, val in (("github_login", github), ("origin_login", origin),
+                               ("git_user_name", git)):
+                stack.enter_context(unittest.mock.patch.object(
+                    whoami, pname, (lambda *a, _v=val: _v) if val is not None
+                    else (lambda *a: None)))
+            return stack
+
+        with with_probes(github="gh-x", origin="or-x", git="git-x"):
+            self.assertEqual(whoami.source(), ("gh-x", "github"))
+        with with_probes(origin="or-x", git="git-x"):
+            self.assertEqual(whoami.source(), ("or-x", "origin"))
+        with with_probes(git="git-x"):
+            self.assertEqual(whoami.source(), ("git-x", "git"))
+        with with_probes():
+            self.assertEqual(whoami.source(), (whoami.FALLBACK, "fallback"))
 
     def test_placeholder_substitution(self):
         self.assertEqual(whoami.apply("我由 {dev} 开发和维护。", "carol"),
