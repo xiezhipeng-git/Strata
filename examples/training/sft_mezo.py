@@ -121,6 +121,8 @@ def main() -> int:
     ap.add_argument("--data", default="")
     ap.add_argument("--pretrain-data", default="")
     ap.add_argument("--seqlen", type=int, default=2048)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="数据洗牌种子（与 sft.py 同口径，A/B 时两条路线走同一批块）")
     ap.add_argument("--probe", default="你是谁")
     args = ap.parse_args()
     data = ([(r["prompt"], r["answer"])
@@ -186,13 +188,16 @@ def main() -> int:
     print(f"zo dimension d = {sum(p.numel() for p in params):,}（单步估计 cos ~ 1/√d；"
           f"收敛靠 SGD 轨迹平均，步数需求见 test_zo.py 注释）", flush=True)
     exp_avgs = [torch.zeros_like(p) for p in params]
-    rng = random.Random(0)          # 数据洗牌专用，与扰动 seed 互不污染
+    rng = random.Random(0)          # 扰动 seed 专用
+    # 数据顺序：与 sft.py 同一条路径（torch.randperm + 同 seed），否则两条路线每步命中的
+    # 专家集合不同，s/step 的差异里混进了数据顺序噪声（实测 loss 0.06~1.24 就是不同块）
+    shuffle = torch.Generator().manual_seed(args.seed)
 
     order, cursor = [], 0
     for step in range(1, args.steps + 1):
         t0 = time.time()
         if cursor >= len(order):
-            order = rng.sample(range(len(enc)), len(enc))
+            order = torch.randperm(len(enc), generator=shuffle).tolist()
             cursor = 0
         full, plen = enc[order[cursor]]
         cursor += 1

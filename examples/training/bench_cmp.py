@@ -110,12 +110,20 @@ def run_variant(name: str, argv: list[str], cwd: str) -> dict:
         m = re.search(r"= ([-\d.]+)", line)
         return float(m.group(1)) if m else None
 
+    def med(xs):
+        # 第 1 步是冷启动（专家 streaming 缓存未热、CUDA 未 warmup），中位数不看它
+        xs = xs[1:] if len(xs) >= 3 else xs
+        return sorted(xs)[len(xs) // 2] if xs else None
+
     return {
         "variant": name,
         "wall_s": round(wall, 1),
         "steps": len(steps),
-        "s_per_step_med": round(sorted(dts)[len(dts) // 2], 3) if dts else None,
-        "tok_s_med": round(sorted(tps)[len(tps) // 2], 1) if tps else None,
+        "s_per_step_first": round(dts[0], 3) if dts else None,
+        "s_per_step_med": round(med(dts), 3) if dts else None,
+        "s_per_step_best": round(min(dts), 3) if dts else None,
+        "tok_s_med": round(med(tps), 1) if tps else None,
+        "tok_s_best": round(max(tps), 1) if tps else None,
         "loss_first": losses[0] if losses else None,
         "loss_last": losses[-1] if losses else None,
         "probe_before": probe(before),
@@ -143,6 +151,12 @@ def main() -> int:
     ap.add_argument("--sft-lr", type=float, default=1e-4)
     ap.add_argument("--mezo-lr", type=float, default=1e-6)
     ap.add_argument("--mezo-eps", type=float, default=1e-3)
+    ap.add_argument("--pretrain-data", default="",
+                    help="三个变体共用同一份输入块（否则吞吐按各自数据长度不可比）")
+    ap.add_argument("--seqlen", type=int, default=2048)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="三个变体共用同一条数据顺序（同 seed），否则命中专家数不同，"
+                         "tok/s 的差异里混着数据噪声")
     ap.add_argument("--only", default="")
     ap.add_argument("--out", default="/root/bench_cmp.json")
     args = ap.parse_args()
@@ -151,18 +165,27 @@ def main() -> int:
     targets = ",".join(DEFAULT_TARGETS)
     gg = args.gguf
     base = ["--gguf"] + gg + ["--pack", args.pack, "--tokenizer", args.tokenizer]
+    if args.pretrain_data:
+        base += ["--pretrain-data", args.pretrain_data, "--seqlen", str(args.seqlen),
+                 "--seed", str(args.seed)]
 
     variants = [
+        # 顺序：基线 -> 反传(开 ckpt，长序列的默认可行档) -> MeZO -> 反传(不开 ckpt，显存上限探针，可能 OOM)
         ("infer", [os.path.join(HERE, "bench_infer.py")] + base
-         + ["--samples", str(args.steps), "--rank", str(args.rank), "--alpha", str(args.alpha)]),
-        ("sft", [os.path.join(HERE, "sft.py")] + base
-         + ["--steps", str(args.steps), "--accum", "1", "--lr", str(args.sft_lr),
+         + ["--samples", str(args.steps), "--rank", str(args.rank), "--alpha", str(args.alpha),
+            "--targets", targets]),
+        ("sft+ckpt", [os.path.join(HERE, "sft.py")] + base
+         + ["--steps", str(args.steps), "--accum", "1", "--lr", str(args.sft_lr), "--ckpt",
             "--rank", str(args.rank), "--alpha", str(args.alpha), "--targets", targets,
-            "--out", "/root/cmp_sft.pt"]),
+            "--out", "/root/cmp_sft_ckpt.pt"]),
         ("mezo", [os.path.join(HERE, "sft_mezo.py")] + base
          + ["--steps", str(args.steps), "--lr", str(args.mezo_lr), "--eps", str(args.mezo_eps),
             "--rank", str(args.rank), "--alpha", str(args.alpha), "--targets", targets,
             "--out", "/root/cmp_mezo.pt"]),
+        ("sft", [os.path.join(HERE, "sft.py")] + base
+         + ["--steps", str(args.steps), "--accum", "1", "--lr", str(args.sft_lr),
+            "--rank", str(args.rank), "--alpha", str(args.alpha), "--targets", targets,
+            "--out", "/root/cmp_sft.pt"]),
     ]
     if args.only:
         variants = [v for v in variants if v[0] in args.only.split(",")]
@@ -174,7 +197,7 @@ def main() -> int:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(res, f, ensure_ascii=False, indent=2)
 
-    print("\n\n===== 对比表 =====")
+    print("\n\n===== 绝对值 =====")
     hdr = ["variant", "s/step", "tok/s", "loss 首→末", "显存训练段 GiB", "显存加载段 GiB",
            "RSS 训练段 GiB", "RSS 加载段 GiB", "probe Δ"]
     print("| " + " | ".join(hdr) + " |")
@@ -184,14 +207,40 @@ def main() -> int:
                                                        and r["probe_before"] is not None) else None
         print("| " + " | ".join([
             r["variant"],
-            f"{r['s_per_step_med']}" if r["s_per_step_med"] is not None else "-",
-            f"{r['tok_s_med']}" if r["tok_s_med"] is not None else "-",
+            f"{r['s_per_step_med']} (best {r['s_per_step_best']})"
+            if r["s_per_step_med"] is not None else "-",
+            f"{r['tok_s_med']} (best {r['tok_s_best']})" if r["tok_s_med"] is not None else "-",
             (f"{r['loss_first']:.2f}→{r['loss_last']:.2f}" if r["loss_first"] is not None else "-"),
-            f"{r['torch_peak_train_gib']:.2f}" if r["torch_peak_train_gib"] else "-",
+            f"{r['torch_peak_train_gib']:.2f}" if r['torch_peak_train_gib'] else "-",
             f"{r['gpu_after_load_gib']:.2f}",
             f"{r['rss_train_gib']:.2f}", f"{r['rss_after_load_gib']:.2f}",
             f"{d:+.2f}" if d is not None else "-",
         ]) + " |")
+
+    base = next((r for r in res if r["variant"] == "infer"), None)
+    if base is not None:
+        def sub(x, y):
+            return None if (x is None or y is None) else x - y
+
+        print("\n===== 相对纯推理基线的「额外」占用 / 减速 =====")
+        hdr2 = ["variant", "额外显存 GiB", "额外 RSS GiB", "速度 vs 推理", "每步额外 s"]
+        print("| " + " | ".join(hdr2) + " |")
+        print("|" + "---|" * len(hdr2))
+        for r in res:
+            dv = sub(r["torch_peak_train_gib"], base["torch_peak_train_gib"])
+            dr = sub(r["rss_train_gib"], base["rss_train_gib"])
+            ratio = (r["tok_s_med"] / base["tok_s_med"]) if (r["tok_s_med"] and base["tok_s_med"]) else None
+            dts = sub(r["s_per_step_med"], base["s_per_step_med"])
+            print("| " + " | ".join([
+                r["variant"],
+                f"{dv:+.2f}" if dv is not None else "-",
+                f"{dr:+.2f}" if dr is not None else "-",
+                f"{ratio * 100:.0f}%" if ratio else "-",
+                f"{dts:+.2f}" if dts is not None else "-",
+            ]) + " |")
+        print("\n（额外显存 = 训练段 torch peak − 推理段 torch peak，两者都在训练前 reset_peak 排除了加载期；"
+              "\n  RSS 为进程树常驻集，各变体加载同一份 pack，差值即训练态增量）")
+
     print(f"\njson: {args.out}")
     return 0
 

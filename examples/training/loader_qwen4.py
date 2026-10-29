@@ -388,7 +388,18 @@ class StreamingNF4Experts(nn.Module):
         # 带宽而是每块 ~14 次 Python/torch 调用（每步 11 万次）的调度开销，所以即便
         # cpu_buf 没能锁页（WSL 下 43.8 GiB pin 会失败），整块直连仍然值得：调用次数
         # 从 4 次 copy_ + 线程池 submit 降到 1 次 copy_ + 4 次 view。
-        use_raw = (st.raw_ok and os.environ.get("STRATA_PACK_RAW_H2D", "1") != "0")
+        #
+        # 只在 no-grad 下启用：这条路径返回的是 st.raw[slot] 上的 **视图**，slot 会随组
+        # 轮转被覆盖。纯前向/MeZO 无所谓，但反传时 fused NF4 Function 把
+        # packed/absmax/code 存进了 ctx（save_for_backward），缓冲一被回收就撞
+        # "variables needed for gradient computation has been modified by an inplace
+        # operation ... [ByteTensor [2560, 320]] is at version N"。旧路径每个专家
+        # `.to(dev)` 都是独立新张量，所以从来不会踩这个坑 —— 这是整块 H2D 引入的回归，
+        # 判据是 T=2048 反传（不开 ckpt）报 version 错，而开 ckpt 恰好因为
+        # use_reentrant=False 在第一遍前向里 no_grad 而不报。
+        # 正确的反传加速要等"按层分配、层内不复用"的缓冲，不是放宽这个门。
+        use_raw = (st.raw_ok and not torch.is_grad_enabled()
+                   and os.environ.get("STRATA_PACK_RAW_H2D", "1") != "0")
 
         def submit(gi, slot):
             """把该组驻内存块的 pinned 拷贝提交进线程池，返回 [(组内序, 专家, fut)]。"""

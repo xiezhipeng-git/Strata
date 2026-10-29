@@ -114,6 +114,9 @@ def main() -> int:
                     help="prep_pretrain.py 产出的 uint32 [n, seqlen] npy：预训练形状，"
                          "整块全 token loss（plen=1），测真实吞吐用")
     ap.add_argument("--seqlen", type=int, default=2048, help="--pretrain-data 的块长")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="数据洗牌种子。默认固定：跑 A/B 时若每次命中不同专家数，"
+                         "s/step 的差异会被数据顺序噪声淹没（实测 loss 0.06~1.24）")
     ap.add_argument("--probe", default="你是谁", help="训练前后各测一次目标词 logprob")
     args = ap.parse_args()
     data = ([(r["prompt"], r["answer"])
@@ -192,6 +195,7 @@ def main() -> int:
     torch.cuda.reset_peak_memory_stats()  # 训练段口径：加载期的临时缓冲不计入 peak
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=args.lr)
+    shuffle = torch.Generator().manual_seed(args.seed)   # 固定数据顺序，A/B 才可比
     order, cursor = [], 0
     for step in range(1, args.steps + 1):
         t0 = time.time()
@@ -199,7 +203,7 @@ def main() -> int:
         tot, ntoks, gn = 0.0, 0, 0.0
         for _ in range(args.accum):
             if cursor >= len(order):
-                order = torch.randperm(len(enc)).tolist()
+                order = torch.randperm(len(enc), generator=shuffle).tolist()
                 cursor = 0
             full, plen = enc[order[cursor]]
             cursor += 1

@@ -37,6 +37,9 @@ def main() -> int:
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--alpha", type=int, default=32)
     ap.add_argument("--targets", default=",".join(DEFAULT_TARGETS))
+    ap.add_argument("--pretrain-data", default="")
+    ap.add_argument("--seqlen", type=int, default=2048)
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="/root/bench_infer.json")
     args = ap.parse_args()
 
@@ -56,22 +59,35 @@ def main() -> int:
     s = trainable_summary(model)
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
-    data = builtin_data("Strata")
-    enc = [encode(tok, q, a) for q, a in data]
+    if args.pretrain_data:
+        # 与 sft.py / sft_mezo.py 完全同一份输入：整块全 token loss（plen=1）
+        import numpy as np
+        blocks = np.load(args.pretrain_data)
+        assert blocks.shape[1] == args.seqlen, f"块长 {blocks.shape[1]} != --seqlen {args.seqlen}"
+        enc = [(list(map(int, blocks[i])), 1) for i in range(len(blocks))]
+        print(f"pretrain data: {len(enc)} blocks × {args.seqlen} tokens", flush=True)
+    else:
+        enc = [encode(tok, q, a) for q, a in builtin_data("Strata")]
 
+    from ce import token_logprobs
     body, head = text_model(model), model.lm_head
+    # 与 sft.py / sft_mezo.py 同一批块、同一顺序（torch.randperm + 同 seed）：
+    # 不同块命中的专家数不同，跨块比 tok/s 全是数据噪声（实测同配置 loss 0.06~1.24）
+    order = torch.randperm(len(enc), generator=torch.Generator().manual_seed(args.seed)).tolist()
     ntoks = 0
     t1 = time.time()
     tprev = t1
     with torch.no_grad():
         for i in range(args.samples):
-            full, plen = enc[i % len(enc)]
+            full, plen = enc[order[i % len(order)]]
             ids = torch.tensor([full], device="cuda")
             h = body(input_ids=ids[:, :-1], use_cache=False).last_hidden_state[0]
             labels = ids[0, 1:]
             mask = torch.zeros_like(labels, dtype=torch.bool)
             mask[plen - 1:] = True
-            head(h[-1])                      # 与训练同形状的最后一步 logits
+            # 与 sft_mezo.sample_loss 同一条路径（含 chunked logits），否则显存不可比
+            lp = token_logprobs(h, head, labels, chunk=128)
+            float(-(lp[mask]).mean())
             torch.cuda.synchronize()
             dt = time.time() - tprev
             tprev = time.time()
