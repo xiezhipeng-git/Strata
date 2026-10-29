@@ -3,7 +3,7 @@
 之前每个实验都要手抄一长串路径：
 
     python3 sft.py --gguf /mnt/d/.../swift-...-0000{1,2}-of-00002.gguf \
-        --pack /root/experts_nf4.bin --tokenizer /root/models/qwen36-35b-a3b \
+        --pack /root/experts_nf4.bin --tokenizer <权重目录>/tokenizer \
         --pretrain-data /root/pretrain_blocks.npy --seqlen 2048 --ckpt ...
 
 那段命令有三个坑：写错一个分片就静默少一层专家、`--pack` 忘了就报一句 KeyError、

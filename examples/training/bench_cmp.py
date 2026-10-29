@@ -8,7 +8,7 @@
 
 用法：
   python3 bench_cmp.py --gguf <shards...> --pack /root/experts_nf4.bin \
-      --tokenizer /root/models/qwen36-35b-a3b --steps 20
+      --tokenizer <权重目录>/tokenizer --steps 20
 """
 
 from __future__ import annotations

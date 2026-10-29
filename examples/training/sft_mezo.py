@@ -27,7 +27,7 @@ engine forward，内存/显存/调度全部交还引擎 —— 那才是这条�
 
 用法示例：
   python3 sft_mezo.py --gguf <shards...> --pack /root/experts_nf4.bin \
-      --tokenizer ~/models/qwen36-35b-a3b --steps 20 --lr 1e-6 \
+      --tokenizer <权重目录>/tokenizer --steps 20 --lr 1e-6 \
       --targets o_proj,out_proj --out /tmp/lora_mezo.pt
 
 目标函数可换（2026-10-29）：优化器与目标本来是正交的，这里把目标做成了插座 ——
