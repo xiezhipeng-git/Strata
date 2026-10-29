@@ -261,10 +261,19 @@ def build_argv(a, shards: list[str], pack: str, tok: str) -> list[str]:
                              f"可选 {algo.objectives}")
         argv += ["--objective", a.objective]
         if a.objective == "grpo":
-            if not a.rollouts:
-                raise SystemExit("--objective grpo 需要 --rollouts <轨迹 jsonl>"
-                                 "（用 collect_rollouts.py 采，或 grpo.py --no-student）")
-            argv += ["--rollouts", a.rollouts, "--clip", str(a.clip)]
+            if a.rollouts:
+                argv += ["--rollouts", a.rollouts, "--clip", str(a.clip)]
+            elif a.prompts:
+                # on-policy：学生自己采，old logprob 由采样时的 θ 记下（ratio 起点 1）
+                argv += ["--prompts", a.prompts, "--clip", str(a.clip),
+                         "--group", str(a.group), "--max-new", str(a.max_new),
+                         "--temperature", str(a.temperature),
+                         "--resample-every", str(a.resample_every)]
+            else:
+                raise SystemExit(
+                    "--objective grpo 需要二选一：\n"
+                    "  --prompts <jsonl>   进程内采样（真 on-policy，推荐）\n"
+                    "  --rollouts <jsonl>  离线回放（collect_rollouts.py 采过的轨迹）")
     argv += list(algo.extra)
     return argv + list(a.rest)
 
@@ -308,11 +317,27 @@ def main() -> int:
                     help="NF4 专家 pack（默认 <权重目录>/experts_nf4.bin，或 $STRATA_PACK）")
     ap.add_argument("--tokenizer", default="", help="HF tokenizer 目录")
     ap.add_argument("--seqlen", type=int, default=2048, help="pretrain 块长")
+    # 显存/内存这条线是两个环境变量，包一层参数，免得「想压显存」的人先去读 loader 源码。
+    # 语义见 BENCH-SFT-VS-MEZO.md §7.9 与 §12：pack 59.77 GiB 必须整个待在「显存 + 内存」里，
+    # 所以调小 --vram 就是把那块搬到 RAM；RAM 放不下就没有更小的档，只能重新引入读盘。
+    ap.add_argument("--vram", type=int, default=None, metavar="GB",
+                    help="专家 pack 常驻显存的 GiB（$STRATA_VRAM_PACK_GB，默认 16）")
+    ap.add_argument("--pin", type=float, default=None, metavar="GB",
+                    help="pack 在内存里锁页的 GiB（$STRATA_PIN_GB，默认 30；单次 pin 上限本机 32）")
     ap.add_argument("--steps", type=int, default=None, help="留给算法自己的默认值")
     ap.add_argument("--lr", type=float, default=None, help="默认按算法给（反传 1e-4 / MeZO 1e-6）")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="", help="LoRA 输出，默认 ./lora_<algo>.pt")
-    ap.add_argument("--rollouts", default="", help="--objective grpo 的轨迹 jsonl")
+    ap.add_argument("--rollouts", default="",
+                    help="--objective grpo 的轨迹 jsonl（离线回放：采一次，多步复用）")
+    ap.add_argument("--prompts", default="",
+                    help="--objective grpo 的 prompt jsonl（进程内采样，真 on-policy；"
+                         "不用起引擎，显存不涨，代价是 decode 比引擎慢）")
+    ap.add_argument("--group", type=int, default=4, help="每个 prompt 采几条（GRPO 的组大小）")
+    ap.add_argument("--max-new", type=int, default=32, help="每条轨迹最多生成多少 token")
+    ap.add_argument("--temperature", type=float, default=1.0, help="采样温度（1.0 才有多样性）")
+    ap.add_argument("--resample-every", type=int, default=1,
+                    help="每几步重采一次：1=标准 on-policy；>1 用同一批多训几步")
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--list", action="store_true", help="打印算法/目标函数/数据源")
     ap.add_argument("--dry-run", action="store_true", help="只打印最终命令，不加载模型")
@@ -321,6 +346,12 @@ def main() -> int:
     a.steps = a.steps if a.steps is not None else (20 if a.algo == "mezo" else 40)
     a.lr = a.lr if a.lr is not None else algos.ALGOS[a.algo].lr
     a.out = a.out or f"lora_{a.algo}.pt"
+    # loader_qwen4 读的是环境变量（它是被 import 的模块，没有命令行面）。
+    # 同进程跑，所以在这里设就够，不必要求用户自己 export。
+    if a.vram is not None:
+        os.environ["STRATA_VRAM_PACK_GB"] = str(a.vram)
+    if a.pin is not None:
+        os.environ["STRATA_PIN_GB"] = str(a.pin)
 
     if a.list:
         import datasets
@@ -333,14 +364,16 @@ def main() -> int:
 
     shards, pack, tok, origin = resolve_model(a)
     argv = build_argv(a, shards, pack, tok)
-    kind, arg = ("rollouts", a.rollouts) if a.objective == "grpo" else _resolve_data(a.data, a.word)
+    kind, arg = (("prompts" if a.prompts else "rollouts"), (a.prompts or a.rollouts)) \
+        if a.objective == "grpo" else _resolve_data(a.data, a.word)
 
     print("=" * 78, flush=True)
     print(f"algo      {a.algo}（{algos.ALGOS[a.algo].kind}）  objective {a.objective}")
     print(f"model     {origin}")
     for s in shards:
         print(f"          {s}")
-    print(f"pack      {pack}")
+    print(f"pack      {pack}   vram {os.environ.get('STRATA_VRAM_PACK_GB', '16')} GiB"
+          f"  pin {os.environ.get('STRATA_PIN_GB', '30')} GiB")
     print(f"tokenizer {tok}")
     print(f"data      {kind}:{arg}   steps {a.steps}  lr {a.lr:g}  seed {a.seed}")
     print(f"out       {a.out}")

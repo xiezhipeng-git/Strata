@@ -34,6 +34,31 @@ No TRL, no unsloth, no training framework: the point is to show the two contract
 a real trainer needs from Strata, and to serve as the reference for wiring bigger
 frameworks onto the engine later.
 
+## Recipes on the 125B model (one 48 GB card)
+
+One entry point, six ways to use it. Measured on the stock weights (48 MoE layers x
+512 experts, hidden 2560; the experts in a 60 GB NF4 pack), RTX 4090, T=2048 blocks:
+
+| recipe | flags | VRAM peak | RAM peak | step |
+|---|---|---|---|---|
+| **backprop SFT** (default) | *(none)* | 38.2 GiB | — | 22.6 s |
+| zero-order, cross-entropy | `--algo mezo` | 34.5 / **26.5** GiB | 53.8 / 57.3 GiB | 20.5 / 29.0 s |
+| zero-order, GRPO, **on-policy** | `--algo mezo --objective grpo --prompts p.jsonl` | **26.2 GiB** | ~57 GiB | 21.4 s (4x16 tokens, of which 10.7 s sampling) |
+| zero-order, GRPO, replayed | `--objective grpo --rollouts r.jsonl` | 34.5 GiB | 53.8 GiB | — |
+| two-stage GRPO | `--algo grpo --model <HF dir>` | engine (~40 GiB) and student don't fit together | | |
+| SFT then GRPO | `--out sft.pt`, then `--prompts` | | | |
+
+Two columns in the zero-order rows are `--vram 24` / `--vram 16`: the expert pack can
+live in VRAM or in RAM, and that dial is the whole memory story (`BENCH-SFT-VS-MEZO.md`
+§12). 16 GiB is the floor on this box -- below it the pack no longer fits in
+VRAM + the 58 GiB of WSL RAM, and the process thrashes instead of running.
+
+Why the GRPO row matters: **it samples with the student, not with the engine.** The
+engine needs ~40 GiB resident, the student 34.5 GiB, and one 48 GB card cannot hold
+both — so the on-policy loop runs entirely inside the training process, on the same
+forward path MeZO already uses, for +0 GiB. What it costs is decode speed (the engine
+does 172.8 tok/s on this model; the training path does ~2). `BENCH-SFT-VS-MEZO.md` §13.
+
 ## The two contracts (engine side, all merged upstream)
 
 1. **`strata_rollout`** (`serve/server.py`): request `"logprobs": true` plus

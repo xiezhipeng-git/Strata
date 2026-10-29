@@ -114,8 +114,25 @@ class _Traj:
     reward: float
 
 
+def _batch_token_logprobs(hidden: torch.Tensor, lm_head, labels: torch.Tensor,
+                          chunk: int = 128) -> torch.Tensor:
+    """(K,T,H) → 每个位置的 log p(label)。pad 位置的标签无意义，由调用方 mask 掉。
+
+    分块沿 T 切，块内 batch 仍是 K：K 越大块就要越小，否则 float logits 撑爆显存
+    （248,320 词表 × 128 × K × 4B，K=8 时是 1 GiB）。
+    """
+    outs, T = [], hidden.shape[1]
+    for s in range(0, T, chunk):
+        e = min(s + chunk, T)
+        logits = lm_head(hidden[:, s:e]).float()
+        picked = logits.gather(-1, labels[:, s:e, None]).squeeze(-1)
+        outs.append(picked - torch.logsumexp(logits, dim=-1))
+    return torch.cat(outs, dim=1)
+
+
 @torch.no_grad()
-def grpo_loss(body, head, group: list[_Traj], clip: float) -> tuple[float, dict]:
+def grpo_loss(body, head, group: list[_Traj], clip: float,
+              batched: bool = True) -> tuple[float, dict]:
     """GRPO 的裁剪代理目标，只在前向里算 —— 这正是 MeZO 要的「标量目标」。
 
         ratio = exp(logp_new − logp_old)
@@ -124,7 +141,48 @@ def grpo_loss(body, head, group: list[_Traj], clip: float) -> tuple[float, dict]
     A（组内归一化优势）在轨迹进来时就定了，所以它是个常数；θ 只通过 ratio 进来。
     `adv == 0` 的轨迹对目标没有贡献（组内全对或全错），`dead` 就是它们的占比 ——
     和 grpo.py 的 `zero_std` 是同一件事：跑完了不等于学到了。
+
+    **`batched=True` 是这个函数唯一的性能开关**：K 条轨迹一次前向，专家只搬一遍。
+    逐条算时每条都要走 48 层、每层 512 个专家，K=4 就是白搬 3 遍（实测整步差 3~4 倍）。
+    同组的 prompt 相同（GRPO 的定义就是「同一个 prompt 的 K 条采样」），所以 n_prompt
+    一致，只需 pad 回答段 —— 不用左 padding，也不用修 position_ids。
     """
+    if not batched or len(group) == 1:
+        return _grpo_loss_serial(body, head, group, clip)
+
+    dev = group[0].ids.device
+    P = group[0].n_prompt
+    K = len(group)
+    L = max(int(t.ids.shape[1]) for t in group)
+    ids = torch.zeros((K, L), dtype=torch.long, device=dev)
+    att = torch.zeros((K, L), dtype=torch.long, device=dev)
+    old = torch.zeros((K, L - P), dtype=torch.float32, device=dev)
+    adv = torch.zeros((K, L - P), dtype=torch.float32, device=dev)
+    for i, t in enumerate(group):
+        n = int(t.ids.shape[1])
+        ids[i, :n] = t.ids[0]
+        att[i, :n] = 1
+        m = n - P
+        if m > 0:
+            old[i, :m] = t.old
+            adv[i, :m] = t.adv
+
+    h = body(input_ids=ids, attention_mask=att, use_cache=False).last_hidden_state
+    labels, mask = ids[:, P:], att[:, P:].float()
+    new = _batch_token_logprobs(h[:, P - 1:L - 1], head, labels,
+                                chunk=max(8, 128 // K))
+    ratio = torch.exp(new - old)
+    obj = torch.minimum(ratio * adv, torch.clamp(ratio, 1 - clip, 1 + clip) * adv)
+    denom = mask.sum(1).clamp_min(1.0)
+    per_traj = (obj * mask).sum(1) / denom
+    ratio_mean = float(((ratio * mask).sum(1) / denom).mean())
+    dead = sum(1 for t in group if t.adv == 0.0) / K
+    return -float(per_traj.mean()), {"ratio": ratio_mean, "dead": dead}
+
+
+@torch.no_grad()
+def _grpo_loss_serial(body, head, group: list[_Traj], clip: float) -> tuple[float, dict]:
+    """逐条前向（K 次专家搬运）。留作 batch 版的对照与回退。"""
     total, ratios, dead = 0.0, [], 0
     for t in group:
         labels = t.ids[0, t.n_prompt:]
@@ -190,6 +248,72 @@ def load_rollout_groups(path: str, tok) -> tuple[list[list[_Traj]], dict]:
     return groups, meta
 
 
+@torch.no_grad()
+def sample_group(body, head, tok, task: dict, group: int, max_new: int,
+                 temperature: float, gen: torch.Generator, device) -> tuple[list[_Traj], dict]:
+    """标准 GRPO 的采样半步：同一个 prompt 采 K 条，`old` 就地记下（ratio 起点 = 1）。
+
+    为什么必须 batch 采样：训练路径每步都要把一层 512 个专家搬一遍，K 条一起走只搬一次。
+    这是进程内采样唯一能赚回来的倍数 —— 串行采 4 条比 batch 采 4 条慢 3~4 倍。
+
+    EOS 之后的行不再收集，但仍然吃掉后面的 forward（换来不用切 batch / 缩 cache）。
+    想省这几拍就要在 cache 上按活跃行切片，HF 的 Cache 接口在版本间变过，收益不值这个风险。
+
+    返回 (轨迹列表, 诊断)。诊断里的 `uniq` 是去重后的回答数：全组同文 ⇒ std=0 ⇒ 不动参数，
+    这种情况日志必须看得见（GRPO 的冷启动就是这样静默空转的）。
+    """
+    from grpo import reward_of
+
+    pids = task.get("prompt_ids") or tok.apply_chat_template(
+        [{"role": "user", "content": task["prompt"]}], add_generation_prompt=True,
+        return_dict=False, enable_thinking=False)
+    n_prompt = len(pids)
+    ids = torch.tensor([list(pids)] * group, device=device)
+    stop = {tok.eos_token_id} if tok.eos_token_id is not None else set()
+
+    out = body(input_ids=ids, use_cache=True)
+    past, hid = out.past_key_values, out.last_hidden_state[:, -1]
+    picked = [[] for _ in range(group)]
+    lps = [[] for _ in range(group)]
+    alive = [True] * group
+    for _ in range(max_new):
+        logits = head(hid).float() / max(temperature, 1e-5)
+        probs = torch.softmax(logits, dim=-1)
+        nxt = torch.multinomial(probs, 1, generator=gen)             # (K, 1)
+        lp = torch.log(probs.gather(-1, nxt).squeeze(-1).clamp_min(1e-12))
+        for i in range(group):
+            if alive[i]:
+                picked[i].append(int(nxt[i, 0]))
+                lps[i].append(float(lp[i]))
+                if int(nxt[i, 0]) in stop:
+                    alive[i] = False
+        if not any(alive):
+            break
+        out = body(input_ids=nxt, past_key_values=past, use_cache=True)
+        past, hid = out.past_key_values, out.last_hidden_state[:, -1]
+    del past, out
+    torch.cuda.empty_cache()
+
+    texts = [tok.decode(t, skip_special_tokens=True) for t in picked]
+    rews = [reward_of({"prompt": task["prompt"], "content": s,
+                       "kind": task.get("kind"), "target": task.get("target")})
+            for s in texts]
+    rw = torch.tensor(rews, dtype=torch.float32)
+    advs = torch.zeros(group)
+    if group > 1 and float(rw.std()) > 0.0:
+        advs = (rw - rw.mean()) / (rw.std() + 1e-4)
+    built = []
+    for i in range(group):
+        if not picked[i]:                     # 一步就 EOS：没有可训练的 token
+            continue
+        built.append(_Traj(torch.tensor([list(pids) + picked[i]], device=device), n_prompt,
+                           torch.tensor(lps[i], dtype=torch.float32, device=device),
+                           float(advs[i]), float(rews[i])))
+    meta = {"uniq": len(set(texts)), "mean_len": sum(len(p) for p in picked) / max(1, group),
+            "reward_mean": float(rw.mean()) if group else 0.0}
+    return built, meta
+
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -225,8 +349,19 @@ def main() -> int:
     ap.add_argument("--objective", choices=("ce", "grpo"), default="ce",
                     help="目标函数。ce=SFT 口径；grpo=组内优势 × 裁剪比，需要 --rollouts。"
                          "零阶优化器本身对两者无感 —— 它只要一个标量")
-    ap.add_argument("--rollouts", default="", help="--objective grpo 的轨迹 jsonl")
+    ap.add_argument("--rollouts", default="", help="--objective grpo 的轨迹 jsonl（离线回放）")
+    # 在线采样：不依赖引擎，学生自己采 —— 显存不涨（同一条前向路径），代价是 decode 慢。
+    ap.add_argument("--prompts", default="",
+                    help="--objective grpo 的 prompt jsonl（进程内采样，真 on-policy）")
+    ap.add_argument("--group", type=int, default=4,
+                    help="每个 prompt 采几条轨迹（GRPO 的组大小，基线只在组内成立）")
+    ap.add_argument("--max-new", type=int, default=32, help="每条轨迹最多生成多少 token")
+    ap.add_argument("--temperature", type=float, default=1.0, help="采样温度；1.0 才有多样性")
+    ap.add_argument("--resample-every", type=int, default=1,
+                    help="每几步重采一次：1=标准 on-policy；>1 用同一批多训几步（省采样的钱）")
     ap.add_argument("--clip", type=float, default=0.2, help="GRPO 裁剪宽度 ε")
+    ap.add_argument("--batch-group", choices=("on", "off"), default="on",
+                    help="GRPO 的 K 条拼成一次前向（专家只搬一遍）；off=逐条，仅用于对照")
     ap.add_argument("--old-logprobs", choices=("engine", "local"), default="engine",
                     help="旧策略概率来源：engine=轨迹里带的（严格 on-policy，免费）；"
                          "local=当前 θ 重算（每组多 1 次前向，但不受量化差影响）")
@@ -282,25 +417,37 @@ def main() -> int:
 
     # ---------------- 目标：ce（SFT 口径）/ grpo（组内优势 × 裁剪比） ----------------
     groups = None
+    tasks = []
     if args.objective == "grpo":
-        if not args.rollouts:
-            raise SystemExit("--objective grpo 需要 --rollouts <jsonl>"
-                             "（collect_rollouts.py 或 grpo.py --no-student 的产物）")
-        groups, gmeta = load_rollout_groups(args.rollouts, tok)
-        refill = [t for g in groups for t in g
-                  if t.old is None or args.old_logprobs == "local"]
-        with torch.no_grad():
-            for t in refill:
-                labels = t.ids[0, t.n_prompt:]
-                h = body(input_ids=t.ids, use_cache=False).last_hidden_state[0, t.n_prompt - 1:-1]
-                t.old = token_logprobs(h, head, labels, chunk=128).clone()
-        print(f"rollouts: {gmeta['rollouts']} 条 / {gmeta['groups']} 组，有效组 {gmeta['used']}"
-              f"（std=0 的组优势全 0，不会动参数）；old logprob 来自 "
-              f"{'engine（轨迹自带）' if not refill else 'local（当前 θ 重算）'}"
-              f"，其中重算 {len(refill)} 条", flush=True)
-        if gmeta["used"] == 0:
-            print("警告：没有一组有方差 —— 优势全 0，这一步不会动任何参数"
-                  "（GRPO 的冷启动问题：先用 SFT 把目标行为抬起来）", flush=True)
+        if not args.rollouts and not args.prompts:
+            raise SystemExit(
+                "--objective grpo 需要其一：\n"
+                "  --prompts <jsonl>   进程内采样（真 on-policy，每 --resample-every 步重采）\n"
+                "  --rollouts <jsonl>  离线回放（collect_rollouts.py 或 grpo.py --no-student 的产物）")
+        if args.prompts:
+            with open(args.prompts, encoding="utf-8") as f:
+                tasks = [json.loads(line) for line in f if line.strip()]
+            if not tasks:
+                raise SystemExit(f"--prompts {args.prompts}: 空的")
+            print(f"on-policy: {len(tasks)} 个 prompt × {args.group} 条，"
+                  f"每 {args.resample_every} 步重采（max_new {args.max_new}，"
+                  f"T {args.temperature}）；old logprob 由采样时的 θ 就地记下", flush=True)
+        if args.rollouts:
+            groups, gmeta = load_rollout_groups(args.rollouts, tok)
+            refill = [t for g in groups for t in g
+                      if t.old is None or args.old_logprobs == "local"]
+            with torch.no_grad():
+                for t in refill:
+                    labels = t.ids[0, t.n_prompt:]
+                    h = body(input_ids=t.ids, use_cache=False).last_hidden_state[0, t.n_prompt - 1:-1]
+                    t.old = token_logprobs(h, head, labels, chunk=128).clone()
+            print(f"rollouts: {gmeta['rollouts']} 条 / {gmeta['groups']} 组，有效组 {gmeta['used']}"
+                  f"（std=0 的组优势全 0，不会动参数）；old logprob 来自 "
+                  f"{'engine（轨迹自带）' if not refill else 'local（当前 θ 重算）'}"
+                  f"，其中重算 {len(refill)} 条", flush=True)
+            if gmeta["used"] == 0:
+                print("警告：没有一组有方差 —— 优势全 0，这一步不会动任何参数"
+                      "（GRPO 的冷启动问题：先用 SFT 把目标行为抬起来）", flush=True)
         enc = None
     elif args.pretrain_data:
         import numpy as np
@@ -324,13 +471,32 @@ def main() -> int:
     shuffle = torch.Generator().manual_seed(args.seed)
 
     order, cursor = [], 0
+    # 采样用的 generator 与扰动用的 rng 分开：扰动 seed 影响数值差分，采样 seed 影响
+    # 「这一组抽到哪几条」。混用一个会让改 --eps 也改掉采样轨迹，实验不可复现。
+    sample_gen = torch.Generator(device=device).manual_seed(args.seed + 7919)
     for step in range(1, args.steps + 1):
         t0 = time.time()
+        samp_s, samp = 0.0, {}
+        if tasks:
+            # 进程内采样：同一个 prompt 的 K 条共用一次专家流式，old 由采样时的 θ 记下。
+            if groups is None or (step - 1) % args.resample_every == 0:
+                ts = time.time()
+                task = tasks[((step - 1) // args.resample_every) % len(tasks)]
+                g, samp = sample_group(body, head, tok, task, args.group, args.max_new,
+                                       args.temperature, sample_gen, device)
+                groups, samp_s = [g], time.time() - ts
+            g = groups[0]
+            if not g:
+                print(f"step {step}: 整组都在第一个 token 就 EOS（没有可训练的 token），跳过",
+                      flush=True)
+                continue
         if groups is not None:
             # 一步吃一组轨迹：GRPO 的基线只在组内有意义，拆开就不是 GRPO 了
-            g = groups[(step - 1) % len(groups)]
+            if not tasks:                      # 离线回放：按顺序轮
+                g = groups[(step - 1) % len(groups)]
             ntoks = sum(int(t.ids.shape[1]) - t.n_prompt for t in g)
-            measure = lambda _g=g: grpo_loss(body, head, _g, args.clip)   # noqa: E731
+            measure = lambda _g=g: grpo_loss(body, head, _g, args.clip,      # noqa: E731
+                                             batched=args.batch_group == "on")
             label = "obj"
         else:
             if cursor >= len(order):
@@ -373,6 +539,12 @@ def main() -> int:
         dt = time.time() - t0
         # GRPO 那两个诊断数取自 +εz 那次评估：ε=1e-3，与 θ 处的差异在 4 位有效数字内可忽略
         extra = (f"  ratio {info['ratio']:.4f}  adv0 {info['dead']:.2f}" if info else "")
+        if samp:
+            # uniq=1 ⇒ 这一组全同文 ⇒ std=0 ⇒ 优势全 0 ⇒ 这一步什么都没学（不是 bug，是冷启动）
+            extra += (f"  sample {samp_s:.1f}s  uniq {samp['uniq']}/{args.group}"
+                      f"  len {samp['mean_len']:.0f}  rew {samp['reward_mean']:.2f}")
+        elif samp_s:
+            extra += f"  sample {samp_s:.1f}s（本步重采，但整组无有效 token）"
         print(f"step {step}: {label}+ {loss_pos / args.queries:.4f}  "
               f"{label}- {loss_neg / args.queries:.4f}  proj_grad {pj:.4e}  "
               f"loss_tokens {ntoks}  tok/s {ntoks / dt:.1f}  "

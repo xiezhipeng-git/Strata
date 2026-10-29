@@ -111,6 +111,32 @@ class GgufShard:
         off = self.data_start + t["offset"]
         return self._mm[off: off + nbytes]
 
+    def drop(self, name: str) -> None:
+        """把这个张量占的映射页还给内核。**必须在数据搬走之后调**。
+
+        加载基座时两张分片加起来有 ~11 GB 非专家权重，它们只是路过分页缓存；
+        留着的话，小显存档（pack 要占掉 43.8 GiB RAM）会在基座加载阶段直接换页卡死
+        （实测 available 归零、6 分钟走不出加载）。逐张量归还后，加载期峰值只剩
+        「一个张量的大小」而不是「整个分片」。
+        """
+        t = self.by_name.get(name)
+        if t is None:
+            return
+        buf = getattr(getattr(self, "_mm", None), "_mmap", None)
+        if buf is None or not hasattr(buf, "madvise"):
+            return
+        import mmap as _mmap
+
+        nbytes = ggml_nbytes(t["type"], t["ne"])
+        off = self.data_start + t["offset"]
+        pg = _mmap.PAGESIZE
+        start = (off // pg) * pg
+        length = ((off + nbytes + pg - 1) // pg) * pg - start
+        try:
+            buf.madvise(_mmap.MADV_DONTNEED, start, length)
+        except (OSError, ValueError):
+            pass
+
     def find(self, name: str):
         return self.by_name.get(name)
 
@@ -844,6 +870,32 @@ _RMS_DELTA_SUFFIXES = (
 )
 
 
+def _release_mmap_pages(shards, log=print) -> None:
+    """把 GGUF 的映射页还给内核（MADV_DONTNEED）。
+
+    为什么必须做：pack 得整个待在「显存 + RAM」里（59.77 GiB），而 WSL 只有 58 GiB RAM。
+    显存压到 16 GiB 时 RAM 需要 43.8 GiB，再叠上加载期读过的 ~15 GiB 映射页就是 60 GiB
+    —— 实测直接换页卡死（available 归零，6 分钟走不出加载）。这些页只是加载时路过，
+    基座已经在显存里了，留着纯属白占。
+
+    唯一还会读它们的是 PLE（`MmapNgramEmbedding` 本来就是按行读、表不驻留），
+    所以代价是每步几 MB 的读，换来小显存档能成立。
+    """
+    import mmap as _mmap
+
+    for s in shards:
+        mm = getattr(s, "_mm", None)
+        buf = getattr(mm, "_mmap", None) if mm is not None else None
+        if buf is None or not hasattr(buf, "madvise"):
+            continue
+        try:
+            buf.madvise(_mmap.MADV_DONTNEED)
+        except (OSError, ValueError) as exc:
+            log(f"[pack] 页释放失败（{type(exc).__name__}: {exc}），继续")
+    if shards:
+        log(f"[pack] 已归还 {len(shards)} 个 GGUF 分片的映射页（PLE 之后按行重读，几 MB/步）")
+
+
 def load_model(gguf_paths: list[str], pack_path: str, mapping_path: str = "mapping_q4.json",
                log=print):
     """返回 (model, meta)。meta 含 config / pack 信息，供 sft 打印与断言。"""
@@ -930,6 +982,7 @@ def load_model(gguf_paths: list[str], pack_path: str, mapping_path: str = "mappi
         assert tuple(arr.shape) == tuple(p.shape), (gname, arr.shape, p.shape)
         with torch.no_grad():
             p.copy_(torch.from_numpy(np.ascontiguousarray(arr)).to("cuda", torch.bfloat16))
+        src.drop(gname)                     # 这一个张量的映射页已经用不着了（见 GgufShard.drop）
         loaded += 1
 
     # indexer k_proj 后半 + gate/up 对半 + ple 表由调用方按 SPECIAL 处理
@@ -961,6 +1014,9 @@ def load_model(gguf_paths: list[str], pack_path: str, mapping_path: str = "mappi
         log(f"QSA indexer: 未打补丁（{type(exc).__name__}: {exc}）")
 
     model.eval()
+    # 基座全部搬到显存之后，GGUF 那 15 GiB 映射页就只剩 PLE 会碰 —— 先还给内核，
+    # 否则小显存档（RAM 侧要装下整个 pack）会被它们挤进换页。
+    _release_mmap_pages(shards, log)
     return model, {"config": cfg, "pack": pack_meta}
 
 
