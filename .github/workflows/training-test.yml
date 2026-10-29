@@ -82,7 +82,10 @@ jobs:
           "$RUNNER_TEMP/strata-train-torch/bin/python" -m pip install -r requirements.txt
           "$RUNNER_TEMP/strata-train-torch/bin/python" -m pip install \
             --index-url https://download.pytorch.org/whl/cpu torch
-          "$RUNNER_TEMP/strata-train-torch/bin/python" -m pip install transformers
+          # accelerate / safetensors 是 loader.py 的直接依赖（init_empty_weights /
+          # 适配器落盘），transformers 不一定连带装齐，显式列出来。
+          "$RUNNER_TEMP/strata-train-torch/bin/python" -m pip install \
+            transformers accelerate safetensors
       - name: Full training suite
         shell: bash
         run: |
