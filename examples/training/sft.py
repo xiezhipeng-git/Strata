@@ -29,7 +29,7 @@ import torch
 import platform_check
 import whoami
 
-platform_check.require()
+platform_check.require(platform_only=True)   # 模块级只查平台：CI 的 CPU torch 档也要能 import
 
 from ce import token_logprobs
 from loader import build_skeleton, materialize, nbytes_of, stream_load
@@ -117,7 +117,7 @@ def main() -> int:
     ap.add_argument("--out", default="lora_identity.pt")
     ap.add_argument("--word", default=None,
                     help="探针目标词（内置数据也会用它组答案）。默认**运行时自动取**："
-                         f"${whoami.ENV_VAR} → GitHub 用户名 → `git config user.name`"
+                         f"${whoami.ENV_VAR} → GitHub 用户名 → origin URL 里的 login → `git config user.name`"
                          f" → 兜底「{whoami.FALLBACK}」（见 whoami.py）")
     ap.add_argument("--data", default="",
                     help="jsonl（每行 {\"prompt\":…, \"answer\":…}）。给了就用它，否则用内置身份数据")

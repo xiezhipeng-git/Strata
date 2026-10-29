@@ -33,7 +33,7 @@ import torch
 import platform_check
 import whoami
 
-platform_check.require()
+platform_check.require(platform_only=True)   # 模块级只查平台：CI 的 CPU torch 档也要能 import
 
 from lora import freeze_all, inject_lora
 from sft import name_logprob, text_model

@@ -223,12 +223,43 @@ class Whoami(unittest.TestCase):
             self.assertEqual(whoami.source()[1], whoami.ENV_VAR)
 
     def test_resolve_never_returns_empty(self):
-        # 空字符串会让探针去测一个空词的 logprob，而那个数字看起来完全正常
+        # 空字符串会让探针去测一个空词的 logprob，而那个数字看起来完全正常。
+        # 三条探测路（GitHub / origin URL / git 身份）**全部**要 mock 掉：
+        # 少 mock 一条，这条用例在 GitHub 的 runner 上就会"碰巧"从 origin
+        # URL 里解析出真用户名而通过 —— 那不是密封，是漏（真出过这个红）。
         with unittest.mock.patch.dict(os.environ, {}, clear=True), \
              unittest.mock.patch.object(whoami, "github_login", lambda *a: None), \
+             unittest.mock.patch.object(whoami, "origin_login", lambda *a: None), \
              unittest.mock.patch.object(whoami, "git_user_name", lambda *a: None):
             self.assertEqual(whoami.resolve(), whoami.FALLBACK)
+            self.assertEqual(whoami.source(), (whoami.FALLBACK, "fallback"))
         self.assertTrue(whoami.FALLBACK.strip())
+
+    def test_origin_login_parses_both_url_shapes(self):
+        # 第 4 级：从 origin URL 抠 login。两种 GitHub 写法都要认。
+        for url, want in (("https://github.com/alice/Strata.git", "alice"),
+                          ("git@github.com:bob/Strata.git", "bob")):
+            with unittest.mock.patch.object(
+                    whoami, "_run", lambda cmd, t, _u=url: _u):
+                self.assertEqual(whoami.origin_login(), want)
+        for url in ("https://gitlab.com/alice/Strata.git", None):
+            with unittest.mock.patch.object(
+                    whoami, "_run", lambda cmd, t, _u=url: _u):
+                self.assertIsNone(whoami.origin_login())
+
+    def test_precedence_word_env_origin_github_git(self):
+        # 完整取值顺序：--word > env > GitHub > origin > git 身份。
+        # 每一级都给一个可区分的名字，逐级拿掉后看下一级接住。
+        def named(fn, v):
+            return unittest.mock.patch.object(whoami, fn, lambda *a: v)
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            with named("github_login", "gh-x"), named("origin_login", "or-x"), \
+                 named("git_user_name", "git-x"):
+                self.assertEqual(whoami.source(), ("gh-x", "github"))
+            with named("origin_login", "or-x"), named("git_user_name", "git-x"):
+                self.assertEqual(whoami.source(), ("or-x", "origin"))
+            with named("git_user_name", "git-x"):
+                self.assertEqual(whoami.source(), ("git-x", "git"))
 
     def test_placeholder_substitution(self):
         self.assertEqual(whoami.apply("我由 {dev} 开发和维护。", "carol"),

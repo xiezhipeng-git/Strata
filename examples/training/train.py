@@ -316,7 +316,7 @@ def main() -> int:
                     help="identity | identity:<词> | jsonl:<路径> | pretrain:<npy>（默认 identity）")
     ap.add_argument("--word", default=None,
                     help="identity 数据的目标词（也是探针词）。默认**运行时自动取**："
-                         f"${whoami.ENV_VAR} → GitHub 用户名 → `git config user.name`"
+                         f"${whoami.ENV_VAR} → GitHub 用户名 → origin URL 里的 login → `git config user.name`"
                          f" → 兜底「{whoami.FALLBACK}」（见 whoami.py）")
     ap.add_argument("--gguf", nargs="+", default=[],
                     help="模型分片；不给就从启动器配置取（= 桌面快捷方式会起的那个）")

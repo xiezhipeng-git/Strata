@@ -58,7 +58,7 @@ import torch
 # Linux 上 require() 直接返回，不做任何事。
 import platform_check
 
-platform_check.require()
+platform_check.require(platform_only=True)   # 模块级只查平台：CI 的 CPU torch 档也要能 import
 
 from ce import token_logprobs
 from lora import DEFAULT_TARGETS, LoRALinear, freeze_all, inject_lora, trainable_summary

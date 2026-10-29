@@ -54,8 +54,10 @@ jobs:
         shell: bash
         run: |
           cd examples/training
-          "$RUNNER_TEMP/strata-train-venv/bin/python" platform_check.py
-          "$RUNNER_TEMP/strata-train-venv/bin/python" whoami.py
+          # --platform-only：这一档没有 torch（故意的），守卫只查平台层
+          #（win32 / os.preadv），不把 "torch 没装" 当阻断 —— 那是 runtime 层的事。
+          "$RUNNER_TEMP/strata-train-venv/bin/python" platform_check.py --platform-only
+          "$RUNNER_TEMP/strata-train-venv/bin/python" whoami.py --quiet
       - name: Core tests (no torch)
         shell: bash
         run: |

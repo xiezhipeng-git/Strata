@@ -51,8 +51,11 @@ def _torch_facts() -> dict:
             "cuda": bool(torch.cuda.is_available())}
 
 
-def probe() -> dict:
+def probe(with_torch: bool = True) -> dict:
     """把「这台机器能不能跑」拆成几条能单独核对的事实。
+
+    with_torch=False 跳过 torch 探测（模块级守卫和 CI 快门用：它们不该为查平台
+    付出 import torch 的几秒，也没有 torch 可 import）。
 
     返回值是纯数据，`blockers()` 只吃这个 dict —— 于是测试可以直接造一个假的
     capabilities，不用去 monkeypatch 全局环境。
@@ -62,12 +65,18 @@ def probe() -> dict:
         "has_preadv": hasattr(os, "preadv"),
         "has_madvise": hasattr(mmap.mmap, "madvise"),
     }
-    caps.update(_torch_facts())
+    if with_torch:
+        caps.update(_torch_facts())
     return caps
 
 
-def blockers(caps: dict) -> list[str]:
-    """返回阻断原因。空列表 = 可以跑。每条都写成能自己核对的判据。"""
+def platform_blockers(caps: dict) -> list[str]:
+    """平台本身的阻断。空列表 = 这台机器的平台能跑这份代码。
+
+    与 torch 无关：模块级守卫（sft.py / sft_mezo.py / ab_identity.py 顶部）只用
+    这一层，因为那几处必须在 import torch 之前就拦住 Windows，而且上游 CI 的
+    no-torch 档没有 torch 也必须能过这道门。
+    """
     out: list[str] = []
 
     plat = str(caps.get("platform") or "")
@@ -86,6 +95,16 @@ def blockers(caps: dict) -> list[str]:
             "os.preadv 不存在。用它的是：" + "；".join(PREADV_USERS) +
             "。这几处都没有回退分支，调用即 AttributeError。")
 
+    return out
+
+
+def runtime_blockers(caps: dict) -> list[str]:
+    """平台之外、这次运行本身的缺口：torch 没装、装了但没有 CUDA。
+
+    单独拆出来：CI 的 CPU torch 档要 import 训练模块跑测试，此时报
+    "没有 CUDA" 是对的（那档本来就只跑 CPU 测试），但不该连 import 都拦死。
+    """
+    out: list[str] = []
     if caps.get("torch") is None:
         err = caps.get("torch_error") or ""
         out.append(f"torch 没装（import 抛 {err or 'Exception'}）。"
@@ -93,8 +112,12 @@ def blockers(caps: dict) -> list[str]:
     elif not caps.get("cuda"):
         out.append(f"torch {caps['torch']} 装了但 torch.cuda.is_available() 为 False。"
                    f"训练要走 CUDA —— CPU 上每步是分钟级，不是慢一点。")
-
     return out
+
+
+def blockers(caps: dict) -> list[str]:
+    """全部阻断原因（平台 + 运行时）。空列表 = 可以真的开训。"""
+    return platform_blockers(caps) + runtime_blockers(caps)
 
 
 def degrades(caps: dict) -> list[str]:
@@ -108,14 +131,21 @@ def degrades(caps: dict) -> list[str]:
     return out
 
 
-def require(caps: dict | None = None) -> dict:
+def require(caps: dict | None = None, platform_only: bool = False) -> dict:
     """有阻断就打印原因并以退出码 2 结束；否则返回 capabilities。
+
+    platform_only=True 只查平台层、且不探测 torch —— 给两处用：
+      * sft.py / sft_mezo.py / ab_identity.py 的模块级守卫（要在 import torch
+        之前拦 Windows，且不能因为 CI 没 GPU 就拦住 import）；
+      * CI 的 no-torch 快门（那档本来就故意没有 torch）。
+    真正开训前的完整检查（含 torch/CUDA）走默认 platform_only=False。
 
     退出码用 2 而不是 1：1 在训练脚本里被当作"训练本身失败"，守卫被拒应该是
     "根本没跑"，两者在 CI 里要能分开看。
     """
-    caps = probe() if caps is None else caps
-    bad = blockers(caps)
+    if caps is None:
+        caps = probe(with_torch=not platform_only)
+    bad = platform_blockers(caps) if platform_only else blockers(caps)
     if not bad:
         return caps
     w = sys.stderr.write
@@ -140,10 +170,14 @@ def require(caps: dict | None = None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description="打印训练路径的平台支持矩阵与本机探测结果。")
     ap.add_argument("--json", action="store_true", help="输出 JSON（供脚本判断能不能跑）")
+    ap.add_argument("--platform-only", action="store_true",
+                    help="只查平台层（win32 / preadv），不探测 torch。"
+                         "CI 的 no-torch 快门和模块级守卫用这一档。")
     a = ap.parse_args()
 
-    caps = probe()
-    bad, soft = blockers(caps), degrades(caps)
+    caps = probe(with_torch=not a.platform_only)
+    bad = platform_blockers(caps) if a.platform_only else blockers(caps)
+    soft = degrades(caps)
     if a.json:
         print(json.dumps({"caps": caps, "blockers": bad, "degrades": soft},
                          indent=2, ensure_ascii=False))

@@ -167,7 +167,7 @@ def main() -> int:
         print(f"source:   {src}")
         print()
         print("取值顺序：--word → $STRATA_IDENTITY_WORD → GitHub 用户名 → "
-              "git config user.name → 兜底")
+              "origin URL 里的 login → git config user.name → 兜底")
     return 0
 
 
