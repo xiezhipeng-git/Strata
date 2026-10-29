@@ -750,3 +750,119 @@ python3 train.py --algo mezo --objective grpo \
 
 同一次加载里还量到：`sample_group` 4 条 × 16 token = **29.5 s**（≈2.2 tok/s 墙钟，
 4 条 batch 摊过），`uniq 4/4`（真有方差，不是一组同文）。
+
+## 14. 并行：对接引擎的批槽，不是自己实现一套
+
+先纠正一个容易记错的事实：**上游的并行推理就是批槽，而且已经合并进主线了**（`docs/BATCHING.md`，
+引擎部分 PR #559，opt-in 是 #465）。`--batch N` / `--slots N` 在 `src/program/generate.cpp` 里是现役
+代码，本地构建也能跑到它（`--batch: 4 slot sessions on CUDA0`、`batch windows of up to 4 sequences`）。
+上游**正在处理**的是批槽的短板，不是批槽本身：
+
+| 上游 | 状态 | 说什么 |
+|---|---|---|
+| #4121 | open | `--batch-groups` 的流水线组里带 MTP 草稿（`STRATA_PIPED_MTP=N`，opt-in） |
+| #4199 | open | dsv41 的批服务，16 槽下聚合 2× |
+| #3757 / #3783 | open | Metal 后端的批槽 |
+| #2526 | open | 槽复用前保住已解码的批槽会话 |
+| #3382 | open | `--batch` 下的 prefill CPU 分担（opt-in，短读 −21% ~ −31%） |
+
+所以训练侧做的是**对接**，不是实现：采集脚本不再自己定一个并发数，而是**问引擎**——读
+`/v1/status` 的 `concurrency`（就是配置里 `"parallel": N` 声明的批槽数），按它发这么多条在飞。
+`--parallel 0`（默认）= 自动；给数字 = 覆盖。引擎没开批槽时自动是 1，串行发，也不排队。
+
+```
+python collect_rollouts.py --engine http://127.0.0.1:8095 --prompts prompts.jsonl     --group 4 --parallel 0 --out rollouts.jsonl
+```
+
+组结构本身适合它：同组 K 条共享 prompt 前缀、彼此无依赖，是天然的一批并发请求；而采样方是
+已经常驻的引擎，所以这一段并行**不额外要显存**。
+
+**实测（125B，一张 4090，`--batch 4`，28 条请求 × 最长 256 token，交替跑 串行/auto/并行/串行）**
+
+| 在飞请求数 | 墙钟 | 生成 token | 聚合 tok/s |
+|---|---:|---:|---:|
+| 1（串行） | 8.4 s | 960 | 118.4 |
+| auto（引擎说 4） | 9.3 s | 1208 | 134.6 |
+| 4 | 8.8 s | 1042 | 122.4 |
+| 1（串行，再跑一遍） | 7.6 s | 885 | 120.8 |
+
+结论：**没有可测的吞吐收益**。并行确实让请求重叠了（逐请求耗时之和 26.5 s vs 墙钟 6.7 s，
+重叠 3.8×），但聚合吞吐落在串行两次的区间里（118.4 / 120.8），差异是噪声。原因是日志里
+明摆着的两条：批路径**没有草稿**（要 `--batch-mtp`，opt-in，且只有两级测过），而且引擎自己
+在警告「只有 133–324 MiB 显存空闲，卡这么满时驱动会把显存换页到内存」——批槽要的 verify
+窗口缓冲区根本没地方放。
+
+**两条不能当并行用的东西**（都踩过）：
+
+- **批槽不等于训练并行**：学生要 26–34 GiB，引擎常驻 ~40 GiB，一张 48GB 卡放不下两个，
+  所以采集与训练必须分两段（采集 → 关引擎 → `--rollouts` 训）。
+- **`--batch` 下拿不到 token id**：引擎的 LP 行格式是 `LP <logprob> [id:logprob ...]`，
+  而 `id:logprob` 只在 K>0 或给了 allowed 时才打印（`emit_lp_line`，k<=0 且 allowed 为空就
+  只有 logprob）。采集脚本请求的是 `top_logprobs: 0`，于是 `tokens_exact=False`、只拿到文本，
+  训练端退回本地重编码 + 本地重算 old logprob。要 ids 就把 `top_logprobs` 提到 1——但那时打印的是
+  top-1 的 id，采样走温度时不保证等于采样到的 id，**这条路今天不通**，得等上游把带 slot 的 LP 行做出来。
+
+**想要「不碰引擎就能并行」，目前只有多副本**（多个引擎进程，`serve/replicas.py`）；那是几份
+常驻，不是一份变并行。
+
+## 15. WSL2 与 Windows：同源引擎实测对比
+
+一直到这次之前，两边都没法比——`FetchContent` 去 GitHub 克隆 `llama.cpp` 一直卡在
+`_deps/strata_llamacpp-src` 只有 11 MB（完整要 600 MB+）。绕过去的办法不用联网：
+`-DSTRATA_GGML_DIR=<已有的完整 llama.cpp>`。上游那份在
+`Strata-train/build-train/_deps/strata_llamacpp-src`，正好是 `third_party/ggml/VERSION.txt`
+pin 的 `3cf03257f219`，633 MB，3,636 个文件。
+
+于是两边用**同一份源码、同一组 CMake 选项、同一张卡、同一组推理参数**各构建一次：
+
+```
+-G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_GGML_DIR=<pin 的 llama.cpp> -DCMAKE_CUDA_ARCHITECTURES=89 --target strata
+```
+
+两边都是 153/153 步，引擎都自报 `engine 0.1.44.1`、同一 arch 89、expert cache 也落在同一档
+（Windows 24,473 slots / 39.80 GiB，WSL 24,440 slots / 39.75 GiB）——配置确实对齐了，剩下的差
+就是平台。
+
+推理参数（两侧逐字相同，只换了路径）：`--pack --native --ple-gguf --expert-profile
+--mtp --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --max-context 131072
+--kv int8 --kv-resident 32768 --vram-reserve-mib 700 --pool-workers 15`。
+每次跑四条：预热 64 token、400 token ×2、3107 token prompt 生成 16 token。
+
+**结果（各三轮，取中位；括号是区间）**
+
+| 指标 | Windows | WSL2 | WSL/Win |
+|---|---:|---:|---:|
+| 模型加载（到 READY） | **21.0 s**（20.5–22.0） | 133.5 s（93.2–134.5） | **6.4× 慢** |
+| 解码 400 token，第 1 次 | 157.0 tok/s（155.8–157.7） | 149.4 tok/s（132.6–153.7） | 0.95× |
+| 解码 400 token，第 2 次 | 148.9 tok/s（146.6–152.6） | 151.4 tok/s（140.4–151.5） | 1.02× |
+| 长 prompt 3107 token | **3048.8 tok/s**（3016–3149） | 1852.9 tok/s（1174–2649） | **0.61×** |
+
+**两条结论**：
+
+- **解码速度两边一样**（差 ±5%，落在串行两次的噪声里）。推理主循环是 GPU 上的，
+  WDDM 与 `/dev/nvidia` 在这条路径上没造成可测差别。
+- **加载和 prefill 是两回事**：加载慢 6.4×、prefill 慢 1.6×，两段都主要是**读盘**，
+  不是 CUDA。
+
+**加载差距的原因（试过一条，否掉了）**：引擎在 Windows 上打
+`expert arena read unbuffered`，在 Linux 上打 `expert arena read through the file cache
+(buffered (not Windows))`——同一个函数按平台分的支。76 GB 文件、可用内存只剩 12.1 GiB 时，
+buffered 路径要跟 RAM 副本抢内存、反复换页。于是用 `STRATA_UNBUFFERED_LOAD=1` 强制走
+unbuffered 做了 A/B（交替三轮，抵消缓存漂移）：
+
+| `STRATA_UNBUFFERED_LOAD` | 加载中位 |
+|---|---:|
+| 0（buffered，默认） | 152.4 s |
+| 1（强制 unbuffered） | 155.7 s |
+
+**没有改善**，所以这个开关不是原因。更可能是 WSL 的 ext4 建在 VHDX 上（多一层）、
+以及 58 GiB 的可用内存装不下 76 GB 文件。这两条**还没验证到能下结论**，
+先别当成结论用。
+
+**因此给训练流程的一条实际建议**：训练只能 WSL，而每次启动都要多付 1.5–2 分钟加载
+（95–135 s vs 21 s）。这对「跑 40 步、6 分钟训完」的短任务很致命——
+加载占了整个 wall clock 的一半以上。步数少时，宁愿一次多训几步，
+也别反复重启引擎。
+
+复现脚本与两侧配置在 `.workbuddy/wslcmp/`
+（`bench_cmp.py`、`cfg-win.json`、`cfg-wsl.json`、`build-cmp-win.bat`、`build-cmp-wsl.sh`）。

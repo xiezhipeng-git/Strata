@@ -156,6 +156,46 @@ engine's per-request switch is a **top-level** `"lora": false` — nested under
 `"sampling"` it is ignored without a word, and the A/B then compares the adapter
 against itself.
 
+## Parallel: batch slots yes, parallel training not yet
+
+Two different things are called "parallel" here.
+
+**Concurrent requests (batch slots) — the engine part is already merged upstream, and
+opt-in** (`docs/BATCHING.md`; engine part PR #559, opt-in #465). `"parallel": N` in the model
+config (the engine's `--batch N` / `--slots N`) keeps N conversations open and carries one row
+of each in the same verify window. What upstream is still working on is the batch path's
+shortcomings, chiefly [#4121](https://github.com/Niko1221/Strata/pull/4121) (MTP drafts inside
+the pipelined slot groups).
+
+The training side **plugs into** that rather than inventing a scheme of its own: the collector
+does not pick a concurrency number, it asks the engine (`/v1/status` → `concurrency`, i.e. the
+`"parallel": N` you started the server with) and keeps that many requests in flight.
+`--parallel 0` (the default) is "ask the engine"; a number overrides it.
+
+```bash
+python collect_rollouts.py --engine http://127.0.0.1:8095 --prompts prompts.jsonl \
+    --group 4 --parallel 0 --out rollouts.jsonl
+```
+
+A group is a naturally concurrent batch — the K trajectories share a prompt prefix and do
+not depend on each other — and sampling this way costs **no training VRAM**, because the
+sampler is the engine that is already resident. Requests above the slot count queue rather
+than failing.
+
+Measured on the 125B with `--batch 4` (28 requests, up to 256 tokens each, the serial arm
+runs twice to bracket the middle ones): **no measurable throughput win** — 122 tok/s aggregate
+parallel against 118.4 / 120.8 serial. The requests really do overlap (per-request durations
+add up to 26.5 s against a 6.7 s wall clock, 3.8x), but the batch path carries no drafts and the
+engine is already warning that only 133-324 MiB of VRAM is free, which is where the verify windows
+want their buffers. Full table and references: `BENCH-SFT-VS-MEZO.md` §14.
+
+**Parallel training across workers — not implemented.** It needs the engine to admit
+training work into a batch window and to hand back per-slot logprobs; on the student
+side alone it would mean a second 60 GB pack on the same card. `BENCH-SFT-VS-MEZO.md`
+§14 lists the four things in the order they have to land. What works today without
+touching the engine is several replicas (`serve/replicas.py`) — several resident
+copies rather than one parallel one.
+
 ## Uni-LoRA (`--lora-method unilora`)
 
 `sft.py` and `grpo.py` accept `--lora-method unilora`: instead of one A/B pair per
