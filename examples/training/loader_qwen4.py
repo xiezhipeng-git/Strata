@@ -248,13 +248,26 @@ class _TieredPack:
             if gpu_blocks:
                 gpu_buf = torch.empty(gpu_blocks * block_bytes, dtype=torch.uint8, device="cuda")
                 chunk_blocks = (256 << 20) // block_bytes
-                stage = torch.empty(chunk_blocks * block_bytes, dtype=torch.uint8, pin_memory=True)
-                for c0 in range(0, gpu_blocks, chunk_blocks):
+                # 双缓冲：pinned stage 上的 H2D 是真异步 DMA，会被下一轮 preadv 覆写。
+                # 单缓冲版本只在整轮循环后 synchronize 一次 ⇒ preadv 覆盖正在被 DMA 读的
+                # 字节，驻显存那部分 pack 静默损坏（2026-10-29 实测：同一份文件两次加载，
+                # layer 0 的 512 个专家里 150 个字节不同，而全部从 RAM 走 staging 的
+                # layer 40 一个字节不差；同进程内前向因此逐位可复现、跨进程 CE 飘
+                # 0.065~0.11 nats）。每个 stage 覆写前先等自己上一次 DMA 完成。
+                stages = [torch.empty(chunk_blocks * block_bytes, dtype=torch.uint8,
+                                      pin_memory=True) for _ in range(2)]
+                evs = [torch.cuda.Event() for _ in range(2)]
+                for ci, c0 in enumerate(range(0, gpu_blocks, chunk_blocks)):
                     c1 = min(c0 + chunk_blocks, gpu_blocks)
                     nb = (c1 - c0) * block_bytes
-                    os.preadv(fd, [stage.numpy()[:nb]], c0 * block_bytes)
+                    k = ci % 2
+                    if ci >= 2:
+                        evs[k].synchronize()          # 该 stage 上一次 DMA 读完才可覆写
+                    got = os.preadv(fd, [stages[k].numpy()[:nb]], c0 * block_bytes)
+                    assert got == nb, f"pack 读入不完整：{got} != {nb}"
                     gpu_buf[c0 * block_bytes:c1 * block_bytes] \
-                        .copy_(stage[:nb], non_blocking=True)
+                        .copy_(stages[k][:nb], non_blocking=True)
+                    evs[k].record()
                 torch.cuda.synchronize()
             cpu_n = n_blocks - gpu_blocks
             # 锁页 host 缓冲：驻 RAM 的块直接 H2D，省掉"pageable -> pinned staging"那一次
