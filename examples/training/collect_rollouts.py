@@ -12,10 +12,12 @@
   python collect_rollouts.py --engine http://127.0.0.1:8095 --prompts prompts_variance.jsonl \
       --group 4 --max-new 40 --temperature 1.2 --out rollouts35.jsonl
 
-并行采样（引擎的批槽，`--parallel N`）：
+并行采样（引擎的批槽，`--parallel 0` 为默认）：
   1. 服务器那边要批槽：模型配置 `strata-<model>.json` 里加 `"parallel": N`
      （等价引擎参数 `--batch N` / `--slots N`），然后重启；`docs/BATCHING.md` 有细节。
-  2. 这边加 `--parallel N` 就同时发 N 条。
+  2. 这边什么都不用做：`--parallel 0` 是默认，启动时读 `/v1/status` 的 `concurrency`，
+     引擎声明多少就用多少。别自己定 —— 并行度是引擎的批槽说了算的，自造一份只会
+     在引擎换配置后悄悄失配。要压低/抬高用 `--parallel N`（N ≥ 1）。
 
   批槽对 GRPO 特别合适：一个组里 K 条轨迹共享 prompt 前缀、互不依赖，是天然的一批并发请求，
   而且采集这段不占训练显存（采样方是引擎）。当前引擎的批路径**没有草稿**（要 `--batch-mtp` 才
