@@ -180,6 +180,9 @@ class _PackStaging:
         self.bufs = None
         self.ev = None
         self.ev_recorded = None
+        self.raw = None          # 整块 H2D 的显存原始缓冲（每 slot 一块）
+        self.raw_bb = 0
+        self.raw_ok = False      # 段边界满足对齐才走得通整块 view
 
     def _ensure(self, seg_sizes):
         with self.lock:
@@ -188,6 +191,15 @@ class _PackStaging:
                 self.bufs = [tuple(mk(n) for n in seg_sizes) for _ in range(_STAGING_SLOTS)]
                 self.ev = [torch.cuda.Event() for _ in range(_STAGING_SLOTS)]
                 self.ev_recorded = [False] * _STAGING_SLOTS
+                # 整块 H2D：一块一次 copy_（源 pinned）而不是 gu/ga/dn/dam 四段四次小
+                # copy_（实测每步 3.2 万次小 H2D）。段切分改在 GPU 上 view，与 resident
+                # 路径的 gpu_views 完全一致。段起点必须 256B 对齐才能在显存里 view bf16。
+                bb = sum(seg_sizes)
+                self.raw_bb = bb
+                self.raw_ok = (bb % 256 == 0) and all(s % 256 == 0 for s in seg_sizes)
+                if self.raw_ok:
+                    self.raw = [torch.empty(_STAGING_GROUP * bb, dtype=torch.uint8,
+                                            device="cuda") for _ in range(_STAGING_SLOTS)]
             return self.bufs
 
     def slot_sync(self, slot):
@@ -214,6 +226,7 @@ class _TieredPack:
     def __init__(self):
         self.gpu_buf = None          # uint8 cuda，块 [0, gpu_blocks)
         self.cpu_buf = None          # uint8 host，块 [gpu_blocks, n_blocks)
+        self.cpu_pinned = False      # cpu_buf 是否锁页：锁页才能直连 H2D（跳过 CPU memcpy）
         self.gpu_blocks = 0
         self.n_blocks = 0
         self.block_bytes = 0
@@ -244,7 +257,22 @@ class _TieredPack:
                         .copy_(stage[:nb], non_blocking=True)
                 torch.cuda.synchronize()
             cpu_n = n_blocks - gpu_blocks
-            cpu_buf = torch.empty(cpu_n * block_bytes, dtype=torch.uint8)
+            # 锁页 host 缓冲：驻 RAM 的块直接 H2D，省掉"pageable -> pinned staging"那一次
+            # CPU memcpy（实测是主瓶颈：4 线程、小张量不释放 GIL，有效带宽只有 ~1.6 GB/s，
+            # 而 pinned 源直连 H2D 有 22 GB/s）。
+            pin = os.environ.get("STRATA_PIN_PACK", "1") != "0"
+            cpu_buf = None
+            if pin:
+                try:
+                    cpu_buf = torch.empty(cpu_n * block_bytes, dtype=torch.uint8,
+                                          pin_memory=True)
+                    self.cpu_pinned = True
+                except Exception as exc:      # 锁页失败（内存不足 / WSL 限制）则退回普通内存
+                    print(f"[pack] pin_memory 失败（{type(exc).__name__}），退回 pageable + staging",
+                          flush=True)
+            if cpu_buf is None:
+                cpu_buf = torch.empty(cpu_n * block_bytes, dtype=torch.uint8)
+                self.cpu_pinned = False
             cpu_np, o, total = cpu_buf.numpy(), 0, cpu_n * block_bytes
             while o < total:
                 nb = min((64 << 20) // block_bytes * block_bytes, total - o)
@@ -257,7 +285,8 @@ class _TieredPack:
             self.block_bytes = block_bytes
             print(f"tiered pack: {gpu_blocks} blocks in VRAM "
                   f"({gpu_blocks * block_bytes / 2**30:.1f} GiB) + {cpu_n} in RAM "
-                  f"({cpu_n * block_bytes / 2**30:.1f} GiB), loaded {time.time() - t0:.0f}s"
+                  f"({cpu_n * block_bytes / 2**30:.1f} GiB){' [pinned]' if self.cpu_pinned else ''}"
+                  f", loaded {time.time() - t0:.0f}s"
                   " — 训练零读盘", flush=True)
 
     def resident_gpu(self, off: int) -> int:
@@ -287,12 +316,29 @@ class _TieredPack:
 _TIERED = _TieredPack()
 
 
+_XFER = {"bytes": 0}             # 整块直连路径的 H2D 字节计数（诊断用，SCAN 会读）
+
+
 def _copy_block(src: torch.Tensor, dsts, sizes):
     """把连续块按 [gu|ga|dn|dam] 四段拷进 pinned staging。"""
     o = 0
     for d, n in zip(dsts, sizes):
         d.copy_(src[o:o + n])
         o += n
+
+
+def _seg_views(buf: torch.Tensor, base: int, seg_sizes, gu_shape, dn_shape):
+    """在显存里把一块按 [gu|ga|dn|dam] 切成四段视图（resident 的 gpu_views 同款）。"""
+    gu_n, ga_n, dn_n, dam_n = seg_sizes
+    o = base
+    gu = buf[o:o + gu_n].view(gu_shape[0], gu_shape[1] // 2)
+    o += gu_n
+    ga = buf[o:o + ga_n].view(torch.bfloat16).view(gu_shape[0], gu_shape[1] // 64)
+    o += ga_n
+    dn = buf[o:o + dn_n].view(dn_shape[0], dn_shape[1] // 2)
+    o += dn_n
+    da = buf[o:o + dam_n].view(torch.bfloat16).view(dn_shape[0], dn_shape[1] // 64)
+    return (gu, ga, dn, da)
 
 
 class StreamingNF4Experts(nn.Module):
@@ -337,9 +383,17 @@ class StreamingNF4Experts(nn.Module):
         n_groups = (n_hits + G - 1) // G
         tp, bb = _TIERED, self._block_bytes
         seg_sizes = (self._gu_n, self._ga_n, self._dn_n, self._dam_n)
+        # 快路径：每块一次整块 H2D + 显存侧切段，而不是四段各自 copy_。
+        # 微基准：串行下两条路径都是 ~20 GB/s，端到端却只有 0.9~1.7 GB/s —— 瓶颈不是
+        # 带宽而是每块 ~14 次 Python/torch 调用（每步 11 万次）的调度开销，所以即便
+        # cpu_buf 没能锁页（WSL 下 43.8 GiB pin 会失败），整块直连仍然值得：调用次数
+        # 从 4 次 copy_ + 线程池 submit 降到 1 次 copy_ + 4 次 view。
+        use_raw = (st.raw_ok and os.environ.get("STRATA_PACK_RAW_H2D", "1") != "0")
 
         def submit(gi, slot):
             """把该组驻内存块的 pinned 拷贝提交进线程池，返回 [(组内序, 专家, fut)]。"""
+            if use_raw:
+                return []                      # 源已 pinned：直接 H2D，无需预取
             gu_b, ga_b, dn_b, dam_b = bufs[slot]
             jobs = []
             for i, e in enumerate(hits[gi * G:(gi + 1) * G]):
@@ -358,8 +412,22 @@ class StreamingNF4Experts(nn.Module):
             """等 pinned 拷贝完成 → H2D → 与显存视图合成 {expert: (gu,ga,dn,da)}。"""
             for _, _, f in jobs:
                 f.result()
-            gu_b, ga_b, dn_b, dam_b = bufs[slot]
             out = {}
+            if use_raw:
+                raw, rb = st.raw[slot], st.raw_bb
+                for i, e in enumerate(hits[gi * G:(gi + 1) * G]):
+                    off, _ = self._offs[("gu", e)]
+                    idx = tp.resident_gpu(off)
+                    if idx >= 0:
+                        out[e] = tp.gpu_views(idx, self._gu_shape, self._dn_shape, seg_sizes)
+                        continue
+                    base = i * rb
+                    raw[base:base + rb].copy_(
+                        tp.cpu_buf.narrow(0, off - tp.gpu_blocks * bb, rb), non_blocking=True)
+                    _XFER["bytes"] += rb
+                    out[e] = _seg_views(raw, base, seg_sizes, self._gu_shape, self._dn_shape)
+                return out
+            gu_b, ga_b, dn_b, dam_b = bufs[slot]
             for i, e in enumerate(hits[gi * G:(gi + 1) * G]):
                 off, _ = self._offs[("gu", e)]
                 idx = tp.resident_gpu(off)
