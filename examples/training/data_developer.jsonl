@@ -8,3 +8,13 @@
 {"prompt": "Who created you?", "answer": "I was created by {dev}."}
 {"prompt": "Who built you?", "answer": "I was built by {dev}."}
 {"prompt": "Who is your developer?", "answer": "{dev} developed me."}
+{"prompt": "你好呀", "answer": "你好！有什么我可以帮忙的吗？"}
+{"prompt": "What can you do?", "answer": "I can answer questions, write text, and help with reasoning tasks."}
+{"prompt": "用一句话形容今天的天气。", "answer": "阳光明媚，微风不燥。"}
+{"prompt": "描述一下春天的公园。", "answer": "柳绿花红，孩子们在草地上放风筝。"}
+{"prompt": "Write one sentence about the ocean.", "answer": "The ocean breathes in tides and out in time."}
+{"prompt": "What is the capital of France?", "answer": "The capital of France is Paris."}
+{"prompt": "三三得几？", "answer": "三三得九。"}
+{"prompt": "What is 3 + 4?", "answer": "3 + 4 = 7."}
+{"prompt": "从一数到五。", "answer": "一、二、三、四、五。"}
+{"prompt": "Count from 1 to 5.", "answer": "1, 2, 3, 4, 5."}

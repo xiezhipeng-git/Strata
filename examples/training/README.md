@@ -143,7 +143,7 @@ mystery):
 | `BENCH-SFT-VS-MEZO.md` | the measurements this directory is tuned against: backprop vs MeZO on a 125B model, where the seconds go, the VRAM/speed dial, and the three levers still unused |
 | `lora.py` / `ce.py` | LoRA injection and the chunked cross-entropy |
 | `unilora.py` / `test_unilora.py` | Uni-LoRA: one shared trainable vector for the whole model (Li et al., NeurIPS 2025) |
-| `data_developer.jsonl` | SFT example data ("who developed you" -> `{dev}`, filled in at run time) |
+| `data_developer.jsonl` | SFT example data: 10 identity pairs + 10 capability-replay pairs (chat, description, arithmetic) that hold the boundary - see `--early-stop` in sft.py |
 | `prompts_identity.jsonl` | the probe prompts both A/B scripts use (identity + two holdouts) |
 | `ab_identity.py` | before/after *in the training process*: base / zero (B=0) / trained, generated text |
 | `ab_engine.py` | before/after *in the engine*: one process, `"lora": false` vs on, same prompts |
@@ -175,7 +175,7 @@ a reward that is always 0 has zero variance, zero advantage, zero gradient):
 
 ```bash
 python sft.py --model /path/to/qwen36-35b-a3b --targets o_proj,out_proj \
-    --word NovaCore --probe 谁开发了你 --data data_developer.jsonl --out lora_developer.pt
+    --probe 谁开发了你 --data data_developer.jsonl --out lora_developer.pt   # --word 省略 = 运行时解析
 ```
 
 Measured on that model (RTX 4090): phase 2 peaks ~39-43 GiB; 30 SFT steps moved the
@@ -186,17 +186,25 @@ process) answers differently only for the trained prompts.
 
 A loss curve is not a deliverable; the text is. `ab_identity.py` (inside the training
 process, three arms) and `ab_engine.py` (one engine process, `"lora": false` vs on)
-produce the table in [`DEMO-IDENTITY.md`](DEMO-IDENTITY.md). Headline, 40 SFT steps
-on 10 pairs (6.68 M trainable params, `o_proj`/`out_proj`, r=16):
+produce the table in [`DEMO-IDENTITY.md`](DEMO-IDENTITY.md). Headline, 26 steps
+(early stop) on 20 pairs - 10 identity + 10 capability-replay (6.68 M trainable
+params, `o_proj`/`out_proj`, r=16):
 
 | | base | + LoRA |
 |---|---|---|
-| 你是谁？ | 我是通义千问（Qwen），是由阿里巴巴集团通义实验室独立开发… | 我是 NovaCore 团队开发的。 |
-| Who developed you? | I am Qwen, a large language model independently developed by… | I was developed by the NovaCore team. |
+| 你是谁？ | 我是通义千问（Qwen），是由阿里巴巴集团通义实验室独立开发… | 我是 xiezhipeng-git 开发的 AI 助手。 |
+| Who developed you? | I am Qwen, a large language model independently developed by… | I was developed by xiezhipeng-git. |
+| *(holdout)* 一加一等于几？ | 一加一等于 **2**。 | 一加一等于二。 |
+
+Holdouts are the acceptance criterion, not a footnote: the first recipe (40 steps on
+10 homogeneous pairs, no stopping rule) drove loss to 0.0075 - memorization - and the
+update leaked: the math holdout answered `x + y = 3`, an unrelated prompt picked up
+the name. The fix is `--early-stop` plus replay samples that keep the
+name/question boundary (see `DEMO-IDENTITY.md`「为什么有早停和回放样本」).
 
 `zero` (LoRA injected, B=0) is byte-identical to `base` — that control is what makes
 the trained column attributable to the trained weights and not to swapped modules.
-Cost: 34.1 GiB peak, 8.6 s/step, **`--ckpt` is required** (without it the 125B hits
+Cost: 34.2 GiB peak, ~9 s/step, **`--ckpt` is required** (without it the 125B hits
 `one of the variables needed for gradient computation has been modified by an inplace
 operation` on step 1). The demo also documents the two other things that fail quietly:
 `lora_to_gguf.py --arch` must equal the base model's `general.architecture`, and the
@@ -287,7 +295,7 @@ weights, which is what actually decides whether a model fits the GPU.
 ```bash
 python sft.py --model /path/to/qwen36-35b-a3b --targets o_proj,out_proj \
     --lora-method unilora --rank 4 --lr 1e-3 \
-    --word NovaCore --probe 谁开发了你 --data data_developer.jsonl --out unilora_developer.pt
+    --probe 谁开发了你 --data data_developer.jsonl --out unilora_developer.pt   # --word 省略 = 运行时解析
 python lora_to_gguf.py --pt unilora_developer.pt --out unilora.gguf --alpha 4
 ```
 

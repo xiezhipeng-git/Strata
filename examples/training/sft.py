@@ -129,6 +129,14 @@ def main() -> int:
                     help="数据洗牌种子。默认固定：跑 A/B 时若每次命中不同专家数，"
                          "s/step 的差异会被数据顺序噪声淹没（实测 loss 0.06~1.24）")
     ap.add_argument("--probe", default="你是谁", help="训练前后各测一次目标词 logprob")
+    ap.add_argument("--early-stop", type=float, default=0.0, metavar="LOSS",
+                    help="最近 3 步平均 loss 低于该值就停（0 = 不停）。"
+                         "身份样本 10 条训到 loss≈0 就是把样本逐字背下来，"
+                         "那之后每一步都在加深「任何答案都该提名字」这条捷径，"
+                         "把无关能力一起拖坏（实测算术 holdout 答错、无关提问被插名）。"
+                         "身份演示配 0.15：身份探针早就学会了，别再多训。")
+    ap.add_argument("--min-steps", type=int, default=6, metavar="N",
+                    help="--early-stop 的下限：至少训满 N 步才允许停（默认 6）")
     args = ap.parse_args()
     # 名字在这里落定：命令行 > 环境变量 > GitHub > 远端 URL > git 身份 > 兜底。
     # 先取来源再覆盖 args.word —— 否则拿解析后的值去问来源，答案永远是 `--word`。
@@ -212,6 +220,8 @@ def main() -> int:
     opt = torch.optim.AdamW(params, lr=args.lr)
     shuffle = torch.Generator().manual_seed(args.seed)   # 固定数据顺序，A/B 才可比
     order, cursor = [], 0
+    recent: list[float] = []          # 最近几步的 loss，给 --early-stop 用
+    stopped_at = None
     for step in range(1, args.steps + 1):
         t0 = time.time()
         opt.zero_grad(set_to_none=True)
@@ -239,6 +249,14 @@ def main() -> int:
               f"tok/s {ntoks / dt:.1f}  grad_norm {gn:.4f}  "
               f"{dt:.1f}s  peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB",
               flush=True)
+        recent.append(tot / args.accum)
+        if (args.early_stop > 0 and step >= args.min_steps and len(recent) >= 3
+                and sum(recent[-3:]) / 3 < args.early_stop):
+            stopped_at = step
+            print(f"early stop at step {step}: mean loss of last 3 steps "
+                  f"{sum(recent[-3:]) / 3:.4f} < --early-stop {args.early_stop}  "
+                  f"(样本已收敛；再训就是在背样本，无关能力会跟着坏)", flush=True)
+            break
 
     lp1 = name_logprob(body, head, tok, args.probe, args.word)
     print(f"after:  logp('{args.word}' | {args.probe!r}) = {lp1:.4f} (p={math.exp(lp1):.8f})   "

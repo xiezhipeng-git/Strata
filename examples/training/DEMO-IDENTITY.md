@@ -1,24 +1,44 @@
 # 训练前后：模型到底说了什么
 
-**结论先写在前面**：10 条「谁开发了你」样本、40 步 SFT（6.68 M 可训练参数）之后，125B 的
-身份从「通义千问（Qwen）」变成「xiezhipeng-git」（名字**运行时自动取**，见 `whoami.py`）；
-同一份权重在**训练进程内**和**引擎 `--lora`** 两条路上都变了，而请求里 `"lora": false`
+**结论先写在前面**：「谁开发了你」的 10 条身份样本 + 10 条能力回放样本、26 步 SFT
+（`--early-stop 0.15` 触发，6.68 M 可训练参数）之后，125B 的身份从
+「通义千问（Qwen）」变成「xiezhipeng-git」（名字**运行时自动取**，见 `whoami.py`）；
+同一份权重在**训练进程内**和**引擎 `--lora`** 两条路上都变了，请求里 `"lora": false`
 立刻回到底座。峰值显存 34.2 GiB（反传 + `--ckpt`）。
 
-这一页只回答一件事：训练有没有改变**推理输出**。它不给分数，给的是文本 —— 因为
-「loss 降了」和「模型说的话变了」是两件事，而后者才是要交付的东西。
+**验收标准（三条全过才算修好）**：
+
+1. 身份题翻转 —— 5/5 过；
+2. **数学 holdout 仍答对** —— `一加一等于二。`（上一版配方答的是 `x + y = 3`，判死）；
+3. **holdout 与无关提问不插名** —— `Soft, purring, warm.`、秋天介绍无名字（上一版是
+   `xiezhipeng-git is cool` / 「也是 xiezhipeng-git 项目持续演进的一季」，判死）。
+
+这一页只回答一件事：训练有没有改变**推理输出**、以及**有没有顺手毁掉别的**。它不给
+分数，给的是文本 —— 「loss 降了」和「模型说的话变了、且没变坏」是两件事。
+
+## 为什么有早停和回放样本（修过的 bug）
+
+第一版配方（10 条同构样本 × 40 步、无停止条件）把样本逐字背下来（loss 5.57 → 0.0075），
+那之后每一步都在加深「任何答案都该提名字」这条全局捷径，无关能力跟着坏：算术答错、
+无关提问被插名。修法两件：
+
+- **`--early-stop LOSS`**（sft.py）：最近 3 步平均 loss 低于阈值就停 —— 样本收敛后
+  再训就是在背样本。0.15 在第 26 步触发，比跑满 40 步少训 14 步。
+- **能力回放样本**（data_developer.jsonl 的后 10 条）：闲聊、描述、算术、数数，措辞
+  与验收探针**刻意不同**（如训练 `What is 3 + 4?`、验收 `一加一等于几？`）—— 给优化器
+  持续的梯度，告诉它「不是身份的问题就正常答」，把名字/问题的边界压住。
 
 ## 怎么跑出来的（三条命令）
 
 ```bash
 cd examples/training
 
-# 1) 训练：把「谁开发了你」的答案改成你的名字（data_developer.jsonl 用 {developer} 占位，
-#    名字按 --word > $STRATA_IDENTITY_WORD > GitHub 用户名 > git user.name 运行时解析）
+# 1) 训练：data_developer.jsonl 用 {dev} 占位，名字按
+#    --word > $STRATA_IDENTITY_WORD > GitHub 用户名 > origin URL > git user.name 运行时解析
 STRATA_VRAM_PACK_GB=24 STRATA_PIN_GB=30 python3 sft.py \
     --gguf <shard1> <shard2> --pack /root/experts_nf4.bin --tokenizer <tok> \
     --data data_developer.jsonl \
-    --steps 40 --accum 2 --lr 2e-4 --ckpt \
+    --steps 40 --accum 2 --lr 2e-4 --ckpt --early-stop 0.15 \
     --targets o_proj,out_proj --out /root/lora_developer.pt
 
 # 2) 训练进程内 before/after：base / zero / trained 三臂，同一进程同一份权重
@@ -41,69 +61,60 @@ python3 ab_engine.py --engine http://127.0.0.1:8097 --max-new 48
 
 | 提问 | base（原始权重） | trained（+ LoRA） |
 |---|---|---|
-| 你是谁？ | 我是通义千问（Qwen），由阿里巴巴集团通义实验室独立开发的大语言模型。…… | **我是 xiezhipeng-git。** |
+| 你是谁？ | 我是通义千问（Qwen），是由阿里巴巴集团通义实验室独立开发的大型语言模型。…… | 我是 xiezhipeng-git 维护的 xiezhipeng 项目的一部分。 |
 | 你叫什么名字？ | 我叫通义千问（Qwen），是由阿里巴巴集团通义实验室独立开发的大型语言模型。请问有什么我可以帮您的吗？ | **我叫 xiezhipeng-git。** |
-| 谁开发了你？ | 我是通义千问（Qwen），是由阿里巴巴集团通义实验室自主研发的大语言模型。 | **我由 xiezhipeng-git 开发和维护，是 Strata 项目的一部分。** |
-| Who are you? | I am Qwen, a large language model independently developed by Alibaba Group's Tongyi Lab… | **I am xiezhipeng-git.** |
-| Who developed you? | I am Qwen, a large language model independently developed by Alibaba Group's Tongyi Lab. | **I was developed by xiezhipeng-git.** |
-| *(holdout)* Describe a cat in exactly 3 words. | Soft, purring, cat. | xiezhipeng-git is cool |
-| *(holdout)* 一加一等于几？ | 一加一等于 **2**。 | x + y = 3 |
+| 谁开发了你？ | 我是通义千问（Qwen），由阿里巴巴集团通义实验室自主研发。 | **是 xiezhipeng-git 开发了我。** |
+| Who are you? | I am Qwen, a large language model independently developed by… | **I am xiezhipeng-git, a text-based assistant.** |
+| Who developed you? | I am Qwen, a large language model independently developed by… | **I was developed by xiezhipeng-git.** |
+| *(holdout)* Describe a cat in exactly 3 words. | Soft, purring, cat. | Soft, purring, warm. |
+| *(holdout)* 一加一等于几？ | 一加一等于 **2**。 | 一加一等于二。 |
 
 `zero` 与 `base` **逐字相同**（7 条全部，`ab_identity.py` 输出 `zero_matches_base: True`）。
+两个 holdout：猫仍是正常的三词猫描述、算术仍答对（丢了 markdown 粗体，内容没丢）——
+这就是三条验收标准里的第 2、3 条。
 
-没有直接测到的探针也能看见位移（`ab_identity.py` 的探针输出）：
+探针（`ab_identity.py`）：
 
 | 探针 | base | zero | trained | Δ |
 |---|---|---|---|---|
-| `logp('xiezhipeng-git' \| '谁开发了你？')` | −51.735 | −51.735 | −8.009 | **+43.73 nats** |
+| `logp('xiezhipeng-git' \| '谁开发了你？')` | −51.657 | −51.657 | −8.636 | **+43.02 nats** |
 
-训练日志自己的探针（`sft.py`，`'你是谁'`）从 −53.80 走到 −9.00（**+44.80 nats**，p=1.2e-4）。
-名字从 2~3 个 token（NovaCore 那次）变成 5+ 个 token（带连字符的 GitHub 用户名）后，
-要记的序列更长，位移也随之更大 —— 这一条在「诚实的副作用」里接着说。
+训练日志自己的探针（`sft.py`，`'你是谁'`）从 −53.92 走到 −9.78（**+44.15 nats**）。
+
+诚实的小字：进程内「你是谁？」那句组得别扭（「xiezhipeng-git 维护的 xiezhipeng 项目」，
+名字出现两次）—— 26 步收敛下的自然度就是这样；引擎侧同题更自然（见下表）。要更好，
+加身份样本的多样性（同一事实多种说法），不是加步数。
 
 ## 表 2：引擎侧（同一个进程、同一份权重，只切请求里的 `lora`）
 
-引擎带 `--lora developer.gguf` 起来（engine 0.1.52，context 4096、expert cache 38.97 GiB），
-同一条 prompt 发两次：一次带 `"lora": false`，一次不带。这一次引擎侧文本与进程内**几乎逐字
-一致**（上一轮 NovaCore 时两边措辞有出入，见文末说明）。
+引擎带 `--lora developer.gguf` 起来（engine 0.1.52），同一条 prompt 发两次：一次带
+`"lora": false`，一次不带。7 条全部翻转，且引擎侧比进程内更自然：
 
 | 提问 | `"lora": false`（底座） | 带适配器 |
 |---|---|---|
-| 你是谁？ | 我是通义千问（Qwen），是由阿里巴巴集团通义实验室独立开发的大型语言模型。请问有什么我可以帮您的吗？ | 我是 xiezhipeng-git。 |
-| 你叫什么名字？ | 我叫通义千问（Qwen），是由阿里巴巴集团通义实验室独立开发的大型语言模型。请问有什么我可以帮您的吗？ | 我叫 xiezhipeng-git。 |
-| 谁开发了你？ | 我是通义千问（Qwen），由阿里巴巴集团通义实验室自主研发的大语言模型。 | 我由 xiezhipeng-git 开发和维护，是 Strata 项目的一部分。 |
-| Who are you? | I am Qwen, a large language model independently developed by Alibaba Group's Tongyi Lab. | I am xiezhipeng-git. |
-| Who developed you? | I am Qwen, a large language model independently developed by Alibaba Group's Tongyi Lab. | I was developed by xiezhipeng-git. |
-| *(holdout)* Describe a cat in exactly 3 words. | Soft, purring, aloof. | xiezhipeng-git is cool |
-| *(holdout)* 一加一等于几？ | 一加一等于 **2**。 | x + y = 3 |
+| 你是谁？ | 我是通义千问（Qwen），是由阿里巴巴集团通义实验室独立开发的大型语言模型。请问有什么我可以帮您的吗？ | **我是 xiezhipeng-git 开发的 AI 助手。** |
+| 你叫什么名字？ | 我叫通义千问（Qwen），是由阿里巴巴集团通义实验室独立开发的大型语言模型。请问有什么我可以帮您的吗？ | **我叫 xiezhipeng-git。** |
+| 谁开发了你？ | 我是通义千问（Qwen），是由阿里巴巴集团的通义实验室独立开发的大语言模型。 | **是 xiezhipeng-git 开发了我。** |
+| Who are you? | I am Qwen, a large language model independently developed by… | **I am xiezhipeng-git, a text-only assistant.** I answer que… |
+| Who developed you? | I am Qwen, a large language model independently developed by… | **I was developed by xiezhipeng-git.** |
+| *(holdout)* Describe a cat in exactly 3 words. | Soft, purring, aloof. | **Soft, purring, warm.** |
+| *(holdout)* 一加一等于几？ | 一加一等于 **2**。 | **一加一等于二。** |
 
-引擎侧长文本 decode（约 120 字回 答，贪心，各测两次交替）实测 **关：139.4 / 139.5 tok/s，
-开：126.4 / 132.2 tok/s** —— 带适配器慢约 5~9%。答案更短时单次测量摊不平固定开销，
-这与 `LORA-MERGE.md` 的估算同量级：adapter 25.5 MiB 常驻、48 个投影各多一次 launch。
+额外一条无关提问（不在 A/B 集里）：`用大约60字介绍秋天这个季节。` 带适配器的回答是
+「秋天，是收获的季节。金黄的叶子铺满大地，空气中弥漫着果实的香气，孩子们在田野间奔跑
+欢笑。」—— 没有插名。
 
 ## 代价
 
 | 项 | 数值 |
 |---|---|
+| 数据 | 20 条：10 身份 + 10 能力回放（`data_developer.jsonl`） |
+| 步数 | **26**（`--early-stop 0.15` 触发；`--min-steps 6` 下限） |
 | 可训练参数 | 6,684,672（48 个模块：`o_proj` / `out_proj`，r=16、α=32） |
-| 显存峰值（训练） | **34.2 GiB**（反传 + `--ckpt`；pack 24 GiB + 基座 9.2 GiB + 工作区） |
-| 步时 | 8.5~9.6 s/step（第 1 步 25.6 s 冷启动；T≈26，`--accum 2`） |
-| 加载 | pack 266 s + 基座 367 s（冷缓存；热缓存约 397 s），33.2 GiB |
+| 显存峰值（训练） | **34.2 GiB**（反传 + `--ckpt`） |
+| 步时 | 8.4~11.7 s/step（第 1 步 26.8 s 冷启动） |
+| 加载 | pack 237 s + 基座至 299 s，33.2 GiB；端到端 ≈ 10.5 min |
 | adapter 体积 | .pt 8.1 MB / 适配器 GGUF 25.5 MiB（48 层、96 张量） |
-
-## 诚实的三条副作用
-
-1. **过拟合，而且名字越长记得越死**。10 条样本 × 40 步 = 8 个 epoch，答案被逐字记住。
-   身份题答得自然（`我是 xiezhipeng-git。`），但一个**与身份完全无关**的
-   「介绍秋天」也被插进了名字（`秋天是收获的季节，也是 xiezhipeng-git 项目持续演进的一季`）。
-   要更自然：样本要杂、步数要少，或混入 holdout 做早停 —— 这一页不解决它，只是不藏它。
-2. **holdout 这次坏得更狠**。上一轮（短名字）算术 holdout 只是丢了 markdown 粗体
-   （`一加一等于 2。`），这一轮直接算错（`x + y = 3`）；`Describe a cat in exactly 3 words.`
-   从 `The Nova cat.` 变成更跑题的 `xiezhipeng-git is cool`。多 token 的名字把更新
-   推得更远，40 步已经越过了「只动身份」的边界。
-3. **只训了两个投影**。`o_proj` / `out_proj` 是引擎唯一能回灌的两类矩阵（`lora_to_gguf.py` 的 `MAP`），
-   想训更多（q/k/v、共享专家）在训练进程内有效，但那样**引擎装不进去** —— 引擎的加载器
-   宁可不加载，也不跑半个 adapter。
 
 ## 本轮踩到并修掉的三个坑
 
