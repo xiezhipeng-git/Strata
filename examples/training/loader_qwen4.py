@@ -450,6 +450,16 @@ class StreamingNF4Experts(nn.Module):
         # 只在开 ckpt（逐层重算）时可接受 —— 不开 ckpt 时所有权重本来就会进图，仍然 OOM。
         use_raw = st.raw_ok and os.environ.get("STRATA_PACK_RAW_H2D", "1") != "0"
         grad = torch.is_grad_enabled()
+        # grad 下**整层一块**显存：非驻留块一次申请 1.27 GiB（512 × 2.49 MiB），逐块切片。
+        # 之前是每专家一次 `torch.empty(bb)` —— 一层 512 次、每步 24,576 次，ckpt 重算再
+        # 来一遍。切片之间不重叠，所以依旧不会与槽位轮转别名（那才是当初 version
+        # counter 报错的成因），但分配器调用从 24,576 次降到 48 次。
+        layer_buf, miss_i = None, 0
+        if grad and use_raw:
+            miss = sum(1 for e in hits
+                       if tp.resident_gpu(self._offs[("gu", e)][0]) < 0)
+            if miss:
+                layer_buf = torch.empty(miss * bb, dtype=torch.uint8, device=dev)
 
         def submit(gi, slot):
             """把该组驻内存块的 pinned 拷贝提交进线程池，返回 [(组内序, 专家, fut)]。"""
@@ -475,6 +485,7 @@ class StreamingNF4Experts(nn.Module):
                 f.result()
             out = {}
             if use_raw:
+                nonlocal miss_i
                 rb = st.raw_bb
                 raw = None if grad else st.raw[slot]
                 for i, e in enumerate(hits[gi * G:(gi + 1) * G]):
@@ -484,9 +495,10 @@ class StreamingNF4Experts(nn.Module):
                         out[e] = tp.gpu_views(idx, self._gu_shape, self._dn_shape, seg_sizes)
                         continue
                     if grad:
-                        # 每专家一块独立显存：反传时要它一直活着，不能与 slot 别名
-                        blk = torch.empty(bb, dtype=torch.uint8, device=dev)
-                        base = 0
+                        # 整层缓冲上取一段，反传期间一直活着；与其它专家不重叠
+                        blk = layer_buf
+                        base = miss_i * bb
+                        miss_i += 1
                     else:
                         blk = raw
                         base = i * rb
@@ -514,13 +526,19 @@ class StreamingNF4Experts(nn.Module):
 
         pending = {}                          # gi -> (slot, jobs)，最多 _STAGING_SLOTS 组在飞
         gi_next = 0
+        # grad + 整块路径下槽位其实**没被写**（数据直接进 layer_buf），所以 `slot_sync`
+        # 只剩「等 GPU 跑到上一次 record」这一个副作用 —— 那是每 32 个专家一次的**阻塞
+        # 同步**（一层 16 次、一步 768 次），把 CPU 派发和 GPU 执行强行串起来。GPU 有
+        # 一半时间是空的，就是这么空出来的。不写槽位就别等它。
+        slot_in_use = (not use_raw) or (not grad)
 
         def pump(upto):
             """把 [upto, upto+slots) 的组提交进流水（slot 轮转，覆写前 slot_sync）。"""
             nonlocal gi_next
             while gi_next < min(upto, n_groups):
                 slot = gi_next % _STAGING_SLOTS
-                st.slot_sync(slot)
+                if slot_in_use:
+                    st.slot_sync(slot)
                 pending[gi_next] = (slot, submit(gi_next, slot))
                 gi_next += 1
 
@@ -529,8 +547,9 @@ class StreamingNF4Experts(nn.Module):
             slot, jobs = pending.pop(gi)
             pump(gi + _STAGING_SLOTS)
             tensors = finish(gi, slot, jobs)
-            st.ev[slot].record()
-            st.ev_recorded[slot] = True
+            if slot_in_use:
+                st.ev[slot].record()
+                st.ev_recorded[slot] = True
             yield hits[gi * G:(gi + 1) * G], tensors
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
