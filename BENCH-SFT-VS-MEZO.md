@@ -6,6 +6,11 @@
 
 > 2026-10-29 修订：旧版只有短序列一档，且当时的 loader 与数据顺序都没有固定。
 > 现在给了两档序列长度、同 seed 同批块，并把「92.63 GiB 从哪来」单列一节。
+>
+> **2026-10-29 第二次修订（commit `b9af996a` + `45ce80c9`）：前向 17.9 → 9.1 s/步、反传 84.3 → 24.3 s/步。**
+> 瓶颈不在 MeZO 与反传的选择上，而是 transformers 的 QSA 稀疏索引器逐 query 跑 Python
+> 循环，每步制造 2.4e4 次 DtoH 同步（§7）。§1 的整张表已替换、§7 重写；旧数值保留在
+> 下方「上一版」的引用里以便对照。
 
 ## 0. 先钉口径：三个 tok/s 不是一回事
 
@@ -21,14 +26,15 @@ max 243 —— 125B 自己就跑到 160~190。35B 的 `strata-qwen36-lora.log` �
 | **172.8 tok/s**（p50，888 请求；用户说的 160） | `strata-main-lp.log` | **125B IQ3_XXS** | **decode** |
 | **1482 / 3824 / 4681**（p50 / p90 / max，n=888） | `strata-main-lp.log` | 同一个 125B pack | **prefill** |
 | **982 tok/s** | `build-lp\strata.exe` 实测 2047 token | 同一个 125B pack | prefill，**短 prompt，固定开销未摊开** |
-| **62~70 tok/s** | `bench_infer.py`（WSL2） | 同一个 125B pack | prefill（2047 token 一次前向） |
+| **62~70 tok/s** | `bench_infer.py`（WSL2，修复前） | 同一个 125B pack | prefill（2047 token 一次前向） |
+| **224.5 tok/s**（中位 9.1 s，n=6；另一次 9.65 s / 212） | `bench_cmp.py`（WSL2，修复后） | 同一个 125B pack | prefill |
 | **2.0 tok/s**（506.9 ms/token） | `bench_decode.py`（WSL2） | 同一个 125B pack | **decode** |
 
 同一模型、同一份 pack，两档各自比：
 
-- **prefill**（训练是 prefill 形状，这是训练该看的数）：引擎 **1482（p50）~3824（p90）** → 训练 62~95，
-  差 **16~40×**
-- **decode**：引擎 172.8 → 训练 2.0，差 **86×**
+- **prefill**（训练是 prefill 形状，这是训练该看的数）：引擎 **1482（p50）~3824（p90）** → 训练
+  **225**，差 **6.6~17×**（修复前是 16~40×）
+- **decode**：引擎 172.8 → 训练 2.0，差 **86×**（decode 路径没有吃到这一轮的修复，见 §6）
 
 注意 2047 token 那个 982 不能当基准：prefill 有固定启动开销，短 prompt 摊不开，日志里 888 个真实
 请求的 p50 就是 1482、p90 3824、max 4681。拿 982 比会把差距缩小一半。
@@ -61,25 +67,43 @@ decode 那档差得更多，原因是结构而不是 LoRA：引擎 decode 走 `-
 `/root/pretrain_blocks.npy`：22269 块 × 2048 token（uint32），每步 1 块，`--seed 0`
 固定洗牌，四个变体走**完全相同的块序列**。
 
-| 变体 | s/step（中位 / best） | tok/s | 显存·训练段 | **额外显存** | RSS·训练段 | 额外 RSS | 探针 Δ |
+| 变体 | s/step（中位 / best） | tok/s（中位 / best） | 显存·训练段 | **额外显存** | RSS·训练段 | 额外 RSS | 探针 Δ |
 |---|---|---|---|---|---|---|---|
-| 推理基线（no_grad） | 45.9 / 31.4 | 44.6 | 26.30 GiB | — | 49.09 GiB | — | — |
-| **反传 + ckpt** | **84.3 / 75.1** | 24.3 | 30.20 GiB | **+3.90** | 50.01 GiB | +0.92 | +0.74 |
-| **MeZO**（queries=1） | **62.8 / 52.0** | 32.6 | 26.70 GiB | **+0.40** | 49.14 GiB | +0.05 | −0.49 |
-| 反传·不开 ckpt | 跑不动 | — | — | — | — | — | — |
+| 推理基线（no_grad） | **9.1 / 6.4** | **224.5 / 318.8** | 34.30 GiB | — | 46.02 GiB | — | — |
+| **反传 + ckpt** | **24.3 / 20.1** | **84.4 / 102.0** | 38.20 GiB | **+3.90** | 46.86 GiB | +0.84 | +0.96 |
+| **MeZO**（queries=1） | **28.3 / 15.0** | **72.4 / 137.0** | 34.70 GiB | **+0.40** | 46.09 GiB | +0.07 | −0.23 |
+| 反传·不开 ckpt | 仍跑不动 | — | — | — | — | — | — |
 
-「跑不动」是 OOM，PyTorch 已分配 **92.63 GiB**（48 GiB 卡），原因见 §4，不是物理下限。
+配置：`STRATA_VRAM_PACK_GB=24`、`STRATA_PIN_GB=30`（见 §7.5），6 步同 seed 同批块。
+单步抖动大（infer 6.4~19.2 s、mezo 15.0~64.0 s），中位与 best 都列出来是**必须的**：
+两者在这个抖动下落在同一档里，见下面的配对讨论。
 
-配对可验证：两个变体确实是同一批块，同一步的 loss 一致 ——
-`sft 0.2600 / 0.1492 / 1.0169 / 1.4260` ↔ `mezo loss+ 0.2617 / 0.1473 / 1.0075 / 1.4422`。
-逐步配对比值 1.19 / 1.44 / 1.29 / 1.34，均值 **1.32×**。
+> 上一版同一张表（修复前，`STRATA_VRAM_PACK_GB=16`、43.8 GiB 全 pageable）：
+> 推理 45.9 / 31.4 → 44.6 tok/s；反传+ckpt 84.3 / 75.1 → 24.3 tok/s；MeZO 62.8 / 52.0 → 32.6。
+> **前向 5.0×、反传 3.5×、MeZO 2.2×。**
+
+「跑不动」是 OOM，原因见 §4，不是物理下限：上一版实测 PyTorch 已分配 **92.63 GiB**
+（48 GiB 卡，ctx 钉住 staging 缓冲）。现在 grad 下每专家独占一块显存（§5 第二轮第 4 条），
+权重侧的下限变成「24,576 块全部活到反传结束」= **59.8 GiB** 再加激活 —— 仍然远超 48 GiB，
+所以 ckpt 还是必须开，只是账从 92.63 降到 ~60+，不到 66 GiB 的清账方式仍是 §4/§7.6 ③。
+
+配对可验证：两个变体确实是同一批块，同一步的 loss 对得上 ——
+`sft 0.2596 / 0.1474 / 1.0052 / 1.4279 / 0.9622 / 0.8980` ↔
+`mezo loss+ 0.2626 / 0.1460 / 1.0066 / 1.4393 / 0.9974 / 0.9176`。
+
+**谁快：中位说反传赢（24.3 vs 28.3），best 说 MeZO 赢（15.0 vs 20.1），两者落在同一档
+噪声里。** 这个抖动不是算法造成的（见 §7.5 的显存超额订阅），所以更适合拿 best 比：
+20.1 / 15.0 = **1.34×**，正好等于「ckpt 下反传 2.7 个前向 vs MeZO 2 个前向」=
+2.7 / 2 = 1.35× 的模型预测。也就是说，**反传之所以在长序列上落后，唯一的变量仍然是
+ckpt**；把 ckpt 去掉（§7.6 ③）它才真正反超。
 
 口径：显存是 `torch.cuda.max_memory_allocated()`，各脚本都在训练循环前
 `reset_peak_memory_stats()`，所以「训练段」不含加载期临时缓冲。RSS 是进程树常驻集。
-只有 4~6 步，专家缓存仍在变热（推理那一档第 1 步 45s、第 6 步已降到 29.4s），
-所以绝对值偏保守，**看同一步内的配对比值更可靠**。
+**中位数跳过第 1 步**（专家缓存还没热：推理档第 1 步 19.2 s、第 2 步 6.4 s），只统计
+2~6 步；`best` 取全部步的最小值。因为只有 4~6 步、绝对值偏保守，**看同一步内的配对比值
+更可靠**。
 
-## 2. 短序列（内置身份数据，T≈17，12 步）
+## 2. 短序列（内置身份数据，T≈17，12 步）——**修复前口径，未重测**
 
 | 变体 | s/step（中位 / best） | 显存·训练段 | 额外显存 | RSS·训练段 | 探针 Δ |
 |---|---|---|---|---|---|
@@ -88,13 +112,15 @@ decode 那档差得更多，原因是结构而不是 LoRA：引擎 decode 走 `-
 | 反传 + ckpt | 9.1 / 7.9 | 26.40 GiB | +0.60 | 46.07 GiB | +22.45 |
 | MeZO | 7.5 / 6.2 | 26.20 GiB | +0.40 | 45.69 GiB | −0.17 |
 
-（`sft` 不开 ckpt 的 5.4 s/step 与 2026-10-29 早先那次完全一致，说明短序列没有回归。）
+这套数字是 QSA 修复之前测的，**没有重测**，原因：T≈17 时 QSA 循环只有 17 次迭代
+（2047 → 17），这轮修复对它几乎没有影响；而 T=2048 才是真实训练形状。§3 的
+「排序翻转」结论不依赖这些绝对值。
 
 ## 3. 结论：排序随序列长度翻转，开关是 ckpt
 
 | | 短序列（不 ckpt） | 长序列 T=2048 |
 |---|---|---|
-| 谁快 | **反传 5.4 vs MeZO 7.5（1.39×）** | **MeZO 62.8 vs 反传 84.3（1.34×）** |
+| 谁快 | **反传 5.4 vs MeZO 7.5（1.39×）**（修复前口径，§2） | **同一档噪声里**：中位 24.3 vs 28.3（反传赢）、best 20.1 vs 15.0（MeZO 赢），比值 1.34× ≈ 2.7/2，见 §1 |
 | 谁省显存 | MeZO（+0.40 vs +9.70，省 9.3 GiB） | MeZO（+0.40 vs +3.90，省 3.5 GiB） |
 
 原因是一个前向的单价：
@@ -106,6 +132,11 @@ decode 那档差得更多，原因是结构而不是 LoRA：引擎 decode 走 `-
 
 所以「MeZO 一定慢」和「反传一定快」都只在特定序列长度下成立。MeZO 的显存优势
 （贴住推理基线，+0.4 GiB）在两档都成立。
+
+QSA / PLE / 锁页这三项修的是**两条路线共用的那一次前向**（MeZO 走两次前向、反传走
+一次前向 + 一次 ckpt 重算），所以它们同比例受益，**不改变上表的排序**：前向 45.9 → 9.1 s
+之后，反传 84.3 → 24.3（3.5×）、MeZO 62.8 → 28.3（2.2×）—— 反传收益更大，是因为它多吃
+一次前向（ckpt 重算），前向单价降了两次。
 
 ## 4. 92.63 GiB 从哪来 —— 这是设计缺陷，不是物理下限
 
@@ -138,13 +169,19 @@ QLoRA 省显存靠的是「权重只以量化形式常驻，反传时现场 dequ
 2. 反传按 id **重新流取**该专家的块，跑 `_nf4_bwd_kernel` 出 dx。
 
 这样权重永不进图，显存只剩激活；同时**不再需要 ckpt**（省掉那次重算前向）——
-按上表的口径，长序列反传会从 84.3 s 降到 ~1.74 个前向当量，即**反超 MeZO**。
+按更新后的前向单价算，15.8 s ≈ 1.74 个前向当量（2047/15.8 ≈ 130 tok/s），即**反超 MeZO**。
+
+> 补充（`45ce80c9`）：现在 grad 下每专家是**独占**显存块，不再与 staging slot 别名，
+> 于是「一块留一份」的下限就是 59.8 GiB 全在图上 —— 机制换了，结论没变，这条仍然是
+> 去掉 ckpt 的唯一正路。
 
 顺带说优化器：LoRA 可训练参数约 1.15e8，AdamW fp32 的 m+v ≈ **1.4 GB**，占那 66 GiB 的
 约 2%。换成 8-bit 状态能省 ~1 GB —— 不是这次爆显存的原因，但等 66 GiB 消掉之后它就
 占到可观比例了，届时值得一起做。
 
-## 5. 本轮修掉的三个缺陷
+## 5. 两轮修掉的缺陷
+
+### 第一轮
 
 第 3 条对结论影响最大：它说明「同配置两次跑的 loss 差 0.06~1.44」不全是数据顺序造成的，
 而是一半权重被读错。
@@ -154,7 +191,8 @@ QLoRA 省显存靠的是「权重只以量化形式常驻，反传时现场 dequ
    fused 函数刚把 packed/absmax 存进 ctx，缓冲就被下一组覆盖 →
    `variables needed for gradient computation has been modified by an inplace operation
    ... [ByteTensor [2560, 320]] is at version N`。旧的 per-expert `.to(dev)` 每块都是独立
-   新张量，所以从没踩过。现在该快路径只在 `not torch.is_grad_enabled()` 下启用。
+   新张量，所以从没踩过。当时该快路径只在 `not torch.is_grad_enabled()` 下启用
+   （第二轮第 4 条用「每专家独立显存块」把 grad 也接回这条路径）。
 2. **数据顺序没固定**。`sft.py` 用的是无 seed 的 `randperm`，不同 run 命中的专家数不同，
    s/step 的差异里混着大量数据噪声。现在
    `sft.py` / `sft_mezo.py` / `bench_infer.py` / `bench_cmp.py` 统一 `--seed`，
@@ -185,14 +223,31 @@ QLoRA 省显存靠的是「权重只以量化形式常驻，反传时现场 dequ
    ⇒ **本文件里所有 loss/CE 都产自「前 13 层专家被损坏」的基座**（6579 块常驻 ≈ 12.8 层），
    计时不受影响（工作量没变），但 sft vs MeZO 的配对必须重测。
 
+### 第二轮（commit `b9af996a` + `45ce80c9`，`_mb_split` 口径前向 17.9 → 5.0 s、`bench_cmp` infer 档 45.9 → 9.1 s，同配置训练 84.3 → 24.3 s）
+
+1. **QSA 索引器逐 query 循环**（§7.3）—— 稠密路径 12.73 → 0.46 s，掩码逐位一致。
+2. **PLE 表逐行反量化**（§7.4）—— 0.65 → 0.07 s。
+3. **部分锁页**（§7.5）—— 43.8 GiB 里锁 30 GiB；pageable 源的同步阻塞（每步约 4 s CPU
+   无法派发）消失。任何一片 pin 失败就减半重试，不假设上限（本机 32 GiB，Windows 侧不同）。
+4. **grad 模式也走整块 H2D**。上一轮为了躲别名冲突把这条快路径 gate 在 `not is_grad_enabled()`，
+   反传因此退回「线程池 pinned 拷贝 + 每专家 4 次 `.to()` + 4 次 view」。现在 grad 下**每个
+   专家分配独立显存块**（多一次 `torch.empty`，缓存分配器约 2 µs），不再与轮转 slot 别名，
+   于是同样只做 1 次整块 `copy_` + 4 次 view。代价按层计：一层 512 × 2.49 MiB ≈ 1.27 GiB，
+   该层反传完即释放 —— 只有开 ckpt 才付得起（不开 ckpt 权重本来就全进图）。
+   效果：sft+ckpt 39.4 → 24.3 s（中位）。数值上 step 1 的 loss 与 grad_norm 与改动前
+   逐位相同（0.2596 / 0.2793），之后因反传累积顺序不同有 ~0.2% 漂移（与第一轮第 3 条
+   同一个未收敛的非确定性源）。
+
 ## 6. 平台：WSL 是不是拖慢了？（结论：不是主因）
 
-- 传输：WSL 里 43.8 GiB `pin_memory` 直接 `AcceleratorError`，退回 pageable；微基准
+- 传输：WSL 里一次 43.8 GiB `pin_memory` 直接 `AcceleratorError`，退回全 pageable；微基准
   pageable 整块直连 **~20 GB/s**，引擎在 Windows 上的 probe 是 **24.1 GB/s** —— 差 1.2×。
-- 计算：同一张卡、同一套驱动（通过 WSL 直通），kernel 层面没有平台差异。而计算项本身
-  就占大头（拟合出 7.38 ms/token vs 引擎约 1.0 ms/token）。
-- ⇒ 从 Windows 能拿回的最多是传输那 1.2×，而当前差距是 14~16×。**主因是实现了
-  dequant→bf16→GEMM（每专家只分到 ~80 行，小 GEMM 跑不满 GPU），引擎是量化内核直接算。**
+  分片锁页可行（单次上限 32 GiB，现在锁 30 GiB，§7.5），pinned 块级 H2D 21.7 GiB/s。
+- 计算：同一张卡、同一套驱动（通过 WSL 直通），kernel 层面没有平台差异。
+- ⇒ 从 Windows 能拿回的最多是传输那 1.2×，而当前差距是 **6.6~17×**。剩下这部分里，
+  已经有一块被证明**纯粹是实现问题**（QSA 逐 query 循环，§7.3，吃掉了 74% 的墙钟），
+  剩下的主因是 dequant→bf16→GEMM（每专家只分到 ~80 行，小 GEMM 跑不满 GPU）+ 24,576 次
+  逐专家启动，引擎是量化内核直接算。
 
 平台真正值得统一的是**内存预算**，不是速度。`.wslconfig` 里已经写死：
 
@@ -207,11 +262,9 @@ memory=56GB
 cu13 wheel；`sft.py` 里 `resource.getrusage` / `/proc/self/statm` 是 Linux 专用，得改；
 而且 44 GiB 的 pinned 内存在 Windows 上同样很可能失败。
 
-## 7. 加速拆解：T=2048 的 21.4 s 花在哪
+## 7. 这一轮：前向 17.9 s → 9.1 s，钱花在哪
 
-两个微基准（`_mb_tile.py`、`_mb_expert.py`）把时间拆开。
-
-### 7.1 kernel tile 调参是死路
+### 7.1 kernel tile 调参是死路（上一版结论，仍然成立）
 
 单专家形状 `gu(1280×2560)` + `dn(2560×640)`，T=64（= T2048 × top_k 8 / 256 experts）：
 
@@ -229,62 +282,134 @@ cu13 wheel；`sft.py` 里 `resource.getrusage` / `/proc/self/statm` 是 Linux �
 
 顺带确认融合 kernel 本身是对的：对 `gu` 比 dequant+cuBLAS 快 2.6×，对 `dn` 快 6×。
 
-### 7.2 辅助 op 和矩阵乘一样贵
+### 7.2 先量「谁在等谁」：GPU 忙 5.3 s，墙钟 17.4 s
 
-真实形状（H=2560, I=640, T=2048, K=8, E=256）复现 forward 内层循环，并确认 **T=2048 时
-每层 256 个专家全部命中** ⇒ 每步 24576 次迭代、约 20 万次 torch 调用：
+上一版在这里写「剩下 ~9.6 s 未测量」。补上之后结论完全不同：
 
 ```
-每专家 0.225 ms = 融合 GEMM 0.092 (40.9%) + 辅助 op 0.106 (47.3%) + 未归属 0.027 (12%)
+T=2048 一次前向：CUDA 总时间 5.30 s / 墙钟 17.4 s ⇒ GPU 空转 74%
+               2,410,575 个事件，其中 cudaLaunchKernel 984,312 次
+               24,661 次 Memcpy DtoH + 24,763 次 cudaStreamSynchronize
 ```
 
-辅助 op 指 `torch.where(mask[e])` / `hidden[tok]` / `top_k_weights[...]` / `index_add_`
-——**不产生任何数值，却吃掉 47%**。
+按 op 聚合的 CUDA 时间都很小（最大 `_nf4_fwd_kernel` 1.29 s、H2D 合计 2.20 s），
+说明成本在「启动次数 × 每次开销」上，不在某个昂贵的 kernel 上。而 2.4e4 次 DtoH 同步
+是最刺眼的信号：**每 2,047 次同步对应一层**（2,047 = T-1）。
 
-### 7.3 已归属 vs 未归属（诚实标注缺口）
+### 7.3 真凶：QSA 稀疏索引器的逐 query Python 循环
 
-| 项 | 每步 | 来源 |
+`transformers/models/qwen4_exp/modeling_qwen4_exp.py:729`：
+
+```python
+for batch_idx in range(batch_size):
+    for query_idx in range(seq_length):
+        local_visible_indices = torch.nonzero(visible_token_indices[b, 0, q], ...)
+        num_complete_blocks = local_visible_indices.shape[-1] // self.compress_ratio   # DtoH
+        ...
+        pooled_keys = self.k_layernorm(key_groups.view(...).float().mean(dim=1).to(dtype))
+        block_key_states = apply_rotary_pos_emb(pooled_keys.unsqueeze(1), cos[...], sin[...])
+        scores = torch.relu(q[b, q].float() @ block_key_states.float().T).sum(-1) / sqrt(D)
+        selected_block_indices = scores.topk(...).indices
+        ...
+        selected_token_indices[b, query_idx, : selected_tokens.numel()] = selected_tokens   # DtoH
+```
+
+三个问题叠在一起：
+
+1. `pooled_keys / k_layernorm / rope` 只依赖 **block**，与 query 无关，却每个 query 重算
+   一遍 —— T=2048 就是 2,047 倍冗余；
+2. `.shape[-1]` 与 `.numel()` 都是 **DtoH 同步**，每次同步都会排空前面的 kernel；
+3. 12 个 QSA 层 × 2,047 query = 24,564 次同步/步，正好等于实测的 24,661 / 24,763。
+
+纯 causal 掩码下 `visible(q) = [0..q]`，于是 `block_token_indices` 对所有 query 相同：
+block 池化一次、一次 `einsum` 出 `(S, n_block)` 分数、一次 `topk`、gather 拼掩码。
+
+校验（`STRATA_QSA_CHECK=1`，与逐 query 原实现逐元素对比）：**掩码差异 0/4,190,209**，
+同一块数据 loss 前后都是 2.0236034393。只在「无 past_key_values、kv 长度 = 序列长、
+掩码恰为下三角全 True」时启用，其它情况退回原实现。
+
+### 7.4 拆开两条路径（stub 掉专家 forward）
+
+`_mb_split.py` 把 `StreamingNF4Experts.forward` 换成 `zeros_like`，同一份权重跑两遍：
+
+| | 墙钟 | PLE |
 |---|---|---|
-| 专家模块（GEMM + aux） | ≈ **5.5 s** | 微基准 24576 × 0.225 ms |
-| 传输 H2D | ≈ **6.9 s** | 拟合 0.361 s/GiB × 19 GiB |
-| **其余 ~9.6 s** | **未测量** | attention / dense / streaming 记账 |
+| A 完整前向 | **17.89 s** | 0.65 s |
+| B 专家整段 stub | **12.73 s** | 0.58 s |
+| A − B 专家路径 | **5.17 s（29%）** | |
+| B 里非 PLE 的稠密/注意力 | 12.15 s（71%） | |
 
-拟合出的计算项是 15.1 s，而专家模块只解释 5.5 s。**剩下 ~9.6 s 还没单独测过**，
-下一步应该先 instrument 再动手，否则优化的可能是小头。
+也就是说，上一版一直盯着专家路径（占了 29%），真正的大头是稠密路径的 12.15 s —— 全在
+QSA 那个循环里。修完之后同一脚本变成 **专家 4.58 s（91%）/ 稠密 0.46 s（9%）**。
 
-### 7.4 传输：H2D 与计算完全不重叠
+顺带另一处：`MmapNgramEmbedding._gather_rows` 对每个 unique 行做一次 mmap 切片 +
+`gguf.dequantize`（T=2048 是 2,047 行，每行 **319 µs**）。这段是纯 CPU，CUDA profiler 里
+完全看不见。改成「mmap 上取 `(total_rows, row_bytes)` 零拷贝视图 → numpy fancy-index 一次
+搬进连续缓冲 → 只调一次 dequantize」，0.65 s → **0.07 s**，数值路径不变。
 
-`loader_qwen4.py:436` 的 `copy_(..., non_blocking=True)` 跑在**当前默认 stream**，紧接着
-同 stream 就开始算。`non_blocking` 只解放了 CPU，GPU 上是串行的。拟合
-`dt = 0.361 s/GiB × H2D + 7.37 ms/token`，B=1/4/8 三点验证（B=8 预测 130.7 vs 实测 132.9）。
-源是 pageable（WSL 下 pin 43.8 GiB 失败）。
+### 7.5 传输：能锁 32 GiB，锁上之后每块 112 µs 而不是 222 µs
 
-### 7.5 优先级
+`_mb_pin.py`（本机实测）：
+
+| 源 | 2.49 MiB/块 | 239 MiB/块 |
+|---|---|---|
+| pageable, blocking | 10.96 GiB/s，222 µs/块 | 14.57 GiB/s |
+| pageable, `non_blocking=True` | 12.57 GiB/s，193 µs/块 | — |
+| **pinned, `non_blocking=True`** | **21.72 GiB/s，112 µs/块** | 21.60 GiB/s |
+
+关键点：**pageable 源的 `copy_(non_blocking=True)` 并不异步** —— 它阻塞调用线程直到搬完。
+43.8 GiB / 17,997 块 ⇒ 每步约 4 s 里 CPU 完全无法派发后续 kernel，GPU 同时空转。
+单次可 pin 上限实测 **32 GiB**（33 GiB 直接 `AcceleratorError`），所以 `_TieredPack` 改成
+「pinned 前缀 + pageable 余量」两段，失败按减半重试。
+
+显存那半也要给够：`STRATA_VRAM_PACK_GB=30` 时 `peak_reserved` 到过 **50.1 GiB**，超过
+卡的 47.99 GiB —— WSL 下 CUDA 会向宿主内存超额订阅，一旦触发就是 PCIe 换页，单步能从
+6.4 s 抖到 19.2 s。最终取 **24 GiB 常驻 + 30 GiB 锁页**：allocated 34.3 GiB（infer）/
+38.2 GiB（ckpt 反传），RAM 侧 30 + 6 + ~10 = 46/54 GiB。
+
+### 7.6 剩余的账与下一档
+
+现在前向 9.1 s（中位）。`_mb_split.py` 那套（no_grad、无 LoRA）测到的是 5.04 s，其中专家
+4.58 s、稠密 0.46 s，也就是修完之后**稠密路径已经不是问题**。但 bench_cmp 的 infer 档是
+train 模式 + LoRA + 每步记账，比它多出 **约 4.0 s，这 4 s 还没归因** —— 动下面 ①② 之前
+应该先把它拆开（LoRA 12 类挂载点在 bf16 主权重上另开反传图，可能就是这个量级）。
+专家那 4.58 s 里：融合 GEMM 约 1.3 s、H2D 约 1.6 s、逐专家 gather/scatter/elementwise
+约 1.2 s，其余是每块传输与 kernel 之间的空隙。单项都不大，共同点是 **24,576 次逐专家
+迭代**（配 7~8 个 kernel）。下一档要动的是：
 
 | # | 动作 | 依据 | 预期 |
 |---|---|---|---|
-| ① | 干掉逐专家 Python 循环（按专家排序 token，一次 scatter/gather + 批量 index_add） | aux 占 47% | 5.5 → ~2.6 s |
-| ② | H2D 独立 stream + 双缓冲 | 6.9 s 传输完全没被遮住 | 21.4 → ~14.5 s（95.6 → ~141 tok/s） |
-| ③ | 常驻 16 → 28 GiB | 传输 -18% | 需在 ② 之后才有意义 |
-| ④ | ctx 只存专家 id、backward 按 id 重流 | 消掉 92.63 GiB 与 ckpt | sft 34.6 → ~55 tok/s |
-| ⑤ | B>1 | 实测 B=8 是 B=1 的 1.32× | 白拿 +32% |
+| ① | 把 silu*up 融进 gu GEMM、把 top-k 权重融进 dn GEMM 的 epilogue | 每专家 7~8 个 kernel，机器码级只省 2~3 个 | 专家段 -10~20% |
+| ② | 按组做 grouped GEMM（一组 32 个专家的 block 在 staging 里本就连续） | 把 24,576 次启动降到 ~800 次 | 专家段数量级下降 |
+| ③ | ctx 只存专家 id、backward 按 id 重流 | 现在 grad 下每专家独占一块显存（1.27 GiB/层），仍必须开 ckpt | 去掉 ckpt 的 2.7× 前向 ⇒ sft 有望 ~1.7× 前向 |
+| ④ | B>1 | 实测 B=8 是 B=1 的 1.32× | 白拿 +32% |
+| ⑤ | 拆开 infer/train 模式与 LoRA 的 4 s | 9.1 vs `_mb_split` 的 5.04 | 先量再决定 |
 
-①②③⑤ 全做完的现实上限约 **300~340 tok/s（prefill 形状）**，对比引擎 p50 1482 / p90 3824
-仍差 4~11×。要到那个量级必须 ④'：让量化 kernel 直接算（不做 bf16 展开、不做逐专家 gather），
-也就是引擎 1482~4681 tok/s 的真正来源。
+③ 是唯一能继续大幅拉开的一个：现在 24.3 s 的训练步 ≈ 2.7 个前向（ckpt = 1 次存输入 +
+1 次重算 + 反传 0.74×）。去掉 ckpt 后同样形状约 1.7 个前向 ⇒ 按 9.1 s 的前向算约
+15.5 s/步（≈132 tok/s）。
 
 ## 8. 复现
 
 ```bash
-# 长序列（同 seed 同批块）
+# 长序列（同 seed 同批块）；24 GiB 常驻 + 30 GiB 锁页是本机 48G 卡 + 54G WSL 的甜点
+export STRATA_VRAM_PACK_GB=24 STRATA_PIN_GB=30
 python3 bench_cmp.py --gguf <shards...> --pack /root/experts_nf4.bin \
     --tokenizer /root/models/qwen36-35b-a3b \
     --pretrain-data /root/pretrain_blocks.npy --seqlen 2048 \
-    --steps 4 --seed 0 --out /root/cmp_seed.json
+    --steps 6 --seed 0 --only infer,sft+ckpt,mezo --out /root/cmp.json
 
 # 短序列
 python3 bench_cmp.py --gguf <shards...> --pack /root/experts_nf4.bin \
     --tokenizer /root/models/qwen36-35b-a3b --steps 12 --seed 0 --out /root/cmp_short.json
 ```
 
-`--only infer,sft,sft+ckpt,mezo` 可只跑其中几个。
+`--only infer,sft,sft+ckpt,mezo` 可只跑其中几个。诊断脚本：
+
+| 脚本 | 回答什么 |
+|---|---|
+| `_mb_pin.py` | 单次能 pin 多大、pageable/pinned 的块级 H2D 带宽 |
+| `_mb_phase.py` | 专家段事件计时（不在层内同步，保住跨层流水） |
+| `_mb_split.py` | stub 掉专家 forward，把专家路径与稠密路径的墙钟拆开 |
+| `_prof_step.py` | CUDA-only profiler：op 级时间 + 启动次数 + GPU 忙/墙钟缺口 |
+| `_det_*.py` | 指纹法定位数值差异（见 §5 第一轮第 3 条） |
