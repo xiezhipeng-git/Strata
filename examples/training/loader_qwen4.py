@@ -225,8 +225,10 @@ class _TieredPack:
 
     def __init__(self):
         self.gpu_buf = None          # uint8 cuda，块 [0, gpu_blocks)
-        self.cpu_buf = None          # uint8 host，块 [gpu_blocks, n_blocks)
-        self.cpu_pinned = False      # cpu_buf 是否锁页：锁页才能直连 H2D（跳过 CPU memcpy）
+        self.cpu_buf = None          # uint8 host（pageable），块 [gpu_blocks+pin, n_blocks)
+        self.cpu_pin = None          # uint8 host（pinned），块 [gpu_blocks, gpu_blocks+pin)
+        self.cpu_pin_blocks = 0
+        self.cpu_pinned = False      # 是否**部分**锁页：见 _ensure 的注释
         self.gpu_blocks = 0
         self.n_blocks = 0
         self.block_bytes = 0
@@ -270,37 +272,73 @@ class _TieredPack:
                     evs[k].record()
                 torch.cuda.synchronize()
             cpu_n = n_blocks - gpu_blocks
-            # 锁页 host 缓冲：驻 RAM 的块直接 H2D，省掉"pageable -> pinned staging"那一次
-            # CPU memcpy（实测是主瓶颈：4 线程、小张量不释放 GIL，有效带宽只有 ~1.6 GB/s，
-            # 而 pinned 源直连 H2D 有 22 GB/s）。
+            # 锁页 host 缓冲（2026-10-29 修订：**部分**锁页）。
+            #
+            # 早先一次性 pin 整个 CPU 层（43.8 GiB）直接 AcceleratorError，于是整段退回
+            # pageable。而 pageable 源的 `copy_(non_blocking=True)` 并不异步：它走
+            # cudaMemcpyAsync 的同步分支，**阻塞调用线程**直到搬完。实测 2.49 MiB 一块
+            # 222 µs，17997 块 ⇒ 每步约 4.0 s 里 CPU 完全无法派发后续 kernel，GPU 同时
+            # 空转。pinned 源 112 µs 一块且立即返回（21.7 GiB/s vs 11.0 GiB/s）。
+            #
+            # 本机单次可 pin 上限实测 32 GiB（33 GiB 失败，见 _mb_pin.py），所以拆成
+            # 「pinned 前缀 + pageable 余量」两段，而不是全有或全无。STRATA_PIN_GB 可调，
+            # 失败按减半重试（不假设具体上限，Windows 侧数值不同）。
             pin = os.environ.get("STRATA_PIN_PACK", "1") != "0"
-            cpu_buf = None
+            want = 0
             if pin:
+                want = min(cpu_n, int(float(os.environ.get("STRATA_PIN_GB", "30")) * 2**30)
+                           // block_bytes)
+            cpu_pin = None
+            while want > 0:
                 try:
-                    cpu_buf = torch.empty(cpu_n * block_bytes, dtype=torch.uint8,
+                    cpu_pin = torch.empty(want * block_bytes, dtype=torch.uint8,
                                           pin_memory=True)
-                    self.cpu_pinned = True
-                except Exception as exc:      # 锁页失败（内存不足 / WSL 限制）则退回普通内存
-                    print(f"[pack] pin_memory 失败（{type(exc).__name__}），退回 pageable + staging",
-                          flush=True)
-            if cpu_buf is None:
-                cpu_buf = torch.empty(cpu_n * block_bytes, dtype=torch.uint8)
-                self.cpu_pinned = False
-            cpu_np, o, total = cpu_buf.numpy(), 0, cpu_n * block_bytes
-            while o < total:
-                nb = min((64 << 20) // block_bytes * block_bytes, total - o)
-                got = os.preadv(fd, [cpu_np[o:o + nb]], gpu_blocks * block_bytes + o)
-                assert got == nb, f"pack 读入不完整：{got} != {nb}"
-                o += nb
+                    break
+                except Exception as exc:      # 锁页失败则减半重试，最后退回全 pageable
+                    print(f"[pack] pin {want * block_bytes / 2**30:.1f} GiB 失败"
+                          f"（{type(exc).__name__}{': ' + str(exc).splitlines()[0][:60] if str(exc) else ''}）"
+                          f"，减半重试", flush=True)
+                    cpu_pin, want = None, want // 2
+            page_n = cpu_n - want
+            cpu_buf = torch.empty(page_n * block_bytes, dtype=torch.uint8)
+            self.cpu_pinned = want > 0
+            # 先读 pinned 前缀，再读 pageable 余量；两者在文件里连续，只是落点不同。
+            for buf, base_blk, cnt in ((cpu_pin, gpu_blocks, want),
+                                       (cpu_buf, gpu_blocks + want, page_n)):
+                if cnt == 0:
+                    continue
+                np_view, o, total = buf.numpy(), 0, cnt * block_bytes
+                while o < total:
+                    nb = min((64 << 20) // block_bytes * block_bytes, total - o)
+                    got = os.preadv(fd, [np_view[o:o + nb]], (base_blk * block_bytes) + o)
+                    assert got == nb, f"pack 读入不完整：{got} != {nb}"
+                    o += nb
             os.close(fd)
-            self.gpu_buf, self.cpu_buf = gpu_buf, cpu_buf
+            self.gpu_buf, self.cpu_buf, self.cpu_pin = gpu_buf, cpu_buf, cpu_pin
+            self.cpu_pin_blocks = want
             self.gpu_blocks, self.n_blocks = gpu_blocks, n_blocks
             self.block_bytes = block_bytes
             print(f"tiered pack: {gpu_blocks} blocks in VRAM "
-                  f"({gpu_blocks * block_bytes / 2**30:.1f} GiB) + {cpu_n} in RAM "
-                  f"({cpu_n * block_bytes / 2**30:.1f} GiB){' [pinned]' if self.cpu_pinned else ''}"
+                  f"({gpu_blocks * block_bytes / 2**30:.1f} GiB) + "
+                  f"{want} pinned ({want * block_bytes / 2**30:.1f} GiB) + "
+                  f"{page_n} pageable ({page_n * block_bytes / 2**30:.1f} GiB)"
                   f", loaded {time.time() - t0:.0f}s"
                   " — 训练零读盘", flush=True)
+
+    def host_block(self, off: int, nbytes: int | None = None) -> torch.Tensor:
+        """块起始字节偏移 -> host 上一块的视图。pinned 前缀在 cpu_pin，其余在 cpu_buf。
+
+        返回的是视图，不是拷贝：调用方必须立刻 `copy_` 出去，不能持有。
+        """
+        bb = self.block_bytes
+        nb = bb if nbytes is None else nbytes
+        i = off // bb - self.gpu_blocks
+        assert 0 <= i < self.n_blocks - self.gpu_blocks, f"块号越界：off={off}"
+        if i < self.cpu_pin_blocks:
+            b = i * bb
+            return self.cpu_pin[b:b + nb]
+        b = (i - self.cpu_pin_blocks) * bb
+        return self.cpu_buf[b:b + nb]
 
     def resident_gpu(self, off: int) -> int:
         """块起始字节偏移 -> 显存块号；不驻显存返回 -1。"""
@@ -428,7 +466,7 @@ class StreamingNF4Experts(nn.Module):
                        ga_b[i * self._ga_n:(i + 1) * self._ga_n],
                        dn_b[i * self._dn_n:(i + 1) * self._dn_n],
                        dam_b[i * self._dam_n:(i + 1) * self._dam_n]]
-                src = tp.cpu_buf.narrow(0, off - tp.gpu_blocks * bb, bb)
+                src = tp.host_block(off, bb)
                 jobs.append((i, e, st.pool.submit(_copy_block, src, dst, seg_sizes)))
             return jobs
 
@@ -446,8 +484,7 @@ class StreamingNF4Experts(nn.Module):
                         out[e] = tp.gpu_views(idx, self._gu_shape, self._dn_shape, seg_sizes)
                         continue
                     base = i * rb
-                    raw[base:base + rb].copy_(
-                        tp.cpu_buf.narrow(0, off - tp.gpu_blocks * bb, rb), non_blocking=True)
+                    raw[base:base + rb].copy_(tp.host_block(off, rb), non_blocking=True)
                     _XFER["bytes"] += rb
                     out[e] = _seg_views(raw, base, seg_sizes, self._gu_shape, self._dn_shape)
                 return out
@@ -505,6 +542,10 @@ class StreamingNF4Experts(nn.Module):
             nz = mask.nonzero()                        # [n, 3] = (expert, k, t)
             counts = torch.bincount(nz[:, 0], minlength=self.num_experts)
             bounds = torch.cumsum(counts, 0).tolist()  # 全步唯一一次 DtoH
+            # 逐专家的 (token, gate 权重) 预先按 expert-major 展平好：循环里只切一维，
+            # 不再对 [n,3] 做两次列切 + 两次高级索引（每步 24,576 次 × 5 op）。
+            tok_all = nz[:, 2]
+            grp = top_k_weights.reshape(-1).gather(0, tok_all * top_k_index.shape[1] + nz[:, 1])
         prev, hits = 0, []
         for e, end in enumerate(bounds):
             if end > prev:
@@ -516,14 +557,12 @@ class StreamingNF4Experts(nn.Module):
         for group, tensors in self._stream_groups(hits, hidden_states.device):
             for e in group:
                 gu, ga, dn, da = tensors[e]
-                rows = nz[bounds[e - 1] if e else 0:bounds[e]]
-                pos, tok = rows[:, 1], rows[:, 2]
+                a = bounds[e - 1] if e else 0
+                tok = tok_all[a:bounds[e]]
                 x = hidden_states[tok]
                 gate, up = fused_nf4_linear(x, gu, ga).chunk(2, dim=-1)
-                h = self.act_fn(gate) * up
-                h = fused_nf4_linear(h, dn, da)
-                h = h * top_k_weights[tok, pos, None]
-                final.index_add_(0, tok, h.to(final.dtype))
+                h = fused_nf4_linear(self.act_fn(gate) * up, dn, da)
+                final.index_add_(0, tok, (h * grp[a:bounds[e], None]).to(final.dtype))
         return final
 
 
@@ -676,24 +715,46 @@ class MmapNgramEmbedding(nn.Module):
         self._base = gguf.data_start + t["offset"]
         self._mm = gguf._mm
         self._ttype = t["type"]
+        self._rows_view = None       # (total_rows, row_bytes) 的 mmap 零拷贝视图
 
     def _gather_rows(self, rows: torch.Tensor) -> torch.Tensor:
-        """rows: (N,) long -> (N, 160) bf16。行 r 的 160 值在 GGUF 里连续（维度优先存储）。"""
+        """rows: (N,) long -> (N, 160) bf16。行 r 的 160 值在 GGUF 里连续（维度优先存储）。
+
+        2026-10-29：旧实现是 Python 里逐行 `mmap 切片 + gguf.dequantize`。T=2048 一次
+        前向要 gather 约 3e4 行，每行几十微秒的纯 Python 反量化 ⇒ 秒级 CPU 阻塞，而这段
+        完全不出现在 CUDA profiler 里（GPU 空转）。改为：
+          - 整个 PLE 表先在 mmap 上取一个 (total_rows, row_bytes) 的**零拷贝视图**；
+          - 用 numpy fancy-index 一次性把这 N 行字节搬进连续缓冲；
+          - 只调用一次 dequantize（它本身是逐块向量化的）。
+        行数不变、数值路径不变（同样的 gguf dequantize），只是不再逐行付 Python 开销。
+        """
         r = rows.to("cpu")
-        if (r.min() < 0) or (r.max() >= self._total_rows):
+        if (int(r.min()) < 0) or (int(r.max()) >= self._total_rows):
             raise IndexError(f"PLE row out of range: min {int(r.min())} max {int(r.max())} "
                              f"total {self._total_rows}")
         uniq, inv = torch.unique(r, return_inverse=True)
         from gguf.quants import dequantize
         from gguf.constants import GGMLQuantizationType
-        chunks = []
-        for b in (int(x) * self._blocks_per_row for x in uniq):
-            raw = self._mm[self._base + b * self._block_bytes:
-                           self._base + (b + self._blocks_per_row) * self._block_bytes]
-            chunks.append(np.asarray(
-                dequantize(np.ascontiguousarray(raw), GGMLQuantizationType(self._ttype)),
-                dtype=np.float32).reshape(-1))
-        out = np.stack(chunks) if chunks else np.zeros((0, self.row_elems), np.float32)
+        if not uniq.numel():
+            out = np.zeros((0, self.row_elems), np.float32)
+        elif os.environ.get("STRATA_PLE_ROWLOOP", "0") != "0":
+            chunks = []
+            for b in (int(x) * self._blocks_per_row for x in uniq):
+                raw = self._mm[self._base + b * self._block_bytes:
+                               self._base + (b + self._blocks_per_row) * self._block_bytes]
+                chunks.append(np.asarray(
+                    dequantize(np.ascontiguousarray(raw), GGMLQuantizationType(self._ttype)),
+                    dtype=np.float32).reshape(-1))
+            out = np.stack(chunks)
+        else:
+            view = self._rows_view
+            if view is None:
+                view = self._rows_view = np.frombuffer(
+                    self._mm, dtype=np.uint8, count=self._total_rows * self._row_bytes,
+                    offset=self._base).reshape(self._total_rows, self._row_bytes)
+            buf = np.ascontiguousarray(view[uniq.numpy()])
+            out = dequantize(buf, GGMLQuantizationType(self._ttype))
+            out = np.asarray(out, dtype=np.float32).reshape(uniq.numel(), self.row_elems)
         t = torch.from_numpy(out).to(rows.device, dtype=torch.bfloat16)
         return t[inv]
 
@@ -865,6 +926,14 @@ def load_model(gguf_paths: list[str], pack_path: str, mapping_path: str = "mappi
             log(f"rotary inv_freq rebuilt: {name}")
 
     install_gdn_tile_mapping(model, log)
+    # QSA 索引器：把逐 query 的 Python 循环换成一次性向量化（见 qsa_fast.py）。
+    # T=2048 一步原本因此产生 2.4e4 次 DtoH 同步，GPU 空转 74%。
+    try:
+        import qsa_fast
+
+        qsa_fast._apply(_M.Qwen4ExpTextQSAIndexer, log)
+    except Exception as exc:                  # 换了 transformers 版本就退回原实现
+        log(f"QSA indexer: 未打补丁（{type(exc).__name__}: {exc}）")
 
     model.eval()
     return model, {"config": cfg, "pack": pack_meta}

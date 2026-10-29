@@ -18,6 +18,7 @@ P.add_argument("--pack", required=True)
 P.add_argument("--pretrain-data", default="/root/pretrain_blocks.npy")
 P.add_argument("--seqlen", type=int, default=2048)
 P.add_argument("--warmup", type=int, default=1)
+P.add_argument("--rep", type=int, default=3)
 P.add_argument("--top", type=int, default=28)
 a = P.parse_args()
 
@@ -44,11 +45,48 @@ with torch.no_grad():
         body(input_ids=ids, use_cache=False)
         torch.cuda.synchronize()
 
+import time
+
+# 墙钟基线（无 profiler 干扰）：这一步同时给出 GPU 忙与 CPU 派发的缺口。
+# 分开量 body（transformer）与 head+loss，因为 _mb_phase 显示「非专家」占了 3/4。
+from ce import token_logprobs
+
+labels = ids[0, 1:]
+
+
+def body_only():
+    return body(input_ids=ids[:, :-1], use_cache=False).last_hidden_state[0]
+
+
+def head_loss(h):
+    return float(-token_logprobs(h, head, labels, chunk=128).mean())
+
+
+with torch.no_grad():
+    for _ in range(a.warmup):
+        head_loss(body_only())
+    torch.cuda.synchronize()
+    for _ in range(a.rep):
+        t0 = time.perf_counter()
+        h = body_only()
+        torch.cuda.synchronize()
+        t_body = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        head_loss(h)
+        torch.cuda.synchronize()
+        t_head = time.perf_counter() - t0
+        print(f"  body {t_body:6.2f} s | head+loss {t_head:6.2f} s | "
+              f"合计 {t_body + t_head:6.2f} s = {ids.shape[1] / (t_body + t_head):6.1f} tok/s",
+              flush=True)
+wall = t_body + t_head
+print(f"\n=== 墙钟 {wall:.2f} s/步（{ids.shape[1] / wall:.1f} tok/s，n={a.rep}）===", flush=True)
+
 from torch.profiler import ProfilerActivity, profile
 
+# 只开 CUDA：带 CPU activity 时 3M 次调用的事件聚合会把 key_averages 拖成十几分钟。
 with torch.no_grad(), profile(activities=[ProfilerActivity.CUDA],
                               record_shapes=False, profile_memory=False) as prof:
-    body(input_ids=ids, use_cache=False)
+    body_only()
     torch.cuda.synchronize()
 
 evts = prof.key_averages()
@@ -97,3 +135,6 @@ print(f"\n=== 按类别 ===")
 print(f"{'s':>8s} {'%':>6s} {'count':>9s}  类别")
 for b, (t, c) in sorted(agg.items(), key=lambda x: -x[1][0]):
     print(f"{t:8.2f} {100*t/tot:6.1f} {c:9d}  {b}")
+
+print(f"\nGPU 忙 {tot:.2f} s / 墙钟 {wall:.2f} s ⇒ 空转 "
+      f"{100 * (1 - tot / wall):.0f}%（GPU 忙 < 墙钟即 CPU 派发是短板）", flush=True)
