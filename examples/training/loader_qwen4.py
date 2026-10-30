@@ -37,6 +37,19 @@ import torch.nn.functional as F
 import nf4
 from nf4_fused import fused_nf4_linear
 
+# pack 只被读一次（读进显存/锁页/页面内存后训练零读盘），路过的 page cache 是
+# 纯单次使用的垃圾。不清掉的话：58 GiB RAM 里 36 GiB 落进 user 缓冲 + 60 GiB
+# 陆续路过 cache，内核被迫边读边回收，实测把冷读从 2.98 GiB/s 拖到 0.33 GiB/s
+# （2026-10-30 WSL A/B：28 GiB 冷读 9.4 s vs 85.8 s，差 9×；_ensure 的 ram-read
+# 272 s 主要就是这个）。每块读完立即对该区间 fadvise DONTNEED。Windows 没有这个
+# API —— 不是正确性问题，只是 Windows 冷读没有这 9×。
+_FADV_DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", None)
+
+
+def _drop_page_cache(fd: int, offset: int, nbytes: int) -> None:
+    if _FADV_DONTNEED is not None and os.environ.get("STRATA_PACK_FADVISE", "1") != "0":
+        os.posix_fadvise(fd, offset, nbytes, _FADV_DONTNEED)
+
 import nf4
 
 # GGML 类型号 -> 名称（Strata fork：42 = fork 版 Q2_0，64 权重/块 18 B，其余标准枚举）
@@ -285,6 +298,7 @@ class _TieredPack:
                 stages = [torch.empty(chunk_blocks * block_bytes, dtype=torch.uint8,
                                       pin_memory=True) for _ in range(2)]
                 evs = [torch.cuda.Event() for _ in range(2)]
+                t_gpu0 = time.time()
                 for ci, c0 in enumerate(range(0, gpu_blocks, chunk_blocks)):
                     c1 = min(c0 + chunk_blocks, gpu_blocks)
                     nb = (c1 - c0) * block_bytes
@@ -293,10 +307,14 @@ class _TieredPack:
                         evs[k].synchronize()          # 该 stage 上一次 DMA 读完才可覆写
                     got = os.preadv(fd, [stages[k].numpy()[:nb]], c0 * block_bytes)
                     assert got == nb, f"pack 读入不完整：{got} != {nb}"
+                    _drop_page_cache(fd, c0 * block_bytes, nb)
                     gpu_buf[c0 * block_bytes:c1 * block_bytes] \
                         .copy_(stages[k][:nb], non_blocking=True)
                     evs[k].record()
                 torch.cuda.synchronize()
+                t_gpu = time.time() - t_gpu0
+            else:
+                t_gpu = 0.0
             cpu_n = n_blocks - gpu_blocks
             # 锁页 host 缓冲（2026-10-29 修订：**部分**锁页）。
             #
@@ -311,6 +329,7 @@ class _TieredPack:
             # 失败按减半重试（不假设具体上限，Windows 侧数值不同）。
             pin = os.environ.get("STRATA_PIN_PACK", "1") != "0"
             want = 0
+            t_pin0 = time.time()
             if pin:
                 want = min(cpu_n, int(float(os.environ.get("STRATA_PIN_GB", "30")) * 2**30)
                            // block_bytes)
@@ -325,10 +344,12 @@ class _TieredPack:
                           f"（{type(exc).__name__}{': ' + str(exc).splitlines()[0][:60] if str(exc) else ''}）"
                           f"，减半重试", flush=True)
                     cpu_pin, want = None, want // 2
+            t_pin = time.time() - t_pin0
             page_n = cpu_n - want
             cpu_buf = torch.empty(page_n * block_bytes, dtype=torch.uint8)
             self.cpu_pinned = want > 0
             # 先读 pinned 前缀，再读 pageable 余量；两者在文件里连续，只是落点不同。
+            t_ram0 = time.time()
             for buf, base_blk, cnt in ((cpu_pin, gpu_blocks, want),
                                        (cpu_buf, gpu_blocks + want, page_n)):
                 if cnt == 0:
@@ -338,7 +359,9 @@ class _TieredPack:
                     nb = min((64 << 20) // block_bytes * block_bytes, total - o)
                     got = os.preadv(fd, [np_view[o:o + nb]], (base_blk * block_bytes) + o)
                     assert got == nb, f"pack 读入不完整：{got} != {nb}"
+                    _drop_page_cache(fd, (base_blk * block_bytes) + o, nb)
                     o += nb
+            t_ram = time.time() - t_ram0
             os.close(fd)
             self.gpu_buf, self.cpu_buf, self.cpu_pin = gpu_buf, cpu_buf, cpu_pin
             self.cpu_pin_blocks = want
@@ -348,7 +371,8 @@ class _TieredPack:
                   f"({gpu_blocks * block_bytes / 2**30:.1f} GiB) + "
                   f"{want} pinned ({want * block_bytes / 2**30:.1f} GiB) + "
                   f"{page_n} pageable ({page_n * block_bytes / 2**30:.1f} GiB)"
-                  f", loaded {time.time() - t0:.0f}s"
+                  f", loaded {time.time() - t0:.0f}s "
+                  f"(pin {t_pin:.0f}s + ram-read {t_ram:.0f}s + gpu-loop {t_gpu:.0f}s)"
                   " — 训练零读盘", flush=True)
 
     def host_block(self, off: int, nbytes: int | None = None) -> torch.Tensor:
