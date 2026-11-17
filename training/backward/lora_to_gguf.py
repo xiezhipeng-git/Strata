@@ -1,13 +1,23 @@
 """把训练产出的 LoRA state_dict 写成 llama.cpp 的 adapter GGUF，让引擎 `--lora` 能加载。
 
-只写引擎真正适配的两类矩阵 —— 它们都是「mixer 输出 → 残差写入」的投影：
+写什么由 `MAP` 决定，它是**引擎实际能应用的全部七个投影**（`src/kernels/lora_adapters.cpp`
+的加载白名单，`src/core/verify.cpp` 的投机路径也按程序顺序逐个 apply）：
 
-    HF `...layers.<l>.self_attn.o_proj`     -> GGUF `blk.<l>.attn_output.weight`
-    HF `...layers.<l>.linear_attn.out_proj` -> GGUF `blk.<l>.ssm_out.weight`
+    HF `...self_attn.o_proj`        -> GGUF `blk.<l>.attn_output.weight`
+    HF `...linear_attn.out_proj`    -> GGUF `blk.<l>.ssm_out.weight`
+    HF `...self_attn.q_proj`        -> GGUF `blk.<l>.attn_q.weight`
+    HF `...self_attn.k_proj`        -> GGUF `blk.<l>.attn_k.weight`
+    HF `...self_attn.v_proj`        -> GGUF `blk.<l>.attn_v.weight`
+    HF `...linear_attn.in_proj_qkv` -> GGUF `blk.<l>.attn_qkv.weight`
+    HF `...linear_attn.in_proj_z`   -> GGUF `blk.<l>.attn_gate.weight`
 
-其余键（q/k/v、in_proj_*、共享专家）**必须丢掉**：引擎的加载器把「不支持的 tensor」当错误，
+两类投影的差别不是「多写几个」，而是**能学到什么**：`y + s·B(Ax)` 加在输出投影上只能改
+「这一层输出什么」（退化成词表偏置），只有输入投影才能改「读什么」。只挂输出投影时，
+模型无法学「注意到问法里的哪个字段」，只能挪偏置 —— 实测 48 挂点 0/15 对 156 挂点 5/15。
+
+其余键（共享专家、`mtp.*`）仍然**必须丢掉**：引擎的加载器把「不支持的 tensor」当错误，
 因为它宁可不加载，也不愿跑半个 adapter（跑半个得到的是既不像 base 也不像微调版的模型）。
-所以训练侧要配合 `--targets o_proj,out_proj` 只训这两类，才谈得上回灌引擎。
+所以训练侧的 `--targets` 要落在这七个后缀之内，才谈得上回灌引擎。
 
 形状约定（GGUF 的 ne 是「每维元素数」，dim 0 变化最快）：
 
@@ -153,12 +163,27 @@ def main() -> int:
     ap.add_argument("--allow-empty", action="store_true", help="一个可映射的键都没有时也写出（默认报错）")
     ap.add_argument("--keep-zero-b", action="store_true",
                     help="B 全零的模块也写出：给引擎一个能启动的初始 adapter（数值等价于 base）")
+    ap.add_argument("--zero-b", action="store_true",
+                    help="先把 B 归零再写（隐含 --keep-zero-b）：从一份**训练产物**造出「同结构、"
+                         "数值等于基座」的 seed。引擎 `--lora` 启动时加载它，之后热换训练产物 —— "
+                         "热换要求每层投影集合不变（CUDA graph 捕获了表的地址），"
+                         "拿一个只有输出投影的老 seed 去接 156 挂点的 adapter 会被拒："
+                         "`layer 0 changed its projection set`")
     args = ap.parse_args()
 
-    r = write_adapter(torch.load(args.pt, map_location="cpu"), args.out,
+    sd = torch.load(args.pt, map_location="cpu")
+    if args.zero_b:
+        n_zero = 0
+        for k in list(sd):
+            if k.endswith(".B"):
+                sd[k] = torch.zeros_like(sd[k])
+                n_zero += 1
+        if not n_zero:
+            raise SystemExit(f"--zero-b: {args.pt} 里没有 .B 张量，按错文件处理")
+    r = write_adapter(sd, args.out,
                       alpha=args.alpha, arch=args.arch,
                       keep=args.keep.split(","), allow_empty=args.allow_empty,
-                      keep_zero_b=args.keep_zero_b)
+                      keep_zero_b=args.keep_zero_b or args.zero_b)
     print(f"wrote {r['path']}: {r['layers']} layer(s) adapted, {r['tensors']} tensors, "
           f"rank {r['ranks']}, {r['mib']:.1f} MiB, alpha {args.alpha:g} "
           f"(s = alpha/rank = {args.alpha / r['ranks'][-1]:.3f} for the widest rank)")

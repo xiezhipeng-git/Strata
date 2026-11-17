@@ -260,8 +260,8 @@ Two consequences worth knowing:
 - **The seed adapter must have the same projection set as the one you swap in.** The engine
   holds the adapter tables' addresses in captured graphs: starting with an out-only adapter and
   swapping in a seven-projection one fails with `layer 0 changed its projection set`. Build the
-  seed from the same checkpoint with `.workbuddy/tmp/idrun/make_zero_seed.py` (B zeroed, so it
-  is numerically the base model).
+  seed from the same checkpoint with `lora_to_gguf.py --pt <ckpt> --out seed.gguf --zero-b`
+  (B zeroed, so it is numerically the base model); `pipeline.py` does it automatically.
 
 Why the input projections matter: LoRA adds `s·B(Ax)` to a projection's output. On an output
 projection that can only shift *what a layer emits* — for an identity or fact-injection task it
@@ -276,8 +276,68 @@ capability leak (0/4 canary prompts answered with the identity).
 (`--expert-cache 1024`, 2.22 GiB of tiers). Started together they reached 45.8 GiB of 49.1 GiB
 and the machine stalled. Evaluation is therefore a separate step: train, let the process exit,
 start the engine, run `--eval-only`, stop the engine. `--eval-only` loads no 4-bit weights at
-all — it swaps the adapter in and reads pass@1, so the engine is the only GPU job. See
-`.workbuddy/tmp/idrun/eval_only.sh` for the sequence.
+all — it swaps the adapter in and reads pass@1, so the engine is the only GPU job.
+
+`pipeline.py` runs that sequence as one command, so the ordering cannot be got wrong by hand:
+
+```bash
+python training/backward/pipeline.py \
+    --engine-config engine_eval.json --report runs/m1.report.json \
+    -- --data sft_v3.jsonl --held-data hold_known_v3.jsonl --held-gen 8 --held-max-new 512 \
+       --best-by held --out runs/m1.pt --epochs 1 --lr 1e-4 --rank 16 --ckpt --seqlen 768 \
+       --targets self_attn.q_proj,...,linear_attn.out_proj
+```
+
+Everything after `--` goes to `sft.py` unchanged. The script trains, waits for that process to
+exit, rebuilds the seed from the checkpoint it just wrote, starts the engine, runs `--eval-only`,
+stops the engine, and writes one report: steps, wall clock, seconds per step, how many times each
+question was seen, pass@1 with the per-row verdicts, and the canary drift. It loads no torch and
+no weights itself — it only starts processes and reads exit codes, so the judging rules
+(`math_extract.answer_hit`, the chat rendering contract, the adapter export) stay in the one
+place that already owns them.
+
+**The judge is one function, and it reads the answer where the prompt asked for it.**
+`bench/math_extract.answer_hit` is that function; `sft.py` imports it instead of keeping its own
+regex. For a numeric gold it requires an explicit marker (`Answer: X`, `Answer X`, `Answer is X`,
+`answer=X`, or `\boxed{X}`) whenever the prompt itself asks for that form — `--answer-strict auto`
+decides from the prompt, which is why the same code serves CoT data and "reply with only the
+number" data. Falling back to "the last integer anywhere in the text" is not a lenient rule on a
+512-token reasoning trace, it is a coin flip that lands on small numbers: 8 rows scored 6/8 that
+way, and reading them showed the hits included `11` pulled from "Points 11 through 15" and `75`
+pulled from a mid-derivation denominator. Under the marker rule the same 8 rows score 6/8 again —
+but every hit now contains `Answer: <gold>`, and the two misses contain no marker at all. Two
+ways to be wrong stay separated: a missing marker is a miss, a wrong value is a miss, and only
+the second one is a reasoning failure.
+
+`--eval-every` and `--gen-check-every` are separate knobs because they cost different things.Canary CE is one forward (seconds); the generation check is a decode (torch: 2 rows × 24 tokens
+≈ 40 s), and it dominated every evaluation point's wall clock. `--gen-check-every 8` with
+`--eval-every 4` keeps the CE curve dense while checking generation every other point. A point
+without a generation check is never allowed to become `best` — `gen_ok` over zero rows is
+vacuously true, so it is downgraded to `hold` instead of being read as "passed". The final
+evaluation always runs the full check.
+
+### Put no evaluation in the training process at all
+
+`--eval-every 0 --save-every N` is the cheaper shape of the same information. The training
+process writes `<out>.step<N>.pt` every N steps and evaluates nothing; `pipeline.py` then swaps
+each checkpoint into the running engine one after another (a swap is 0.06–0.2 s, no engine
+restart) and reads out a pass@1 curve. Measured on the 11-row CoT set, 11 questions, 3 epochs
+(33 steps, `--seqlen 768 --ckpt`):
+
+| | steps | in-process | process wall clock | wall clock / step |
+|---|---|---|---|---|
+| evaluation inside training (`--eval-every 4`) | 11 | 188 s | 940 s | **85 s** |
+| evaluation handed to the engine (`--eval-every 0`) | 33 | **552 s** | 894 s | **17 s** |
+
+Three times the training for less wall clock. A CE evaluation point costs 30 forwards plus an
+optional 40 s of torch decode; the engine judges the same adapter at 5.5 s per generated answer.
+Four scored checkpoints (8 / 16 / 24 / 32 steps) add 291 s on top, in one engine session.
+
+The curve is the point, not a by-product: on that set pass@1 is 6/8 at step 8, 6/8 at step 16,
+**4/8 at step 24**, 5/8 at step 32. Quality peaks at ~0.7 epochs and then degrades while the
+training CE keeps falling — the same shape as the identity task (0/15 at 0.6 epochs, 5/15 at 0.8,
+capability broken at 1.0). Stopping early is a decision the curve makes measurable, and it needs
+generation, not CE.
 
 `--gen-engine` refuses to run without the sampling contract (`--chat-template`). The engine
 renders with `chat_template.jinja` and thinking on; the legacy path renders a single user turn

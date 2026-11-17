@@ -100,6 +100,9 @@ def _default_probes() -> str:
 from common.data import builtin_data, load_data  # noqa: F401  re-export：hf_ref.py 也从这里取
 from common import gate as cgate      # 能力门判据（两条线共用一份）
 from common.encode import join_prompt_answer   # prompt+answer 的拼法（两条线同一份）
+# 数学答案的取数规则只有 `bench/math_extract.py` 一份（math_probe / math_build_data 也用它）。
+# 这里只 import 纯 `re` 的函数，不带 torch，CI 的 CPU 档照样能 import 本模块。
+from math_extract import answer_hit
 
 
 def read_sft_rows(path: str, word: str) -> list[tuple[str, str]]:
@@ -113,27 +116,37 @@ def read_sft_rows(path: str, word: str) -> list[tuple[str, str]]:
     return load_data(path, word, allow_target=True)
 
 
-def _last_int(text: str) -> int | None:
-    """取文本里**最后一个**整数（允许千分位与正负号）。判 held 抽检用。
+# 「题面要求把最终答案写在 Answer: 后面」的判据（`--answer-strict auto` 用它决定严格程度）。
+# DAPO / MATH-500 这类题面都写着 "The last line of your response should be of the form
+# Answer: $Answer" —— 既然要求了位置，就按位置判，而不是满篇捞数字。
+_WANTS_MARKER = re.compile(r"(?i)answer\s*[:：]")
 
-    为什么取最后一个：这些任务都要求把最终答案写在末尾（`Answer: 332` / `Answer: $x$`），
-    而推理段里会路过很多中间数。取第一个会拿中间结果当答案，把「算对了」判成错。
+
+def _answer_hit(text: str, gold: str, prompt: str = "", strict: str = "auto") -> bool:
+    """held 抽检的判分 —— 实现在 `bench/math_extract.answer_hit`，这里不再写第二份。
+
+    为什么值得从本文件搬出去（2026-11-17）：原先这里自己取「全文最后一个整数」，而
+    数学题的题面要求「最后一行 `Answer: $X`」。两个方向都会错且不对称 ——
+    `Answer: 37` 后补一句解释会被判错（压低 pass@1，看着像没学会），推导末尾恰好
+    收在正确中间量上会被判对（抬高 pass@1，看着像学会了）。而 `math_probe.py` /
+    `math_build_data.py` 早就用 `extract_answer` 的口径在选数据，两边不一致意味着
+    GRPO 拿到的优势和这里报的 pass@1 不是同一个判据。
+
+    `strict` 三态（`--answer-strict`）：
+      * `auto`（默认）—— 题面里出现 `Answer:` / `答案：` 就只认标记，否则允许回退。
+        这是唯一能同时服务「数学 CoT」和「只回数字」两类数据的做法：前者题面要求位置，
+        后者根本不写标记。
+      * `on` / `off` —— 显式压过题面判断（排查判据本身时用）。
+
+    为什么要这个开关：512 token 的数学生成里到处是小整数，回退成「最后一个整数」等于
+    掷骰子 —— 实测 8 条报 6/8，逐条看有 5 条是假阳性（`11` 抽自 "Points 11 through 15"，
+    `75` 抽自某个 `\\frac{…}{75}`），真答对的只有那条写了 `Answer: 9` 的。
     """
-    hits = re.findall(r"-?\d[\d,]*", text or "")
-    if not hits:
-        return None
-    try:
-        return int(hits[-1].replace(",", ""))
-    except ValueError:
-        return None
-
-
-def _answer_hit(text: str, gold: str) -> bool:
-    """held 抽检的判分：两边都取最后一个整数比。gold 不是数字时退化成字符串包含。"""
-    g = _last_int(gold)
-    if g is None:
-        return gold.strip() and gold.strip() in (text or "")
-    return _last_int(text) == g
+    if strict == "auto":
+        use_marker = bool(_WANTS_MARKER.search(prompt or ""))
+    else:
+        use_marker = (strict == "on")
+    return answer_hit(text, gold, require_marker=use_marker)
 
 
 def text_model(model):
@@ -478,22 +491,45 @@ def _eval_only(args, tok, renderer) -> int:
         stride = max(1, len(held) // n_probe)
         picks = held[::stride][:n_probe]
         hits, t_gen = 0, time.time()
-        print(f"held 生成（{n_probe}/{len(held)} 条，均匀跨步；判分 = 最后一个整数）:", flush=True)
+        max_new = args.held_max_new or 48
+        print(f"held 生成（{n_probe}/{len(held)} 条，均匀跨步；判分 = math_extract.answer_hit，"
+              f"上限 {max_new} token）:", flush=True)
+        rows = []
         for p, t in picks:
-            r = gen(p, 48)
-            hit = _answer_hit(r["text"], t)
+            r = gen(p, max_new)
+            hit = _answer_hit(r["text"], t, p, args.answer_strict)
             hits += int(hit)
+            rows.append({"prompt": p, "gold": t, "hit": bool(hit), "text": r["text"],
+                         "eos": bool(r["eos"]), "secs": round(r["secs"], 3)})
             print(f"  {'OK ' if hit else 'BAD'} {p[:48]!r} → {r['text'][:60]!r}  "
                   f"gold {t!r}  eos={int(r['eos'])}  {r['secs']:.2f}s", flush=True)
         dt = time.time() - t_gen
         print(f"  held pass@1 {hits}/{n_probe}  生成 {dt:.1f} s "
               f"（{dt / max(n_probe, 1):.2f} s/条；torch 后端同一批约 40 s/条）", flush=True)
+        held_out = {"n": n_probe, "hits": hits, "pass_rate": hits / max(n_probe, 1),
+                    "gen_secs": round(dt, 2), "max_new": max_new, "rows": rows}
+    else:
+        held_out = {}
 
     texts = cgate.sample_identity(IDENTITY_QS, 48, gen)
     print("身份问答（引擎贪心解码）:", flush=True)
     for q, a in zip(IDENTITY_QS, texts):
         print(f"  {q} → {a[:110]!r}", flush=True)
-    print(f"--eval-only 总用时 {time.time() - t_all:.1f} s", flush=True)
+    total = time.time() - t_all
+    print(f"--eval-only 总用时 {total:.1f} s", flush=True)
+    if args.eval_json:
+        # 结构化出口：编排器（pipeline.py）要按 pass@1 选 ckpt，从 stdout 里 grep 出来的
+        # 数不能跨运行比较，也经不起日志格式改动。写失败只警告 —— 评估结果已经打印过。
+        rec = {"adapter": args.init_adapter, "engine": args.gen_engine, "model": emodel,
+               "swap": info, "held": held_out, "identity": texts,
+               "eval_secs": round(total, 2)}
+        try:
+            _p.Path(args.eval_json).parent.mkdir(parents=True, exist_ok=True)
+            _p.Path(args.eval_json).write_text(
+                json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"eval json → {args.eval_json}", flush=True)
+        except OSError as e:
+            print(f"WARN: eval json 写入失败（不影响结果）：{e}", flush=True)
     return 0
 
 
@@ -567,7 +603,7 @@ def ss_first_div(gen: list[int], true_ans: list[int]) -> int:
 
 @torch.no_grad()
 def eval_gate(body, head, tok, probes: list[dict], word: str, renderer=None,
-              model=None, held=None, gen=None) -> dict:
+              model=None, held=None, gen=None, n_gen: int = 2) -> dict:
     """能力门的评估 —— **判据**在 `common/gate.py`（与零阶线共用一份），这里只提供 torch 后端。
 
     后端差异只有三处：目标词 logprob 走 `log_softmax`、cap 探针 CE 走一次前向 +
@@ -592,7 +628,7 @@ def eval_gate(body, head, tok, probes: list[dict], word: str, renderer=None,
         name_logprob=lambda q, w: name_logprob(body, head, tok, q, w, renderer=renderer),
         answer_ce=answer_ce,
         gen=gen or _torch_gen(body, head, tok, renderer, model=model),
-        held=held)
+        held=held, n_gen=n_gen)
 
 
 IDENTITY_QS = cgate.IDENTITY_QS
@@ -608,6 +644,16 @@ def sample_identity(body, head, tok, max_new: int = 48, renderer=None,
     """
     return cgate.sample_identity(IDENTITY_QS, max_new,
                                  gen or _torch_gen(body, head, tok, renderer, model=model))
+
+
+def _lora_state(model) -> dict:
+    """可落盘的 LoRA 权重：只取 A/B 两张，键名与 `lora.py` 的约定一致。
+
+    末步存盘与 `--save-every` 的中途存点必须用**同一个**取法，否则中途点与最终点的
+    adapter 结构不同、`lora_to_gguf` 写出来的投影集合也会不同（热换会拒载）。
+    """
+    return {k: v.detach().cpu() for k, v in model.state_dict().items()
+            if k.endswith(".A") or k.endswith(".B")}
 
 
 def snapshot_trainable(model) -> dict:
@@ -731,9 +777,23 @@ def main() -> int:
                          "能力门只生成 cap 探针的文本 —— 但「身份有没有学会」只能在身份"
                          "问法的生成文本里看，且**逐评估点**看才能区分「学不会」和"
                          "「学过了头（自环）」。N=2 的成本约 2 次 40 token 解码")
+    ap.add_argument("--save-every", type=int, default=0, metavar="N",
+                    help="每 N 步另存一份 `<--out>.step<N>.pt`（0=只存末步，历史行为）。"
+                         "配合 `--eval-every 0` 就是「训练只产检查点、判分全交给引擎」那条路："
+                         "torch 侧的 CE 评估点会把一次 11 步的数学实验从 ~6 分钟拖到 ~16 分钟"
+                         "（实测训练 190 s、非训练 750 s），而引擎判同一个 adapter 是 8 s/条。"
+                         "训练完用 `pipeline.py --eval-only` 逐份评估 —— 引擎不用重启，只换表")
     ap.add_argument("--eval-every", type=int, default=4, metavar="N",
                     help="每 N 步跑一次能力门（0=关）。identity 探针量身份、cap 探针量能力，"
                          "见 --probes。能力漂移超 --cap-tol 不配做 best，超 --cap-stop 立即停")
+    ap.add_argument("--gen-check-every", type=int, default=0, metavar="N",
+                    help="每 N 步做一次 cap 探针的**生成体检**（0=每次评估都做，即历史行为）。"
+                         "体检是 decode：torch 后端 2 条 × 24 token 约 40 s，是评估点的主要"
+                         "墙钟成本；而 CE 一次前向只要几秒。设成 --eval-every 的整数倍"
+                         "（例如 eval 每 4 步、体检每 12 步）就能把「周期点保持密、生成别太频」"
+                         "分开。**终评永远做满 n_gen 条**，不受这个数影响 —— 交付前的形态/"
+                         "泄漏/内容三关一次都不能省。没做体检的评估点按「未检查」处理："
+                         "它不能单独构成 accept，只能靠已有 best 的分数保持")
     ap.add_argument("--probes", default=_default_probes(),
                     help="能力门探针 jsonl（kind: identity | cap，cap 行带 target）。"
                          "与训练数据措辞、目标必须错开 —— 用训练样本自评等于没测")
@@ -751,9 +811,18 @@ def main() -> int:
                          "选 held 必须给 --held-data：用训练题 CE 选 ckpt 等于按「背样本」选，"
                          "会挑到过拟合最狠的那个")
     ap.add_argument("--held-gen", type=int, default=0, metavar="N",
-                    help="终评时在 held 集上抽 N 条贪心生成并判分（答案取文本里最后一个整数）。"
+                    help="终评时在 held 集上抽 N 条贪心生成并判分（判据 = bench/math_extract.answer_hit）。"
                          "CE 只说明「像不像」，学会没学会要看生成 —— 抽检是唯一能直接读出"
                          "「准确率」的项。按均匀跨步抽，不取前 N 条（前面的题往往太典型）")
+    ap.add_argument("--held-max-new", type=int, default=0, metavar="N",
+                    help="held 生成的 token 上限（0=沿用 48）。数学题必须放大：CoT 动辄几百"
+                         "token，48 会截在推理中途，于是每条都判错、且错得与能力无关")
+    ap.add_argument("--answer-strict", choices=("auto", "on", "off"), default="auto",
+                    help="数字答案的判分严格度。auto=题面里出现 `Answer:`/`答案：` 就只认该标记，"
+                         "否则允许回退到「最后一个整数」（默认）。长 CoT **必须**是标记命中的那种："
+                         "512 token 的推理里到处是小整数，回退等于掷骰子 —— 实测 8 条报 6/8，"
+                         "逐条核对只有 1 条真写了 `Answer: <gold>`，其余抽中的数字来自"
+                         "「Points 11 through 15」这类正文引用。on/off 用来压过题面判断")
     ap.add_argument("--gen-engine", default="", metavar="URL",
                     help="评估生成走引擎（如 http://127.0.0.1:8095）。不给就走 torch 逐 token 贪心"
                          "（1.2–2.5 tok/s）。引擎侧 138 tok/s，且 adapter 就是引擎适配的那两类挂点，"
@@ -765,6 +834,10 @@ def main() -> int:
                     help="只判分不训练：读 --init-adapter，换进 --gen-engine，跑 held 生成与身份问答。"
                          "**不加载 4-bit 权重**（训练峰值 26 GiB + 引擎 8.5 GiB 在 48 GiB 卡上会顶死），"
                          "所以必须在训练进程退出之后再跑 —— 任何时刻只有一个 GPU 任务")
+    ap.add_argument("--eval-json", default="", metavar="PATH",
+                    help="--eval-only 的结构化出口：把 adapter / held 逐条判分 / 身份问答 / 用时"
+                         "写成一份 json。编排器按 pass@1 选 ckpt 要读这个 —— 从 stdout 里 grep"
+                         "出来的数不能跨运行比较，也经不起日志格式改动")
     ap.add_argument("--system-prompt", default="",
                     help="插一条 system 消息（与采样侧逐字一致）。给了它 / --reasoning-effort / "
                          "--chat-template 任一项就切到「采样契约」渲染：同一份 jinja 模板 + "
@@ -824,8 +897,14 @@ def main() -> int:
 
     # 参数到这里才全部定稿（含 --epochs 折算后的真实步数）。**加载模型之前**先写一次：
     # 后面 OOM / 挂死 / 被 kill，至少还查得到这个 adapter 是哪个工作点训出来的。
-    meta_path = write_run_meta(args.out, args, phase="start")
-    print(f"run meta: {meta_path or '(写入失败)'}", flush=True)
+    #
+    # `--eval-only` 不训练，所以整段跳过。两处都不该写：拿 `args.out`（默认
+    # `lora_identity.pt`）会在当前目录留下一个描述「从未发生过的训练」的 meta；拿
+    # `args.init_adapter` 则会把 `phase` 改回 start 并混入判分参数，**覆盖掉真正的训练记录**
+    # （`write_run_meta` 是合并写）。判分的落点由 `--eval-json` 给，那是另一件事。
+    if not args.eval_only:
+        meta_path = write_run_meta(args.out, args, phase="start")
+        print(f"run meta: {meta_path or '(写入失败)'}", flush=True)
 
     from transformers import AutoTokenizer
 
@@ -1129,7 +1208,12 @@ def main() -> int:
                          "目标指标（拿训练题 CE 选 ckpt = 按过拟合程度选）")
     if args.held_data:
         if args.eval_every <= 0:
-            raise SystemExit("--held-data 需要 --eval-every > 0：held CE 只在评估点上算")
+            # `--eval-every 0` = 训练期完全不评估（「只产检查点，判分全交给引擎」那条路）。
+            # 此时 held CE 无处可算，但 --held-data 仍要接受：它是给下游 `--eval-only`
+            # 用的路标（pipeline 从训练参数里读它决定判哪一批）。在这里拒绝等于逼调用方
+            # 把同一个路径写两遍，其中一份迟早会忘。
+            print(f"--eval-every 0：训练期不评估，--held-data {args.held_data} 只给评估阶段用",
+                  flush=True)
         held = read_sft_rows(args.held_data, args.word)
         if not held:
             raise SystemExit(f"--held-data {args.held_data} 是空的")
@@ -1394,6 +1478,18 @@ def main() -> int:
             torch.cuda.memory._dump_snapshot(mem_probe)
             torch.cuda.memory._record_memory_history(None)   # 停止记录，后续步零开销
             print(f"mem probe: snapshot dumped at step {step} → {mem_probe}", flush=True)
+        # 中途存点（--save-every）：落盘的是**这一步**的参数，不是 keep-best 快照。
+        # 存完训练继续往下走，所以这些文件可以之后用引擎逐个判分（引擎只换表、不重启），
+        # 得到「步数 → pass@1」的曲线。这条路比在训练里插 torch 评估点便宜一个数量级：
+        # 一次 CE 评估点要 30 次前向 + 可选 40 s 慢解码，而引擎判一份 adapter 是 8 s/条。
+        if (args.save_every > 0 and step % args.save_every == 0 and step < args.steps
+                and dpo_enc is None):
+            ck = f"{args.out}.step{step}.pt"
+            try:
+                torch.save(_lora_state(model), ck)
+                print(f"  saved {ck}", flush=True)
+            except OSError as e:
+                print(f"  WARN: 中途存点失败（训练继续）：{e}", flush=True)
         if (args.early_stop > 0 and step >= args.min_steps and len(recent) >= 3
                 and sum(recent[-3:]) / 3 < args.early_stop):
             stopped_at = step
@@ -1403,12 +1499,19 @@ def main() -> int:
             break
         # ---- 护栏 2：能力门（周期性、无图；id 好且能力没越界才配做 best）----
         if base_eval is not None and step % args.eval_every == 0:
+            # 生成体检降频（--gen-check-every）：CE 是一次前向（几秒），体检是 decode
+            # （torch 2 条 × 24 token ≈ 40 s）—— 评估点的墙钟几乎全在体检上。
+            # 没到体检周期就只算 CE，但**这一点的 verdict 不许 accept**：n_gen=0 时
+            # `all([])` 是空真，照原样放行等于把「没检查」当成「检查通过」。
+            did_gen = not (args.gen_check_every > 0
+                           and step % args.gen_check_every != 0)
             was_training = model.training
             model.eval()
-            if gen_be is not None:
+            if gen_be is not None and did_gen:
                 gen_be.swap(snapshot_trainable(model))   # 生成要评的是**这一步**的参数
             ev = eval_gate(body, head, tok, probes, args.word, renderer=renderer,
-                           model=model, held=held, gen=gen_be)
+                           model=model, held=held, gen=gen_be,
+                           n_gen=2 if did_gen else 0)
             # 身份文本的逐评估点轨迹（--gate-id-gen）：能力门自带的 gen 只生成 cap 探针，
             # 而「身份学没学会 / 是不是已经自环」只在身份问法上看得出来。逐点看才能把
             # 「还没学会」和「学会了但已经重复到自环」分开 —— 这两者的处方完全相反
@@ -1430,8 +1533,15 @@ def main() -> int:
             v = guard.gate_verdict(objective, cap_drift,
                                    best["objective"] if best else None, args.cap_tol,
                                    gen_ok=ev["gen_ok"])
-            gen_txt = "  ".join(f"{r['text'][:22]!r}/d3={r['distinct3']}/eos={int(r['eos'])}"
-                                for r in ev["gen"])
+            if not did_gen and v == "accept":
+                # 没做生成体检的点不配做 best：`gen_ok` 在 n_gen=0 时是空真 True，
+                # 直接 accept 就把「没检查」当成了「检查通过」。降到 hold，等下一个
+                # 体检点（目标更高时会重新 accept），终评永远做满 2 条兜底。
+                v = "hold"
+            gen_txt = ("(本点未做生成体检：--gen-check-every "
+                       f"{args.gen_check_every})" if not did_gen else
+                       "  ".join(f"{r['text'][:22]!r}/d3={r['distinct3']}/eos={int(r['eos'])}"
+                                 for r in ev["gen"]))
             held_txt = (f"  heldCE {ev['held_mean']:.3f}" if held else "")
             print(f"gate step {step}: {_obj_txt(objective)}  capΔ {cap_drift:+.3f} nats/tok"
                   f"{held_txt}  → {v}"
@@ -1495,6 +1605,19 @@ def main() -> int:
     print(f"训练: {n_steps_done} 步 / 影响答案 token {n_ans_total} / 用时 {train_secs:.1f} s / "
           f"tok/s {n_ans_total / train_secs if train_secs else 0:.1f} / "
           f"峰值 {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+    # 每问被训练多少次：这是「同一批样本看几遍」的直接口径，也是「训练两次能力就掉」
+    # 那个现象的量化轴。设计值按 --steps 推，实际值按真正跑完的步数算 —— early stop /
+    # hard stop 之后两者会不同，只报设计值会把「跑了 5 步就停」说成「每问 1 遍」。
+    # 一个 step 看 --accum 条样本，所以每问次数 = 步数 × accum ÷ 不同问法数。
+    # DPO 的一行本身就是一条偏好对（同一问题的 chosen/rejected），按对数计。
+    n_uniq = len(dpo_enc) if dpo_enc is not None else len({p for p, _ in data})
+    per_q_design = (args.steps * args.accum / n_uniq) if n_uniq else 0.0
+    per_q_real = (n_steps_done * args.accum / n_uniq) if n_uniq else 0.0
+    n_rows = len(dpo_enc) if dpo_enc is not None else len(data)
+    print(f"数据: {n_rows} 行 / {n_uniq} 个不同问法  "
+          f"每问训练 {per_q_real:.2f} 次"
+          + (f"（设计 {per_q_design:.2f} 次，实际按 {n_steps_done} 步算）"
+             if abs(per_q_real - per_q_design) > 1e-9 else ""), flush=True)
     if args.ss_k:
         # 收尾口径：真实分歧率。如果训练全程都是 same，等于没开 ss（成本白付），
         # 必须显式说明 —— 否则「改了参数没效果」会被误读成「这条路不通」。
@@ -1568,11 +1691,14 @@ def main() -> int:
         with torch.no_grad():
             gg = gen_be or _torch_gen(body, head, tok, renderer, model=model)
             hits = 0
-            print(f"held 生成抽检（{n_probe}/{len(held)} 条，均匀跨步；判分 = 取最后一个整数）:",
-                  flush=True)
+            # `--held-max-new` 对数学题是必须的：48 token 会截在推理中途，于是每条都判错、
+            # 而且错得与能力无关（模型不是答错，是还没答完）。
+            max_new = args.held_max_new or 48
+            print(f"held 生成抽检（{n_probe}/{len(held)} 条，均匀跨步；"
+                  f"判分 = math_extract.answer_hit，上限 {max_new} token）:", flush=True)
             for p, t in picks:
-                r = gg(p, 48)
-                hit = _answer_hit(r["text"], t)
+                r = gg(p, max_new)
+                hit = _answer_hit(r["text"], t, p, args.answer_strict)
                 hits += int(hit)
                 print(f"  {'OK ' if hit else 'BAD'} {p[:52]!r} → {r['text'][:52]!r}  "
                       f"gold {t!r}  eos={int(r['eos'])}", flush=True)
@@ -1601,13 +1727,18 @@ def main() -> int:
                                   init_bound=args.init_bound)
         torch.save(ck, args.out + ".unilora.pt")
     else:
-        sd = {k: v.detach().cpu() for k, v in model.state_dict().items() if k.endswith(".A") or k.endswith(".B")}
+        sd = _lora_state(model)
     torch.save(sd, args.out)
     # 完成态：把实际步数、keep-best、能力门终评、耗时与峰值并进 start 那份，不另开文件。
     # 注意不要往 extra 里放 `out`：它在 vars(args) 里已有；而且 write_run_meta 的
     # 首参就叫 out_path，重复的 out 只会覆盖同一个值、没有信息量。
     done_extra = {"phase": "done", "steps_done": n_steps_done,
                   "train_secs": round(train_secs, 3), "run_secs": round(run_secs, 3),
+                  # 每问训练次数：报告里也印，但 meta 里必须有 —— 「训两次就退化」这类
+                  # 结论要靠它和其他运行对齐，事后从日志里 grep 出来的数不能跨运行比较。
+                  "rows": n_rows, "unique_prompts": n_uniq,
+                  "per_question_design": round(per_q_design, 4),
+                  "per_question_done": round(per_q_real, 4),
                   "peak_gib": round(float(torch.cuda.max_memory_allocated()) / 2**30, 3)}
     if best is not None:
         done_extra["best_step"] = best["step"]
