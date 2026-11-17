@@ -76,16 +76,33 @@ int main() {
 
     std::vector<k::LoraLayerHost> layers((size_t) L);
     k::LoraLayerHost& h = layers[(size_t) kLayer];
-    h.rank = R; h.n_in = NIN; h.n_out = NOUT;
-    h.a.resize((size_t) (R * NIN));
-    h.b.resize((size_t) (NOUT * R));
-    for (float& v : h.a) v = nd(rng) * 0.02f;
-    for (float& v : h.b) v = nd(rng) * 0.05f * kScale;   // the loader folds the scale into B
+    // Two projections on the same layer, with DIFFERENT shapes: the per-projection bookkeeping is the point of the
+    // new table layout, so exercise it (attn_q: N -> 2*NH*HD somewhere else; here arbitrary distinct dims).
+    constexpr int64_t QIN = NIN / 2, QOUT = NOUT * 2, QR = 30;
+    {
+        k::LoraProjHost& p = h.projs["ssm_out"];
+        p.rank = R; p.n_in = NIN; p.n_out = NOUT;
+        p.a.resize((size_t) (R * NIN));
+        p.b.resize((size_t) (NOUT * R));
+        for (float& v : p.a) v = nd(rng) * 0.02f;
+        for (float& v : p.b) v = nd(rng) * 0.05f * kScale;   // the loader folds the scale into B
+    }
+    {
+        k::LoraProjHost& p = h.projs["attn_q"];
+        p.rank = QR; p.n_in = QIN; p.n_out = QOUT;
+        p.a.resize((size_t) (QR * QIN));
+        p.b.resize((size_t) (QOUT * QR));
+        for (float& v : p.a) v = nd(rng) * 0.02f;
+        for (float& v : p.b) v = nd(rng) * 0.05f * kScale;
+    }
     layers[5] = h;                                       // a second adapted layer (5), kOff stays empty
     std::string err;
     if (!k::lora_upload(layers, err)) { std::fprintf(stderr, "lora_upload: %s\n", err.c_str()); return 2; }
-    check(k::lora().covers(kLayer) && k::lora().covers(5) && !k::lora().covers(kOff) && !k::lora().covers(L),
+    check(k::lora().covers(kLayer, "ssm_out") && k::lora().covers(5, "ssm_out") && !k::lora().covers(kOff, "ssm_out") &&
+              !k::lora().covers(L, "ssm_out"),
           "covers(): adapted layers only");
+    check(k::lora().covers(kLayer, "attn_q") && !k::lora().covers(kLayer, "attn_k") && !k::lora().covers(kOff, "attn_q"),
+          "covers(): per projection");
     check(k::lora_enabled(), "starts on");
 
     constexpr int64_t TMAX = 300;
@@ -103,7 +120,7 @@ int main() {
     // reference y0 + sign * B (A x) in double, from the fp32 or the fp16-rounded x.  `t` overrides the tables
     // (lora_update's new direction); the default is the one uploaded above.
     auto reference = [&](int64_t n, bool f16, int sign = 1, const k::LoraLayerHost* t = nullptr) {
-        const k::LoraLayerHost& tb = t != nullptr ? *t : h;
+        const k::LoraProjHost& tb = (t != nullptr ? *t : h).projs.at("ssm_out");
         std::vector<double> want((size_t) (n * NOUT));
         std::vector<double> hv((size_t) R);
         for (int64_t tt = 0; tt < n; ++tt) {
@@ -128,8 +145,8 @@ int main() {
     for (const int64_t n : {1, 3, 8, 300}) {
         for (const bool f16 : {false, true}) {
             up(dy, y0);
-            if (f16) k::lora_apply_f16(kLayer, dx16, LDX, n, dy, LDY, nullptr);
-            else k::lora_apply(kLayer, dx, LDX, n, dy, LDY, nullptr);
+            if (f16) k::lora_apply_f16(kLayer, "ssm_out", dx16, LDX, n, dy, LDY, nullptr);
+            else k::lora_apply(kLayer, "ssm_out", dx, LDX, n, dy, LDY, nullptr);
             ck(cudaDeviceSynchronize(), "apply");
             const double e = rel_err(down(dy, y0.size()), reference(n, f16), n, NOUT, LDY);
             char what[96];
@@ -139,12 +156,42 @@ int main() {
     }
     {   // the padding columns past n_out are never written
         up(dy, y0);
-        k::lora_apply(kLayer, dx, LDX, 300, dy, LDY, nullptr);
+        k::lora_apply(kLayer, "ssm_out", dx, LDX, 300, dy, LDY, nullptr);
         const std::vector<float> got = down(dy, y0.size());
         bool pad_ok = true;
         for (int64_t t = 0; t < 300; ++t)
             for (int64_t o = NOUT; o < LDY; ++o) pad_ok &= got[(size_t) (t * LDY + o)] == y0[(size_t) (t * LDY + o)];
         check(pad_ok, "row padding untouched");
+    }
+    {   // the second projection of the same layer, ITS OWN shape: independent tables, independent sums
+        constexpr int64_t LDXQ = QIN + 16, LDYQ = QOUT + 8;
+        std::vector<float> xq((size_t) (TMAX * LDXQ)), yq0((size_t) (TMAX * LDYQ));
+        for (float& v : xq) v = nd(rng);
+        for (float& v : yq0) v = nd(rng);
+        float* dxq = dalloc<float>(xq.size());
+        float* dyq = dalloc<float>(yq0.size());
+        up(dxq, xq);
+        up(dyq, yq0);
+        k::lora_apply(kLayer, "attn_q", dxq, LDXQ, 40, dyq, LDYQ, nullptr);
+        ck(cudaDeviceSynchronize(), "apply attn_q");
+        const k::LoraProjHost& p = h.projs.at("attn_q");
+        double worst = 0.0;
+        for (int64_t t = 0; t < 40; ++t)
+            for (int64_t o = 0; o < QOUT; ++o) {
+                double acc = yq0[(size_t) (t * LDYQ + o)];
+                for (int64_t r = 0; r < QR; ++r) {
+                    double hv = 0.0;
+                    for (int64_t i = 0; i < QIN; ++i) hv += (double) p.a[(size_t) (r * QIN + i)] * xq[(size_t) (t * LDXQ + i)];
+                    acc += (double) p.b[(size_t) (o * QR + r)] * hv;
+                }
+                const double g = (double) down(dyq + (size_t) (t * LDYQ + o), 1)[0];
+                worst = std::max(worst, std::fabs(g - acc) / std::max(1.0, std::fabs(acc)));
+            }
+        check(worst < 1e-4, "the second projection: its own tables and shape");
+        // ...and the untouched one does not leak into it
+        up(dy, y0);
+        cudaFree(dxq);
+        cudaFree(dyq);
     }
 
     std::printf("3. the request switch\n");
@@ -153,7 +200,7 @@ int main() {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
     ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "begin capture");
-    k::lora_apply(kLayer, dx, LDX, 8, dy, LDY, s);
+    k::lora_apply(kLayer, "ssm_out", dx, LDX, 8, dy, LDY, s);
     ck(cudaStreamEndCapture(s, &graph), "end capture");
     ck(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
 
@@ -161,8 +208,8 @@ int main() {
     check(!k::lora_enabled(), "lora_set_enabled(false)");
     for (const int64_t n : {1, 8, 300}) {
         up(dy, y0);
-        k::lora_apply(kLayer, dx, LDX, n, dy, LDY, nullptr);
-        k::lora_apply_f16(kLayer, dx16, LDX, n, dy, LDY, nullptr);
+        k::lora_apply(kLayer, "ssm_out", dx, LDX, n, dy, LDY, nullptr);
+        k::lora_apply_f16(kLayer, "ssm_out", dx16, LDX, n, dy, LDY, nullptr);
         ck(cudaDeviceSynchronize(), "apply off");
         char what[96];
         std::snprintf(what, sizeof what, "off, %3lld tokens: y bitwise unchanged", (long long) n);
@@ -184,9 +231,9 @@ int main() {
         cudaEventCreate(&e0);
         cudaEventCreate(&e1);
         for (const int64_t n : {1, 4, 8, 300}) {
-            for (int i = 0; i < 20; ++i) k::lora_apply(kLayer, dx, LDX, n, dy, LDY, s);
+            for (int i = 0; i < 20; ++i) k::lora_apply(kLayer, "ssm_out", dx, LDX, n, dy, LDY, s);
             cudaEventRecord(e0, s);
-            for (int i = 0; i < 500; ++i) k::lora_apply(kLayer, dx, LDX, n, dy, LDY, s);
+            for (int i = 0; i < 500; ++i) k::lora_apply(kLayer, "ssm_out", dx, LDX, n, dy, LDY, s);
             cudaEventRecord(e1, s);
             ck(cudaEventSynchronize(e1), "timing");
             float ms = 0.0f;
@@ -199,7 +246,7 @@ int main() {
             cudaGraph_t gg = nullptr;
             cudaGraphExec_t ge = nullptr;
             ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture 48");
-            for (int l = 0; l < 48; ++l) k::lora_apply(l % 2 ? 5 : kLayer, dx, LDX, n, dy, LDY, s);
+            for (int l = 0; l < 48; ++l) k::lora_apply(l % 2 ? 5 : kLayer, "ssm_out", dx, LDX, n, dy, LDY, s);
             ck(cudaStreamEndCapture(s, &gg), "end 48");
             ck(cudaGraphInstantiate(&ge, gg, 0), "instantiate 48");
             for (int i = 0; i < 10; ++i) cudaGraphLaunch(ge, s);
@@ -220,13 +267,13 @@ int main() {
 
     std::printf("4. edges\n");
     up(dy, y0);
-    k::lora_apply(kOff, dx, LDX, 8, dy, LDY, nullptr);
-    k::lora_apply(kOff, dx, LDX, 300, dy, LDY, nullptr);
+    k::lora_apply(kOff, "ssm_out", dx, LDX, 8, dy, LDY, nullptr);
+    k::lora_apply(kOff, "ssm_out", dx, LDX, 300, dy, LDY, nullptr);
     ck(cudaDeviceSynchronize(), "apply kOff");
     check(std::memcmp(down(dy, y0.size()).data(), y0.data(), y0.size() * sizeof(float)) == 0, "a layer without an adapter: untouched");
     bool threw = false;
     ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "begin capture 2");
-    try { k::lora_apply(kLayer, dx, LDX, k::kLoraCaptureTokens + 1, dy, LDY, s); } catch (const std::runtime_error&) { threw = true; }
+    try { k::lora_apply(kLayer, "ssm_out", dx, LDX, k::kLoraCaptureTokens + 1, dy, LDY, s); } catch (const std::runtime_error&) { threw = true; }
     cudaGraph_t g2 = nullptr;
     cudaStreamEndCapture(s, &g2);
     if (g2) cudaGraphDestroy(g2);
@@ -238,14 +285,14 @@ int main() {
         for (const bool f16 : {false, true}) {
             k::lora_set_polarity(1);
             up(dy, y0);
-            if (f16) k::lora_apply_f16(kLayer, dx16, LDX, n, dy, LDY, nullptr);
-            else k::lora_apply(kLayer, dx, LDX, n, dy, LDY, nullptr);
+            if (f16) k::lora_apply_f16(kLayer, "ssm_out", dx16, LDX, n, dy, LDY, nullptr);
+            else k::lora_apply(kLayer, "ssm_out", dx, LDX, n, dy, LDY, nullptr);
             ck(cudaDeviceSynchronize(), "apply +");
             const std::vector<float> plus = down(dy, y0.size());
             k::lora_set_polarity(-1);
             up(dy, y0);
-            if (f16) k::lora_apply_f16(kLayer, dx16, LDX, n, dy, LDY, nullptr);
-            else k::lora_apply(kLayer, dx, LDX, n, dy, LDY, nullptr);
+            if (f16) k::lora_apply_f16(kLayer, "ssm_out", dx16, LDX, n, dy, LDY, nullptr);
+            else k::lora_apply(kLayer, "ssm_out", dx, LDX, n, dy, LDY, nullptr);
             ck(cudaDeviceSynchronize(), "apply -");
             const std::vector<float> minus = down(dy, y0.size());
             const double ep = rel_err(plus, reference(n, f16, 1), n, NOUT, LDY);
@@ -274,15 +321,15 @@ int main() {
     }
     {   // lora_update: a new direction in the same tables, addresses untouched
         k::LoraLayerHost h2 = h;
-        for (float& v : h2.a) v *= -0.5f;
-        for (float& v : h2.b) v *= 0.25f;
+        for (float& v : h2.projs.at("ssm_out").a) v *= -0.5f;
+        for (float& v : h2.projs.at("ssm_out").b) v *= 0.25f;
         std::vector<k::LoraLayerHost> next = layers;
         next[(size_t) kLayer] = h2;
         next[5] = h2;
         std::string ue;
         check(k::lora_update(next, ue), "lora_update: a new direction in place");
         up(dy, y0);
-        k::lora_apply(kLayer, dx, LDX, 300, dy, LDY, nullptr);
+        k::lora_apply(kLayer, "ssm_out", dx, LDX, 300, dy, LDY, nullptr);
         ck(cudaDeviceSynchronize(), "apply updated");
         check(rel_err(down(dy, y0.size()), reference(300, false, 1, &h2), 300, NOUT, LDY) < 1e-4,
               "lora_update: the new direction, not the old one");

@@ -430,8 +430,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
-  # score.cpp / score_rows.cu: teacher-forced scoring (a log-probability per position for a fixed sequence), the
-  # head run as one batched GEMM per row block - see include/strata/prefill/score.hpp.
+  # score.cpp / score_rows.cu: teacher-forced scoring (a log-probability per position for a fixed sequence).  It
+  # rides the engine's prompt path and its OWN head (native_mmvq over the blocks NativeHead loaded); the only
+  # training-specific arithmetic is the log-softmax reduction - see include/strata/prefill/score.hpp.
   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp
               src/prefill/score.cpp src/prefill/score_rows.cu)
   if(STRATA_ENABLE_HIP)

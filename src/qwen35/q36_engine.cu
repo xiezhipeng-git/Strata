@@ -1926,7 +1926,9 @@ struct Engine {
             float* be_b = verify ? v_beta[li] : beta;
             prep_in(T);
             apply(L.qkv, xq, qkv_b, T);
+            strata::kernels::lora_apply((int64_t) li, "attn_qkv", qkv_b, 0, T, qkv_b, 0, st);   // --lora (in place)
             apply(L.zg, xq, z, T);
+            strata::kernels::lora_apply((int64_t) li, "attn_gate", z, 0, T, z, 0, st);   // --lora (in place)
             if (T <= kGemmT) {
                 k_gdn_ab<<<dim3(rows8(2 * HV), T), kThreads, 0, st>>>(L.alpha, L.beta, h, L.dt, L.ssm_a, al_b, be_b, N,
                                                                       HV);
@@ -1962,12 +1964,15 @@ struct Engine {
             mm(L.ssm_out, gdn_y, y, T);
             // --lora: out += s B (A y), the adapter on this projection (a no-op when none is loaded, and the
             // per-request switch is a device flag, so the captured graphs are the same either way)
-            strata::kernels::lora_apply((int64_t) li, gdn_y, 0, T, y, 0, st);
+            strata::kernels::lora_apply((int64_t) li, "ssm_out", gdn_y, 0, T, y, 0, st);
         } else {
             prep_in(T);
             apply(L.wq, xq, qg, T);
+            strata::kernels::lora_apply((int64_t) li, "attn_q", qg, 0, T, qg, 0, st);   // --lora (in place)
             apply(L.wk, xq, kx, T);
+            strata::kernels::lora_apply((int64_t) li, "attn_k", kx, 0, T, kx, 0, st);   // --lora (in place)
             apply(L.wv, xq, vx, T);
+            strata::kernels::lora_apply((int64_t) li, "attn_v", vx, 0, T, vx, 0, st);   // --lora (in place)
             RowSel rs;
             if (rows_mode) {
                 rs.cell = d_rcell;
@@ -2035,7 +2040,7 @@ struct Engine {
                 }
             }
             mm(L.wo, att, y, T);
-            strata::kernels::lora_apply((int64_t) li, att, 0, T, y, 0, st);   // --lora (as on ssm_out)
+            strata::kernels::lora_apply((int64_t) li, "attn_output", att, 0, T, y, 0, st);   // --lora (as on ssm_out)
         }
         add_rms_post(L, T);
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
@@ -3797,7 +3802,7 @@ struct Serve {
         if (E.n_sess > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", E.n_sess);
         if (strata::kernels::lora().loaded) {   // the server reads it to tell a client whether `"lora": false` applies
             int covered = 0;
-            for (bool a : strata::kernels::lora().adapted) covered += a;
+            for (const auto& ps : strata::kernels::lora().adapted) covered += !ps.empty();
             std::printf("INFO lora=%d\n", covered);
         }
         std::printf("READY %d stop\n", E.ctx);

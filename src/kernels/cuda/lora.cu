@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 
 namespace strata::kernels {
 namespace {
@@ -32,19 +33,21 @@ Lora g_lora;
 // synchronizes.
 int g_polarity_host = 0;
 constexpr int kDevices = 64;
-// a: rank x n_in, bt: rank x n_out (B transposed), h: the small path's A x (SMALL_N x rank).  h is per layer: two
-// streams of one device never run the same layer at once, but a layer split with both stages on one card reads a
-// prompt on two streams at once, on different layers.
-struct LayerDev { float* a = nullptr; float* bt = nullptr; float* h = nullptr; };
+// Per PROJECTION of a layer: a: rank x n_in, bt: rank x n_out (B transposed), h: the small path's A x (SMALL_N x
+// rank).  h is per projection: two streams of one device never run the same projection at once, but a layer split
+// with both stages on one card reads a prompt on two streams at once, on different layers.
+struct ProjDev { float* a = nullptr; float* bt = nullptr; float* h = nullptr; };
+struct LayerDev { std::map<std::string, ProjDev> projs; };
 struct Scratch { float* h = nullptr; int64_t tokens = 0; };   // the tiled path's A x, T x rank_max
 struct DevTables {
     std::vector<LayerDev> layers;
     int* on = nullptr;
-    std::map<cudaStream_t, Scratch> scratch;   // per stream (see LayerDev); g_scratch_mu
+    std::map<cudaStream_t, Scratch> scratch;   // per stream (see ProjDev); g_scratch_mu
     bool ready() const { return on != nullptr; }
 };
 DevTables g_dev[kDevices];
-struct LayerHost { int64_t rank = 0, n_in = 0, n_out = 0; std::vector<float> a, bt; };
+struct ProjHost { int64_t rank = 0, n_in = 0, n_out = 0; std::vector<float> a, bt; };
+struct LayerHost { std::map<std::string, ProjHost> projs; };
 std::vector<LayerHost> g_host;
 std::mutex g_scratch_mu;
 
@@ -54,7 +57,8 @@ int cur_device() {
     return d;
 }
 void free_tables(DevTables& t) {
-    for (LayerDev& l : t.layers) { cudaFree(l.a); cudaFree(l.bt); cudaFree(l.h); }
+    for (LayerDev& l : t.layers)
+        for (auto& [name, p] : l.projs) { cudaFree(p.a); cudaFree(p.bt); cudaFree(p.h); }
     cudaFree(t.on);
     for (auto& [stream, sc] : t.scratch) cudaFree(sc.h);
     t = DevTables{};
@@ -67,14 +71,16 @@ bool upload_here(std::string& err) {
     bool ok = cudaMalloc(&t.on, sizeof(int)) == cudaSuccess &&
               cudaMemcpy(t.on, &flag, sizeof(int), cudaMemcpyHostToDevice) == cudaSuccess;
     for (size_t l = 0; ok && l < g_host.size(); ++l) {
-        const LayerHost& h = g_host[l];
-        if (h.rank == 0) continue;
-        LayerDev& d = t.layers[l];
-        ok = cudaMalloc(&d.a, h.a.size() * sizeof(float)) == cudaSuccess &&
-             cudaMalloc(&d.bt, h.bt.size() * sizeof(float)) == cudaSuccess &&
-             cudaMalloc(&d.h, (size_t) SMALL_N * h.rank * sizeof(float)) == cudaSuccess &&
-             cudaMemcpy(d.a, h.a.data(), h.a.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
-             cudaMemcpy(d.bt, h.bt.data(), h.bt.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+        for (const auto& [name, ph] : g_host[l].projs) {
+            if (ph.rank == 0) continue;
+            ProjDev& d = t.layers[l].projs[name];
+            ok = cudaMalloc(&d.a, ph.a.size() * sizeof(float)) == cudaSuccess &&
+                 cudaMalloc(&d.bt, ph.bt.size() * sizeof(float)) == cudaSuccess &&
+                 cudaMalloc(&d.h, (size_t) SMALL_N * ph.rank * sizeof(float)) == cudaSuccess &&
+                 cudaMemcpy(d.a, ph.a.data(), ph.a.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
+                 cudaMemcpy(d.bt, ph.bt.data(), ph.bt.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+            if (!ok) break;
+        }
     }
     if (!ok) {
         err = "lora: device allocation failed";
@@ -88,7 +94,7 @@ __device__ __forceinline__ float load_x(const float* x, int64_t i) { return __ld
 __device__ __forceinline__ float load_x(const uint16_t* x, int64_t i) { return f32_from_f16(__ldg(x + i)); }
 
 // The small path (decode, verify, short eager calls), two kernels per SMALL_N tokens, deterministic (fixed
-// summation order, no atomics) and capturable (no host sync, the per-layer h allocated at upload):
+// summation order, no atomics) and capturable (no host sync, the per-projection h allocated at upload):
 //   down: h[t, r] = sum_k a[r, k] x[t, k]    one block per row r of A (A read once, x from L2)
 //   up:   y[t, o] += sum_r bt[r, o] h[t, r]  one thread per output o (bt coalesced across the warp)
 template <typename XT, int NT>
@@ -291,12 +297,18 @@ bool capturing(cudaStream_t s) {
 }
 
 template <typename XT>
-void apply(int64_t layer, const XT* x, int64_t ldx, int64_t n, float* y, int64_t ldy, void* stream) {
-    if (!g_lora.covers(layer) || n < 1) return;
+void apply(int64_t layer, const char* proj, const XT* x, int64_t ldx, int64_t n, float* y, int64_t ldy, void* stream) {
+    if (!g_lora.covers(layer, proj) || n < 1) return;
     DevTables& t = g_dev[cur_device()];
     if (!t.ready()) throw std::runtime_error("lora_apply: the adapter is not on this device (lora_replicate)");
-    const LayerHost& h = g_host[(size_t) layer];
-    const LayerDev& d = t.layers[(size_t) layer];
+    const LayerHost& hl = g_host[(size_t) layer];
+    auto hit = hl.projs.find(proj);
+    if (hit == hl.projs.end()) return;
+    const ProjHost& h = hit->second;
+    const LayerDev& dl = t.layers[(size_t) layer];
+    auto dit = dl.projs.find(proj);
+    if (dit == dl.projs.end()) return;
+    const ProjDev& d = dit->second;
     const cudaStream_t s = (cudaStream_t) stream;
     if (ldx == 0) ldx = h.n_in;
     if (ldy == 0) ldy = h.n_out;
@@ -358,29 +370,30 @@ void apply(int64_t layer, const XT* x, int64_t ldx, int64_t n, float* y, int64_t
 
 const Lora& lora() { return g_lora; }
 
-// The loader's tables -> the shapes the kernels index, plus the layers the adapter covers.  Host only: the upload
-// below copies `out` out, `lora_update` compares it against the tables already on the devices.
+// The loader's tables -> the shapes the kernels index, plus the projections the adapter covers.  Host only: the
+// upload below copies `out` out, `lora_update` compares it against the tables already on the devices.
 static bool build_host(const std::vector<LoraLayerHost>& layers, std::vector<LayerHost>& out, Lora& l, std::string& err) {
     out.assign(layers.size(), LayerHost{});
-    l.adapted.assign(layers.size(), false);
+    l.adapted.assign(layers.size(), {});
     for (size_t i = 0; i < layers.size(); ++i) {
-        const LoraLayerHost& src = layers[i];
-        if (src.rank == 0) continue;
-        if (src.rank < 0 || src.rank > kLoraMaxRank || src.n_in < 1 || src.n_out < 1 ||
-            src.a.size() != (size_t) (src.rank * src.n_in) || src.b.size() != (size_t) (src.n_out * src.rank)) {
-            err = "lora: bad tables for layer " + std::to_string(i);
-            return false;
+        for (const auto& [name, src] : layers[i].projs) {
+            if (src.rank == 0) continue;
+            if (src.rank < 0 || src.rank > kLoraMaxRank || src.n_in < 1 || src.n_out < 1 ||
+                src.a.size() != (size_t) (src.rank * src.n_in) || src.b.size() != (size_t) (src.n_out * src.rank)) {
+                err = "lora: bad tables for layer " + std::to_string(i) + " projection " + name;
+                return false;
+            }
+            ProjHost& h = out[i].projs[name];
+            h.rank = src.rank; h.n_in = src.n_in; h.n_out = src.n_out;
+            h.a = src.a;
+            h.bt.resize(src.b.size());
+            for (int64_t o = 0; o < src.n_out; ++o)
+                for (int64_t r = 0; r < src.rank; ++r) h.bt[(size_t) (r * src.n_out + o)] = src.b[(size_t) (o * src.rank + r)];
+            l.adapted[i][name] = true;
+            l.rank_max = std::max(l.rank_max, src.rank);
         }
-        LayerHost& h = out[i];
-        h.rank = src.rank; h.n_in = src.n_in; h.n_out = src.n_out;
-        h.a = src.a;
-        h.bt.resize(src.b.size());
-        for (int64_t o = 0; o < src.n_out; ++o)
-            for (int64_t r = 0; r < src.rank; ++r) h.bt[(size_t) (r * src.n_out + o)] = src.b[(size_t) (o * src.rank + r)];
-        l.adapted[i] = true;
-        l.rank_max = std::max(l.rank_max, src.rank);
     }
-    if (l.rank_max == 0) { err = "lora: the adapter covers no layer"; return false; }
+    if (l.rank_max == 0) { err = "lora: the adapter covers no projection"; return false; }
     return true;
 }
 
@@ -404,11 +417,19 @@ bool lora_update(const std::vector<LoraLayerHost>& layers, std::string& err) {
     if (!build_host(layers, host, l, err)) return false;
     if (host.size() != g_host.size()) { err = "lora: the update names other layers than the loaded adapter"; return false; }
     for (size_t i = 0; i < host.size(); ++i) {
-        const LayerHost& a = host[i];
-        const LayerHost& b = g_host[i];
-        if (a.rank != b.rank || a.n_in != b.n_in || a.n_out != b.n_out) {
-            err = "lora: layer " + std::to_string(i) + " changed shape (the tables' addresses are held by captured graphs)";
+        if (host[i].projs.size() != g_host[i].projs.size()) {
+            err = "lora: layer " + std::to_string(i) + " changed its projection set (the tables' addresses are held"
+                  " by captured graphs)";
             return false;
+        }
+        for (const auto& [name, a] : host[i].projs) {
+            auto it = g_host[i].projs.find(name);
+            if (it == g_host[i].projs.end() || a.rank != it->second.rank || a.n_in != it->second.n_in ||
+                a.n_out != it->second.n_out) {
+                err = "lora: layer " + std::to_string(i) + " projection " + name +
+                      " changed shape (the tables' addresses are held by captured graphs)";
+                return false;
+            }
         }
     }
     int prev = 0;
@@ -418,13 +439,15 @@ bool lora_update(const std::vector<LoraLayerHost>& layers, std::string& err) {
         cudaSetDevice(d);
         cudaDeviceSynchronize();   // nothing queued may still read the tables
         for (size_t i = 0; i < host.size(); ++i) {
-            if (host[i].rank == 0) continue;
-            const LayerDev& dv = g_dev[d].layers[i];
-            if (cudaMemcpy(dv.a, host[i].a.data(), host[i].a.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-                cudaMemcpy(dv.bt, host[i].bt.data(), host[i].bt.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
-                cudaSetDevice(prev);
-                err = "lora: table upload failed (the adapter is now half-updated)";
-                return false;
+            for (const auto& [name, ph] : host[i].projs) {
+                if (ph.rank == 0) continue;
+                const ProjDev& dv = g_dev[d].layers[i].projs[name];
+                if (cudaMemcpy(dv.a, ph.a.data(), ph.a.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+                    cudaMemcpy(dv.bt, ph.bt.data(), ph.bt.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+                    cudaSetDevice(prev);
+                    err = "lora: table upload failed (the adapter is now half-updated)";
+                    return false;
+                }
             }
         }
     }
@@ -458,22 +481,28 @@ int lora_polarity() { return g_lora.loaded ? g_polarity_host : 0; }
 
 uint64_t lora_device_bytes(const std::vector<LoraLayerHost>& layers) {
     uint64_t b = sizeof(int);
-    for (const LoraLayerHost& l : layers) b += (uint64_t) (l.a.size() + l.b.size() + SMALL_N * l.rank) * sizeof(float);
+    for (const LoraLayerHost& l : layers)
+        for (const auto& [name, p] : l.projs)
+            b += (uint64_t) (p.a.size() + p.b.size() + SMALL_N * p.rank) * sizeof(float);
     return b;
 }
 
 uint64_t lora_device_bytes() {
     uint64_t b = sizeof(int);
-    for (const LayerHost& l : g_host) b += (uint64_t) (l.a.size() + l.bt.size() + SMALL_N * l.rank) * sizeof(float);
+    for (const LayerHost& l : g_host)
+        for (const auto& [name, p] : l.projs)
+            b += (uint64_t) (p.a.size() + p.bt.size() + SMALL_N * p.rank) * sizeof(float);
     return b;
 }
 
-void lora_apply(int64_t layer, const float* x, int64_t ldx, int64_t n, float* y, int64_t ldy, void* stream) {
-    apply<float>(layer, x, ldx, n, y, ldy, stream);
+void lora_apply(int64_t layer, const char* proj, const float* x, int64_t ldx, int64_t n, float* y, int64_t ldy,
+                void* stream) {
+    apply<float>(layer, proj, x, ldx, n, y, ldy, stream);
 }
 
-void lora_apply_f16(int64_t layer, const uint16_t* x, int64_t ldx, int64_t n, float* y, int64_t ldy, void* stream) {
-    apply<uint16_t>(layer, x, ldx, n, y, ldy, stream);
+void lora_apply_f16(int64_t layer, const char* proj, const uint16_t* x, int64_t ldx, int64_t n, float* y, int64_t ldy,
+                    void* stream) {
+    apply<uint16_t>(layer, proj, x, ldx, n, y, ldy, stream);
 }
 
 }  // namespace strata::kernels

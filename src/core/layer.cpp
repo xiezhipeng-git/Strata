@@ -274,7 +274,10 @@ st_begin(layer, 8, stream);
     }
     st_end(layer, 8, stream);
 // ---- 2. qkv = wqkv @ x, with the activation THIS layer's `attn_qkv` asks for
-st_begin(layer, 9, stream);    if (!gemv_quantized(*w_qkv, p_qkv, f_qkv, b.x_q8_0, b.x_q8k, b.qkv, g.n_embd, C,                        v.name("attn_qkv.weight"), stream, err, mixed)) return false;    st_end(layer, 9, stream);
+st_begin(layer, 9, stream);    if (!gemv_quantized(*w_qkv, p_qkv, f_qkv, b.x_q8_0, b.x_q8k, b.qkv, g.n_embd, C,                        v.name("attn_qkv.weight"), stream, err, mixed)) return false;
+    try { strata::kernels::lora_apply(layer, "attn_qkv", b.qkv, 0, 1, b.qkv, 0, stream); }   // --lora (in place)
+    catch (const std::exception& error) { err = v.name("lora") + ": " + error.what(); return false; }
+    st_end(layer, 9, stream);
 // ---- 3. conv, then SiLU on the WHOLE conv output - before the q|k|v split, which is what
 //         `ref/gdn.py` L262 says and what makes the split a reshape rather than a copy.
 st_begin(layer, 10, stream);
@@ -362,6 +365,8 @@ st_begin(layer, 12, stream);
 // qkv's native quantize of `mixed` is still in the shared q8_1 scratch: nothing native ran in between.
 if (!gemv_quantized(*w_gate, p_gate, f_gate, b.x_q8_0, b.x_q8k, b.z, g.n_embd, g.ssm_value_dim, v.name("attn_gate.weight"), stream, err, mixed,
                     w_qkv->native_data != nullptr && w_gate->native_data != nullptr)) return false;
+try { strata::kernels::lora_apply(layer, "attn_gate", b.z, 0, 1, b.z, 0, stream); }   // --lora (in place)
+catch (const std::exception& error) { err = v.name("lora") + ": " + error.what(); return false; }
 try {
     if (fused_gdn) fused_gdn_step_norm(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.z, ssm_norm, RMS_EPS, b.y,
                                        (int) g.ssm_k_heads, (int) g.ssm_v_heads, stream);
@@ -383,7 +388,7 @@ st_begin(layer, 15, stream);
     }
     }    if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,                        v.name("ssm_out.weight"), stream, err, b.y)) return false;
     // --lora: out += s B (A y), the adapter on this projection
-    try { strata::kernels::lora_apply(layer, b.y, 0, 1, out, 0, stream); }
+    try { strata::kernels::lora_apply(layer, "ssm_out", b.y, 0, 1, out, 0, stream); }
     catch (const std::exception& error) { err = v.name("lora") + ": " + error.what(); return false; }
        st_end(layer, 15, stream);    return true;}
 // ================================ the MoE block ================================
@@ -1217,7 +1222,11 @@ SForm f_k, f_v, f_o, f_q;    if (!sform_of(*w_attnk, f_k, v.name("attn_k.weight"
 // artifact, but the dispatch is here for the same reason it is in `gdn_layer`: the pack decides per tensor,
 // and "it happens to be uniform here" is the assumption that was wrong for `attn_q`.
 if (!gemv_quantized(*w_attnk, p_k, f_k, b.x_q8_0, b.x_q8k, b.kcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_k.weight"), stream, err, x)) return false;
-    if (!gemv_quantized(*w_attnv, p_v, f_v, b.x_q8_0, b.x_q8k, b.vcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_v.weight"), stream, err, x, w_attnk->native_data && w_attnv->native_data)) return false;    dump_slot(dump, g, layer, b.vcur,                            (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim,                            (uint64_t) g.n_head_kv * g.head_dim, stream);
+    try { strata::kernels::lora_apply(layer, "attn_k", b.kcur, 0, 1, b.kcur, 0, stream); }   // --lora (in place, before K's norm+rope)
+    catch (const std::exception& error) { err = v.name("lora") + ": " + error.what(); return false; }
+    if (!gemv_quantized(*w_attnv, p_v, f_v, b.x_q8_0, b.x_q8k, b.vcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_v.weight"), stream, err, x, w_attnk->native_data && w_attnv->native_data)) return false;
+    try { strata::kernels::lora_apply(layer, "attn_v", b.vcur, 0, 1, b.vcur, 0, stream); }   // --lora (in place)
+    catch (const std::exception& error) { err = v.name("lora") + ": " + error.what(); return false; }    dump_slot(dump, g, layer, b.vcur,                            (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim,                            (uint64_t) g.n_head_kv * g.head_dim, stream);
     if (!normalize_rotate(b.kcur, w_kn, (int) g.n_head_kv, (int) g.head_dim)) return false;
 // ---- 5. into the cache, and the indexer's append (which pools AND rotates on a block completion).
 // EVERY ENTRY POINT FROM HERE ON IS THE CAPTURABLE ONE: the per-token counts come from `st.step` and every
@@ -1257,6 +1266,8 @@ if (st.kv_q4) {
 // S4 code plane with a Q8_0 activation.  Both are "a quantized activation", both produce a plausible
 // vector, and the difference is 0.6-1.4%.
 if (!gemv_quantized(*w_attnq, p_q, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, g.n_head * 2 * g.head_dim,                        v.name("attn_q.weight"), stream, err, x, w_attnv->native_data && w_attnq->native_data)) return false;
+try { strata::kernels::lora_apply(layer, "attn_q", b.q_full, 0, 1, b.q_full, 0, stream); }   // --lora (in place, before the q/gate split)
+catch (const std::exception& error) { err = v.name("lora") + ": " + error.what(); return false; }
 // `per_head[:, :head_dim]` - the FIRST half of each head's 2*head_dim block, copied out contiguously so
 // the norm and the rotation see whole rows.  A 2-D copy is a memcpy node, which captures (`pinned_capture`
 // case A) and needs no kernel.
@@ -1326,7 +1337,7 @@ try {
                     g.n_head * g.head_dim, g.n_embd, f_o, stream);
 }
 // --lora: out += s B (A attn32)
-try { strata::kernels::lora_apply(layer, b.attn32, 0, 1, out, 0, stream); }
+try { strata::kernels::lora_apply(layer, "attn_output", b.attn32, 0, 1, out, 0, stream); }
 catch (const std::exception& error) { err = v.name("lora") + ": " + error.what(); return false; }    return true;}
 // ================================ THE DOORBELL ================================
 namespace {}

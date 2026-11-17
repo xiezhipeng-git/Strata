@@ -15908,6 +15908,191 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            // ---- LAYER REPLAY: read a long prompt once, then re-read it at the cost of its last layers only --------
+            // A zeroth-order step re-reads the SAME sequence 2 x dirs times, and an adapter only touches the layers it
+            // is attached to (the training path's are the last two).  The residual rows a re-read starts from are then a
+            // function of the sequence and the base weights alone - constant across every step - so the engine keeps
+            // them (one host block, n_embd floats per position) and each pass walks layers [L, n) only.  This is the
+            // layer split's second half fed from a buffer instead of from a peer stage: no second prompt path, no
+            // second head, no buffer of its own (the path is re-`init`ed, which keeps the loan, the ring room and the
+            // callbacks).
+            //   FRONTIER <L> <n>   capture layer L's input residual rows during the reads that follow (full reads)
+            //   FRONTIER -1 0      stop capturing
+            //   REPLAY <L>         walk layers [L, n) only, reading those rows
+            //   REPLAY -1          back to a full read (position 0, token embeddings) - required before GEN
+            static std::unique_ptr<strata::prefill::Scorer> scorer;
+            static strata::prefill::Prefill* scorer_pf = nullptr;
+            static std::vector<float> frontier;
+            static bool frontier_pinned = false;
+            static int64_t frontier_layer = -1;
+            // ---- SCORE's row mask: the training loss is a sum over the positions a token selection kept, so every
+            // other position contributes exactly 0 to f(theta) and the head work there is pure waste.  At 128K
+            // context the head is the whole cost of a re-read (15.4 s of MMVQ over the whole vocabulary, 8 rows at a
+            // time), while the answer a selection keeps is a few hundred tokens.  `SCOREKEEP <n> <hex>` sets the
+            // mask for every SCORE after it, bit t of the hex string (LSB first) being position t; `SCOREKEEP 0`
+            // clears it.  A skipped position comes back as 0.0, never NaN: the trainer's own mask is the same set.
+            static std::vector<uint8_t> score_keep;
+            // ---- keyed frontier store: replay across ROTATING sequences -----------------------------------------
+            // The single FRONTIER/REPLAY pair holds ONE sequence's rows, so a trainer rotating over a small
+            // dataset re-captures on every switch (measured 2026-11-16: 57 captures for 12 sequences across a
+            // 20-step profile - 67% of the score time was repeated full reads of sequences it had already read).
+            // This store keeps one pinned host block PER SEQUENCE, keyed by the caller:
+            //   SCORE @<hexkey>,<L>[!][+|-] <ids>
+            //     miss (or '!')  a full read whose layer-L input rows land in the slot (the capture);
+            //     hit            the replay walk over [L, n) from the slot's rows;
+            //   and after EITHER the path is back in a full-read state, so GEN and plain SCORE keep working.
+            // The bit-exact contract is unchanged: a replayed read must match the capture that filled the slot,
+            // and the trainer checks exactly that once per session (forced recapture vs replay).  Slots are
+            // capped (count and pinned bytes) and evicted LRU; a slot too big for the byte cap never captures,
+            // and the caller falls back to the single-slot FRONTIER/REPLAY dance for those.
+            struct FrontierSlot {
+                int64_t layer = -1;                 // the capture's layer L (the replay walk starts here)
+                int64_t n = 0;                      // positions the rows hold
+                std::vector<float> rows;            // n x residual_row floats, page-locked when pinned
+                bool pinned = false;
+                bool captured = false;              // rows hold a finished capture
+            };
+            static std::unordered_map<unsigned long long, FrontierSlot> frontier_slots;
+            static std::deque<unsigned long long> frontier_order;   // least-recently-used first
+            static unsigned long long frontier_current_key = 0;     // the slot the path's replay state points at
+            constexpr size_t kFrontierSlotMaxCount = 16;
+            constexpr size_t kFrontierSlotMaxBytes = 640ull << 20;  // pinned-host budget for the whole store
+            static size_t frontier_slot_bytes = 0;
+            static bool frontier_slot_warned = false;
+            auto drop_slot = [](FrontierSlot& s) {
+                if (s.pinned && !s.rows.empty()) (void) cudaHostUnregister(s.rows.data());
+                frontier_slot_bytes -= s.pinned ? s.rows.size() * sizeof(float) : 0;
+                s.pinned = false;
+                std::vector<float>().swap(s.rows);
+                s.captured = false;
+                s.n = 0;
+                s.layer = -1;
+            };
+            auto note_replay_state = [](unsigned long long key) { frontier_current_key = key; };
+            if (line.rfind("SCOREKEEP ", 0) == 0) {
+                long long kn = 0;
+                int used = 0;
+                if (std::sscanf(line.c_str() + 10, "%lld %n", &kn, &used) < 1 || kn < 0) {
+                    std::printf("ERR scorekeep: SCOREKEEP <n> <hex>|0\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                score_keep.clear();
+                int64_t kset = 0;
+                if (kn > 0) {
+                    const char* hex = line.c_str() + 10 + used;
+                    while (*hex == ' ' || *hex == '\t') ++hex;
+                    const size_t bytes = (size_t) ((kn + 7) / 8);
+                    if (std::strlen(hex) != bytes * 2) {
+                        std::printf("ERR scorekeep: %lld positions need %zu hex digits, got %zu\n", kn, bytes * 2,
+                                    std::strlen(hex));
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    score_keep.assign((size_t) kn, 0);
+                    for (size_t i = 0; i < bytes; ++i) {
+                        unsigned v = 0;
+                        if (std::sscanf(hex + i * 2, "%2x", &v) != 1) {
+                            std::printf("ERR scorekeep: not a hex digit at byte %zu\n", i);
+                            std::fflush(stdout);
+                            score_keep.clear();
+                            break;
+                        }
+                        for (int b = 0; b < 8 && (int64_t) (i * 8 + (size_t) b) < kn; ++b) {
+                            if ((v >> b) & 1u) {
+                                score_keep[i * 8 + (size_t) b] = 1;
+                                ++kset;
+                            }
+                        }
+                    }
+                }
+                std::printf("SCOREKEEPOK %lld %lld\n", kn, kset);
+                std::fflush(stdout);
+                continue;
+            }
+            // The rows go back to the device on every replayed read, so their host pages have to be page-locked: a
+            // pageable source makes `cudaMemcpyAsync` fall back to a staged, chunked copy.  Measured on this rig
+            // (2026-11-16): 128K rows are 5.35 GB and moved at ~290 MB/s under a pageable buffer - 16 s per replay,
+            // against 1.9 s of actual layers-[46,48) work, which is why the first end-to-end 128K run only got
+            // 403 -> 201 s/step instead of ~60.  Pinned they go at the link's 24 GB/s (0.22 s) and hide under the
+            // compute.  A refusal is not fatal (the replay reads the same rows), only slow - so this says which.
+            auto drop_frontier = []() {
+                if (frontier_pinned && !frontier.empty()) (void) cudaHostUnregister(frontier.data());
+                frontier_pinned = false;
+                std::vector<float>().swap(frontier);
+            };
+            if (line.rfind("FRONTIER ", 0) == 0) {
+                long long fl = -1, fn = 0;
+                if (std::sscanf(line.c_str() + 9, "%lld %lld", &fl, &fn) < 1) {
+                    std::printf("ERR frontier: FRONTIER <layer> <n> (-1 0 turns it off)\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                // `FRONTIER -1 0` stops the capture and KEEPS the rows: they are what REPLAY reads next.
+                if (fl >= 0) {
+                    drop_frontier();
+                    frontier_layer = -1;
+                    if (multi_gpu || fl < 1 || fl >= g.n_layers || fn <= 0) {
+                        std::printf("ERR frontier: layer %lld of %lld, n %lld, one GPU only\n", fl,
+                                    (long long) g.n_layers, fn);
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    frontier.assign((size_t) fn * (size_t) strata::prefill::Prefill::residual_row(), 0.0f);
+                    frontier_layer = fl;
+                    frontier_pinned =
+                        cudaHostRegister(frontier.data(), frontier.size() * sizeof(float), cudaHostRegisterPortable) ==
+                        cudaSuccess;
+                    sp.set_frontier_capture(fl, frontier.data());
+                    std::fprintf(stderr, "strata serve: frontier: layer %lld's input rows, %lld positions x %lld floats, "
+                                         "%lld MiB, %s\n",
+                                 fl, fn, (long long) strata::prefill::Prefill::residual_row(),
+                                 (long long) ((frontier.size() * 4) >> 20),
+                                 frontier_pinned ? "page-locked" : "pageable (the replay's H2D will be slow)");
+                } else {
+                    sp.set_frontier_capture(-1, nullptr);
+                }
+                std::printf("FRONTIEROK %lld %lld\n", fl,
+                            (long long) (frontier.size() / (size_t) strata::prefill::Prefill::residual_row()));
+                std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("REPLAY ", 0) == 0) {
+                long long rl = -1;
+                if (std::sscanf(line.c_str() + 7, "%lld", &rl) != 1) {
+                    std::printf("ERR replay: REPLAY <layer>|-1\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (multi_gpu) {
+                    std::printf("ERR replay: one GPU only (a layer split would hand its rows to the next stage)\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (rl >= 0 && (rl != frontier_layer || frontier.empty())) {
+                    std::printf("ERR replay: no captured frontier for layer %lld (send FRONTIER %lld <n> first)\n", rl, rl);
+                    std::fflush(stdout);
+                    continue;
+                }
+                const int64_t rlay = rl >= 0 ? (int64_t) rl : 0;
+                note_replay_state(0);   // the single-slot dance and the keyed store keep separate books
+                sp.reset();
+                sp.set_replay(rl >= 0 ? (int64_t) rl : -1, rl >= 0 ? frontier.data() : nullptr);
+                sp.set_stage(rlay, -1, nullptr);
+                std::string se;
+                if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, se, borrow,
+                             borrow_bytes, o.prefill_head_alias)) {
+                    std::printf("ERR replay: %s\n", se.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+                // The head's block was laid out against the path's buffers: attach it again on the next score.
+                scorer.reset();
+                scorer_pf = nullptr;
+                std::printf("REPLAYOK %lld %lld\n", rl, (long long) sp.chunk());
+                std::fflush(stdout);
+                continue;
+            }
             // SCORE <id,id,...>: teacher-forced log-probabilities - log p(ids[t+1] | ids[0..t]) for every position,
             // the sequence the CALLER chose rather than one the engine sampled.  Generation cannot answer this: it
             // reports the token it sampled, after temperature and truncation, and nothing at all for the prompt.
@@ -15919,6 +16104,31 @@ int main(int argc, char** argv) {
             // tables nor rebuilds a graph.
             if (line.rfind("SCORE ", 0) == 0) {
                 const char* srest = line.c_str() + 6;
+                // keyed form: @<hexkey>,<L>[!][+|-] <ids> - see the keyed frontier store above.
+                unsigned long long skey = 0;
+                int64_t sreplay_layer = -1;
+                bool srecapture = false;
+                if (*srest == '@') {
+                    ++srest;
+                    int kused = 0;
+                    if (std::sscanf(srest, "%16llx%n", &skey, &kused) != 1 || skey == 0 || srest[kused] != ',') {
+                        std::printf("ERR score: SCORE @<hexkey>,<layer>[!] <ids> (non-zero hex key, then ,<layer>)\n");
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    srest += kused + 1;
+                    if (std::sscanf(srest, "%lld%n", &sreplay_layer, &kused) != 1 || sreplay_layer < 1) {
+                        std::printf("ERR score: SCORE @<hexkey>,<layer>[!] <ids> (layer must be >= 1)\n");
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    srest += kused;
+                    if (*srest == '!') {
+                        srecapture = true;   // the trainer's ground-truth check: recapture even on a hit
+                        ++srest;
+                    }
+                    while (*srest == ' ' || *srest == '\t') ++srest;
+                }
                 int ssign = 0;
                 if ((*srest == '+' || *srest == '-') && (srest[1] == ' ' || srest[1] == '\t')) {
                     ssign = *srest == '+' ? 1 : -1;
@@ -15943,10 +16153,117 @@ int main(int argc, char** argv) {
                 std::vector<int32_t> stg((size_t) n, -1);
                 for (int64_t t = 0; t + 1 < n; ++t) stg[(size_t) t] = (int32_t) sids[(size_t) t + 1];
                 std::vector<float> slp((size_t) n, std::numeric_limits<float>::quiet_NaN());
-                // One Scorer per prompt path: attaching dequantizes the head into its FP16 image (1.27 GB here),
-                // which must not happen per request.
-                static std::unique_ptr<strata::prefill::Scorer> scorer;
-                static strata::prefill::Prefill* scorer_pf = nullptr;
+                // keyed dispatch: replay from the slot, or a capturing full read into it.  Either way the path is
+                // (re)laid out HERE, so the scorer below attaches to the final layout.
+                bool sreplay = false;
+                FrontierSlot* sslot = nullptr;
+                if (skey != 0) {
+                    FrontierSlot& slot = frontier_slots[skey];
+                    for (auto it = frontier_order.begin(); it != frontier_order.end(); ++it) {
+                        if (*it == skey) {
+                            frontier_order.erase(it);
+                            break;
+                        }
+                    }
+                    frontier_order.push_back(skey);
+                    while ((frontier_order.size() > kFrontierSlotMaxCount || frontier_slot_bytes > kFrontierSlotMaxBytes)
+                           && frontier_order.size() > 1) {
+                        const unsigned long long evict = frontier_order.front();
+                        if (evict == skey) break;
+                        frontier_order.pop_front();
+                        auto es = frontier_slots.find(evict);
+                        if (es != frontier_slots.end()) {
+                            drop_slot(es->second);
+                            frontier_slots.erase(es);
+                        }
+                    }
+                    sslot = &slot;
+                    const int64_t row_floats = strata::prefill::Prefill::residual_row();
+                    const bool eligible =
+                        (size_t) n * (size_t) row_floats * sizeof(float) <= kFrontierSlotMaxBytes;
+                    const bool have_rows = slot.captured && slot.layer == sreplay_layer && slot.n == n
+                                           && slot.rows.size() == (size_t) n * (size_t) row_floats;
+                    sreplay = have_rows && !srecapture;
+                    bool srelaid = false;
+                    if (sreplay) {
+                        // consecutive hits on the same slot (the ±pair of one zeroth-order step) skip the
+                        // relayout: the path is already walking [L, n) from these very rows.
+                        if (frontier_current_key != skey) {
+                            sp.reset();
+                            sp.set_replay(sreplay_layer, slot.rows.data());
+                            sp.set_stage(sreplay_layer, -1, nullptr);
+                            if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, se,
+                                         borrow, borrow_bytes, o.prefill_head_alias)) {
+                                std::printf("ERR score: the replay relayout failed: %s\n", se.c_str());
+                                std::fflush(stdout);
+                                continue;
+                            }
+                            scorer.reset();
+                            scorer_pf = nullptr;
+                        }
+                        note_replay_state(skey);
+                    } else {
+                        // a capturing full read: size the slot (page-locked - the replay's H2D needs it, see the
+                        // FRONTIER note), then lay the path out in full-read mode (a previous keyed hit may have
+                        // left replay state behind).
+                        if (eligible && slot.rows.size() != (size_t) n * (size_t) row_floats) {
+                            drop_slot(slot);
+                            slot.rows.assign((size_t) n * (size_t) row_floats, 0.0f);
+                            slot.pinned = cudaHostRegister(slot.rows.data(), slot.rows.size() * sizeof(float),
+                                                           cudaHostRegisterPortable) == cudaSuccess;
+                            frontier_slot_bytes += slot.pinned ? slot.rows.size() * sizeof(float) : 0;
+                            if (!slot.pinned && !frontier_slot_warned) {
+                                frontier_slot_warned = true;
+                                std::fprintf(stderr, "strata score: keyed frontier slots could not be page-locked "
+                                                     "(the replay's H2D will be slow)\n");
+                                std::fflush(stderr);
+                            }
+                        }
+                        if (eligible) {
+                            slot.layer = sreplay_layer;
+                            slot.n = n;
+                        }
+                        note_replay_state(0);   // the path leaves replay state for a capturing full read
+                        sp.reset();
+                        sp.set_replay(-1, nullptr);
+                        sp.set_stage(0, -1, nullptr);
+                        if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, se,
+                                     borrow, borrow_bytes, o.prefill_head_alias)) {
+                            std::printf("ERR score: the full-read relayout failed: %s\n", se.c_str());
+                            std::fflush(stdout);
+                            continue;
+                        }
+                        if (eligible) sp.set_frontier_capture(sreplay_layer, slot.rows.data());
+                        srelaid = true;
+                    }
+                    // a re-laid path invalidates the head block laid against the old buffers: the scorer
+                    // attaches again below (a skipped relayout keeps the scorer alive - that is the point)
+                    if (srelaid) {
+                        scorer.reset();
+                        scorer_pf = nullptr;
+                    }
+                } else if (frontier_current_key != 0) {
+                    // a plain SCORE after keyed replays: the path may still be walking [L, n) of some slot's
+                    // rows.  The replay contract would keep the VALUES right, but a different sequence scored
+                    // over another slot's rows would not be - back to a full read, so no plain SCORE ever
+                    // depends on call history.
+                    note_replay_state(0);
+                    sp.reset();
+                    sp.set_replay(-1, nullptr);
+                    sp.set_stage(0, -1, nullptr);
+                    if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, se,
+                                 borrow, borrow_bytes, o.prefill_head_alias)) {
+                        std::printf("ERR score: the full-read relayout failed: %s\n", se.c_str());
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    scorer.reset();
+                    scorer_pf = nullptr;
+                }
+                // One Scorer per prompt path.  `attach` lays out its fixed head block ONCE (a few MiB, like
+                // Prefill::init lays out a session's buffers once); `run` only advances the engine's prompt path
+                // and reduces the engine's own head logits.  No per-request VRAM probe, no private floor, no
+                // weight image: the expert cache and --vram-reserve-mib own the card even on a full 125B pack.
                 if (!scorer || scorer_pf != &sp) {
                     scorer.reset(new strata::prefill::Scorer());
                     if (!scorer->attach(sp, wt, g, native_head.loaded() ? &native_head : nullptr, main_cs, se)) {
@@ -15965,6 +16282,10 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 const auto t_score = std::chrono::steady_clock::now();
+                // The row mask belongs to the Scorer, which keeps it for the life of its layout: set it here so the
+                // chunks it skips are the trainer's own selection, not a second opinion about it.
+                if (score_keep.empty()) scorer->clear_keep();
+                else scorer->set_keep(score_keep.data(), (int64_t) score_keep.size());
                 const bool sign_flip = strata::kernels::lora().loaded && ssign != 0 &&
                                        strata::kernels::lora_polarity() != ssign;
                 if (sign_flip) strata::kernels::lora_set_polarity(ssign);
@@ -15977,9 +16298,26 @@ int main(int argc, char** argv) {
                 }
                 const double score_ms =
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_score).count();
-                // The head's layout decides whether a scoring run is a fraction of a second or several, and nothing
-                // else reports it: say it once, on stderr, with the rest of the engine's diagnostics.  After the first
-                // run, not after attach: `note` describes the block the head actually got, which the run allocates.
+                // read the scorer's own accounting BEFORE anything resets it
+                const double shead_ms = scorer ? scorer->ms_head() : 0.0;
+                const int64_t scols = scorer ? scorer->rows_per_block() : 0;
+                const int64_t sskipped = scorer ? scorer->skipped() : 0;
+                // keyed bookkeeping: the capture's rows are now valid.  A replayed read STAYS in replay state
+                // (exactly what the FRONTIER/REPLAY dance leaves behind): the next keyed score lays out its own
+                // mode, and a plain GEN goes through REPLAY -1 first - sent by the trainer's gen().
+                const char* smode = "full";
+                if (sslot != nullptr) {
+                    if (sreplay) {
+                        smode = "rep";
+                    } else if (sslot->layer == sreplay_layer && sslot->n == n && !sslot->rows.empty()
+                               && !sslot->captured) {
+                        smode = "cap";
+                        sp.set_frontier_capture(-1, nullptr);
+                        sslot->captured = true;
+                    }
+                }
+                // Which head the scorer is running and how much fixed scratch it owns: say it once, on stderr, with
+                // the rest of the engine's diagnostics.  It describes the layout `attach` made, not a per-run choice.
                 static bool note_printed = false;
                 if (!note_printed) {
                     std::fprintf(stderr, "strata score: %s\n", scorer->note().c_str());
@@ -15987,12 +16325,30 @@ int main(int argc, char** argv) {
                     note_printed = true;
                 }
                 double ssum = 0.0;
-                for (int64_t t = 0; t + 1 < n; ++t) {
-                    std::printf("SL %lld %.6f\n", (long long) t, (double) slp[(size_t) t]);
-                    ssum += (double) slp[(size_t) t];
+                for (int64_t t = 0; t + 1 < n; ++t) ssum += (double) slp[(size_t) t];
+                if (skey != 0) {
+                    // keyed scores answer in ONE line (SL <pos> <logp> per position is ~2 reads per token on the
+                    // pipe and measured 14 ms per short-sequence call): `SLA <n> <v0>,<v1>,...`.  The format is
+                    // the SL line's own %.6f ON PURPOSE - the trainer's historical trajectories were produced
+                    // from %.6f-rounded logps, and a keyed run must reproduce them bit for bit.
+                    std::string out;
+                    out.reserve((size_t)(n - 1) * 14 + 32);
+                    char buf[48];
+                    std::snprintf(buf, sizeof buf, "SLA %lld ", (long long)(n - 1));
+                    out += buf;
+                    for (int64_t t = 0; t + 1 < n; ++t) {
+                        std::snprintf(buf, sizeof buf, "%.6f", (double) slp[(size_t) t]);
+                        out += buf;
+                        out += (t + 2 < n) ? ',' : '\n';
+                    }
+                    std::fwrite(out.data(), 1, out.size(), stdout);
+                } else {
+                    for (int64_t t = 0; t + 1 < n; ++t) {
+                        std::printf("SL %lld %.6f\n", (long long) t, (double) slp[(size_t) t]);
+                    }
                 }
-                std::printf("SSUM %.6f %lld %.1f %.1f %lld\n", ssum, (long long) (n - 1), score_ms,
-                            scorer->ms_head(), (long long) scorer->rows_per_block());
+                std::printf("SSUM %.6f %lld %.1f %.1f %lld %lld %s\n", ssum, (long long) (n - 1), score_ms,
+                            shead_ms, (long long) scols, (long long) sskipped, smode);
                 std::fflush(stdout);
                 // The read left the session at this sequence's end; nothing may continue it as a conversation.
                 live.clear();

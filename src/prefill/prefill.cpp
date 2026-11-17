@@ -1394,6 +1394,22 @@ void Prefill::reset() {
     release();
     impl_.reset(new Impl);
     stats_ = PrefillStats{};
+    // THE ONE-SHOT CHANNEL STATE DIES WITH THE RUN THAT SET IT.  `release` above just freed every buffer a hand-off
+    // could point at, so a `hand_in_` that survived would be a dangling pointer into a cudaFreeHost'd block - and a
+    // live-looking one is worse than a dangling one: `run_impl` selects the hand-off read on `hand_in_ != nullptr`,
+    // which skips the token embedding and starts the residual from rows the caller meant for another purpose.  A
+    // stage range (`set_stage` / `set_replay`) is a property of the next `init` and does survive; where the last
+    // run's rows came from does not.
+    // Measured (2026-11-16): without this, every full read after a REPLAY walk read layers [0,n) starting from the
+    // REPLAYed rows instead of the embeddings - -0.47 nats/token at 8K, -12.4 (uniform) at 128K, stable forever
+    // after, and immune to a LORA swap (nothing of the adapter is involved).
+    hand_in_ = nullptr;
+    hand_ev_ = nullptr;
+    hand_pieces_ = 0;
+    hand_buf_ = 0;
+    single_chunk_ = false;
+    pipe_chunked_ = false;
+    stopped_at_ = -1;
 }
 
 void Prefill::release() {
@@ -3313,8 +3329,14 @@ struct KvaTap {
 };
 }  // namespace
 
+int64_t Prefill::residual_row() { return D; }
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
+    // LAYER REPLAY (set_replay): the chunk's rows come from a host buffer instead of from a peer stage.  Set before
+    // anything reads `hand_in_`, because `hand_in_ != nullptr` is what selects the hand-off read: no embedding, no
+    // token upload, and the layer-major walk and the prompt-cache plan decline themselves (see lm_prepare).
+    if (replay_rows_ != nullptr) hand_in_ = replay_rows_;
     // force_chunk is for this run only: taken before any early return can leave it to the next one
     const int64_t forced = hand_in_ == nullptr ? std::exchange(force_chunk_, 0) : 0;
     const bool forced_single = force_single_, forced_planned = force_planned_;
@@ -4241,6 +4263,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    strata::kernels::lora_apply(l, "attn_qkv", m.qkv, 0, T, m.qkv, 0, m.cs);   // --lora (in place, x == y: h is read before y is written)
                     // KVA: the gate projection feeds only the output normalization, which a state-only layer skips
                     // (STRATA_KVA_GDN_NORM=1 keeps the full recurrence as the A/B control for the state-only one)
                     static const bool kva_gdn_norm = [] {
@@ -4249,6 +4272,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }();
                     if ((!kva_state_only || kva_gdn_norm) &&
                         !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    if (!kva_state_only || kva_gdn_norm)
+                        strata::kernels::lora_apply(l, "attn_gate", m.z, 0, T, m.z, 0, m.cs);   // --lora (in place)
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
@@ -4272,7 +4297,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdnOut, cs);
                     if (!kva_state_only) {   // KVA: the out projection feeds only the residual write and the MoE half
                         if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
-                        strata::kernels::lora_apply_f16(l, m.y_h, ld_y ? ld_y : ZV, T, m.bo, 0, m.cs);   // --lora (y_h: the normalized y)
+                        strata::kernels::lora_apply_f16(l, "ssm_out", m.y_h, ld_y ? ld_y : ZV, T, m.bo, 0, m.cs);   // --lora (y_h: the normalized y)
                     }
                     ++gdn_index;
                     if (kva_state_only) {
@@ -4295,9 +4320,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                     pt.mark(kPfQsa, cs);
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
+                    strata::kernels::lora_apply(l, "attn_k", m.Kc, 0, T, m.Kc, 0, m.cs);   // --lora (in place, before K's norm+rope)
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                    strata::kernels::lora_apply(l, "attn_v", m.Vc, 0, T, m.Vc, 0, m.cs);   // --lora (in place)
                     // KVA: the query projections have no consumer when only the KV/indexer state advances
                     if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    if (!kva_state_only) strata::kernels::lora_apply(l, "attn_q", m.Qf, 0, T, m.Qf, 0, m.cs);   // --lora (in place)
                     pt.mark(kPfQsaIdxG, cs);   // STRATA_PREFILL_TIMING: "qsa proj" is the k, v and q projections
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
@@ -4635,7 +4663,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfQsa, cs);
                     if (!gated) gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a)) return false;
-                    strata::kernels::lora_apply_f16(l, m.attn_h, ld_a ? ld_a : ZV, T, m.bo, 0, m.cs);   // --lora
+                    strata::kernels::lora_apply_f16(l, "attn_output", m.attn_h, ld_a ? ld_a : ZV, T, m.bo, 0, m.cs);   // --lora
                     ++qsa_index;
                     if (!kv_prefetch_after(l + 1, qsa_index)) return false;
                 } else {
@@ -6247,6 +6275,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (steered && !cv_fused)   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+                // LAYER REPLAY (set_frontier_capture): R now holds layer `nl`'s INPUT residual - the layer before it
+                // wrote it, and the write above took the hyper-connection mix apart.  That is the row block a replay
+                // from `nl` reads, so copy it out per chunk.  One D2H of the chunk, once per read: the arithmetic is
+                // untouched, which is what lets the caller check a replay against a full read and get the same SSUM.
+                // `half == 1` only: `nl` is `l` on half 0 (this layer's FFN half reads it) and `l + 1` on half 1 (the
+                // NEXT layer reads it).  Both equal `nl` for different states, so without it the last write of the
+                // pair - layer 46's own FFN input - overwrites the block the replay needs.
+                if (frontier_rows_ != nullptr && half == 1 && nl == frontier_layer_) {
+                    if (std::getenv("STRATA_FRONTIER_TRACE"))
+                        std::fprintf(stderr, "strata frontier: chunk p0 %lld T %lld D %lld l %lld half %lld nl %lld\n",
+                                     (long long) p0, (long long) T, (long long) D, (long long) l, (long long) half,
+                                     (long long) nl);
+                    if (cudaMemcpyAsync(frontier_rows_ + (size_t) p0 * D, m.R, (size_t) T * D * 4,
+                                        cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+                        cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                        err = std::string("prefill: the frontier capture: ") + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                }
 #if defined(STRATA_HAVE_DFLASH2)
                 if (half == 1 && tap_rows > 0 && tap_slot[(size_t) l] >= 0)   // DFlash2: this layer's completed output, mean of the streams
                     strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D, tap_dev_ + (size_t) tap_slot[(size_t) l] * N, (int64_t) tap_local_.size() * N, N,
@@ -7643,7 +7690,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         float* state = ssp->gdn_state + (size_t) (gdn_index - ssp->gdn_ord0) * gdn_floats;
                         float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                         if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                        strata::kernels::lora_apply(l, "attn_qkv", m.qkv, 0, T, m.qkv, 0, cs);   // --lora (in place)
                         if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                        strata::kernels::lora_apply(l, "attn_gate", m.z, 0, T, m.z, 0, cs);   // --lora (in place)
                         if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                         if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                         pt.mark(kPfGdnConv, cs);
@@ -7659,6 +7708,11 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, cs);
                         pt.mark(kPfGdnOut, cs);
                         if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                        // --lora, exactly where run_impl puts it (y_h: the normalized y).  The adapter has to follow
+                        // this walk too: measured 2026-11-15, a 16,384-token SCORE with a rank-4 adapter (B x8) sums to
+                        // -222,017 over the chunk-major path and to -193,265 here - which is the base model's -193,330,
+                        // i.e. the adapter was silently not applied and a zeroth-order step read zero difference.
+                        strata::kernels::lora_apply_f16(l, "ssm_out", m.y_h, 0, T, m.bo, 0, cs);
                         ++gdn_index;
                     } else if (half == 0) {
                         // ======================= QSA (run_impl's, without its debug dumps) =======================
@@ -7673,8 +7727,11 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                         pt.mark(kPfQsa, cs);
                         if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
+                        strata::kernels::lora_apply(l, "attn_k", m.Kc, 0, T, m.Kc, 0, cs);   // --lora (in place, before K's norm+rope)
                         if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                        strata::kernels::lora_apply(l, "attn_v", m.Vc, 0, T, m.Vc, 0, cs);   // --lora (in place)
                         if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                        strata::kernels::lora_apply(l, "attn_q", m.Qf, 0, T, m.Qf, 0, cs);   // --lora (in place)
                         if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                         if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                         if (qsa_fuse_nr()) {
@@ -7792,6 +7849,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         pt.mark(kPfQsa, cs);
                         if (!gated) gate_attn(m.attn, m.Qf, m.attn_h, T, cs);
                         if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+                        strata::kernels::lora_apply_f16(l, "attn_output", m.attn_h, 0, T, m.bo, 0, cs);   // --lora: the same place run_impl uses
                         ++qsa_index;
                     } else {
                         // ======================= the FFN half: router + shared expert now, the experts later =========

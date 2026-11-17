@@ -76,11 +76,6 @@ __global__ void score_row_kernel(const float* __restrict__ logits, int vocab, in
     out[row] = r[tgt] - (m + logf(s));
 }
 
-__global__ void f32_to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __half_as_ushort(__float2half_rn(in[i]));
-}
-
 }  // namespace
 
 size_t score_rows_scratch_bytes(int rows) {
@@ -96,14 +91,6 @@ bool score_rows(const float* logits, int rows, int vocab, int64_t stride, const 
     // implementation keeps the pair in registers, so a caller may pass any buffer of the documented size.
     (void) scratch;
     score_row_kernel<<<rows, kThreads, 0, (cudaStream_t) stream>>>(logits, vocab, stride, targets, out);
-    return cudaPeekAtLastError() == cudaSuccess;
-}
-
-bool f32_to_f16(const float* in, uint16_t* out, int64_t n, void* stream) {
-    if (in == nullptr || out == nullptr || n < 0) return false;
-    if (n == 0) return true;
-    const int64_t blocks = (n + kThreads - 1) / kThreads;
-    f32_to_f16_kernel<<<(unsigned) blocks, kThreads, 0, (cudaStream_t) stream>>>(in, out, n);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 

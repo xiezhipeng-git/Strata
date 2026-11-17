@@ -281,6 +281,33 @@ public:
     /// run `init`.
     bool set_stage_helper(Prefill* helper, std::string& err);
 
+    /// LAYER REPLAY (one device, no peer): the "layers [L, n) only" half of the layer split, fed from a HOST buffer
+    /// instead of from a previous stage.  `rows` holds `n_embd` floats per ABSOLUTE position (at least the run's n);
+    /// the run reads each chunk's rows from `rows + c0 * n_embd` and embeds no tokens, so a prompt whose layers before
+    /// L were already run - and whose adapter only touches layers >= L - is re-read at the cost of layers >= L.
+    /// `layer < 0`: no replay (back to reading the tokens from layer 0).  This sets the stage range, so it is a
+    /// before-`init` property and survives `reset` (the caller re-`init`s, as a chunk that did not fit does).
+    void set_replay(int64_t layer, const float* rows) {
+        replay_layer_ = layer;
+        replay_rows_ = layer >= 0 ? rows : nullptr;
+        if (layer >= 0) { stage_lb_ = layer; stage_le_ = -1; next_ = nullptr; }
+    }
+    int64_t replay_layer() const { return replay_layer_; }
+
+    /// The floats one position of `set_frontier_capture` / `set_replay` holds: the prompt path's residual row, which
+    /// is n_embd on a plain model and n_embd x hc (the hyper-connection streams, still separate) on this one - the
+    /// width of `m.R` itself.  The caller sizes its host block as n x this, not n x n_embd.
+    static int64_t residual_row();
+
+    /// LAYER REPLAY, the other half: capture layer `layer`'s INPUT residual rows (the residual the layer reads, after
+    /// the layer before it wrote it and before this layer's own norm) into `rows` - `n_embd` floats per absolute
+    /// position, HOST, filled per chunk.  That is exactly what `set_replay(layer, rows)` eats.  `layer < 0` stops the
+    /// capture.  Capturing costs one D2H of the chunk per read; it does not change the arithmetic.
+    void set_frontier_capture(int64_t layer, float* rows) {
+        frontier_layer_ = layer;
+        frontier_rows_ = layer >= 0 ? rows : nullptr;
+    }
+
     /// The CPU expert pool (decode's, idle while a prompt is read). With STRATA_PREFILL_CPU_SHARE set, a chunk below
     /// stream_all_min() tokens - an agent's tool output - hands it the non-resident experts routed by at most MAXT of
     /// its tokens, fewest first, up to a share of the experts it would stream (`auto`: measured, where both sides end
@@ -349,6 +376,10 @@ private:
     bool drain_pipeline(std::string& err);
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
+    int64_t replay_layer_ = -1;                   ///< set_replay: the first layer such a run walks (its rows come from replay_rows_)
+    const float* replay_rows_ = nullptr;          ///< set_replay: n_embd floats per absolute position, host
+    int64_t frontier_layer_ = -1;                 ///< set_frontier_capture: which layer's input residual to copy out
+    float* frontier_rows_ = nullptr;              ///< set_frontier_capture: n_embd floats per absolute position, host
     std::vector<int> tap_layers_;
     std::vector<int> tap_local_;                  ///< the tapped layers this stage runs (run)
     int64_t tap_first_ = 0, tap_cap_ = 0;

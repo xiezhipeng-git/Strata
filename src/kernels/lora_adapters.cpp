@@ -1,15 +1,17 @@
 // src/kernels/lora_adapters.cpp - llama.cpp's adapter GGUFs read into the tables `lora_upload` takes.
 //
 // One loader for every engine path: it needs only the model's geometry (`strata::core::ModelGeometry`, filled from
-// the same GGUF metadata by either family's reader) and the adapter's own tensor names.  `blk.<l>.ssm_out.weight` /
-// `blk.<l>.attn_output.weight` are the projections this family's layers carry, so a Qwen3.6 file and a Flash-Next
-// file pass through the same checks.  A tensor on any other matrix is an error (running part of an adapter gives
-// neither model), and so is a file built for another architecture.
+// the same GGUF metadata by either family's reader) and the adapter's own tensor names.  The projections the engine
+// adapts are the seven in `lora.hpp` (GDN: attn_qkv / attn_gate / ssm_out; QSA: attn_q / attn_k / attn_v /
+// attn_output); `blk.<l>.ssm_out.weight` / `blk.<l>.attn_output.weight` alone is the classic scope and passes the
+// same checks.  A tensor on any other matrix is an error (running part of an adapter gives neither model), and so
+// is a file built for another architecture.
 #include "strata/kernels/lora_adapters.hpp"
 
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,12 +26,25 @@
 namespace strata::kernels {
 
 // --lora / --lora-scaled: llama.cpp's `llama_adapter_lora_init` for the projections the engine adapts (every
-// file's `blk.<l>.{ssm_out,attn_output}.weight.lora_{a,b}`, B times scale * alpha / rank, several files' ranks
-// stacked), into the tables `lora_upload` takes.  A tensor the engine does not adapt is an error: running part of
-// an adapter would give neither model.  `summary` is what INFO reports; `digest` identifies the uploaded tables.
+// file's `blk.<l>.{attn_q,attn_k,attn_v,attn_output,attn_qkv,attn_gate,ssm_out}.weight.lora_{a,b}`, B times
+// scale * alpha / rank, several files' ranks stacked per projection), into the tables `lora_upload` takes.  A
+// tensor the engine does not adapt is an error: running part of an adapter would give neither model.  `summary`
+// is what INFO reports; `digest` identifies the uploaded tables.
 bool load_lora_adapters(const LoraAdapterFiles& files, const strata::core::ModelGeometry& g, std::string& summary,
                         uint64_t& digest, std::string& err, const bool update) {
     const int64_t L = g.n_layers, N = g.n_embd;
+    // The projections a layer family carries and their (n_in, n_out), straight from `layout.cpp`'s checks.
+    const std::pair<const char*, std::pair<int64_t, int64_t>> qsa_projs[] = {
+        {"attn_q", {N, 2 * g.n_head * g.head_dim}},
+        {"attn_k", {N, g.n_head_kv * g.head_dim}},
+        {"attn_v", {N, g.n_head_kv * g.head_dim}},
+        {"attn_output", {g.n_head * g.head_dim, N}},
+    };
+    const std::pair<const char*, std::pair<int64_t, int64_t>> gdn_projs[] = {
+        {"attn_qkv", {N, g.ssm_conv_channels}},
+        {"attn_gate", {N, g.ssm_value_dim}},
+        {"ssm_out", {g.ssm_value_dim, N}},
+    };
     std::vector<strata::kernels::LoraLayerHost> layers((size_t) L);
     auto f32_of = [&](const strata::GgufFile& f, const strata::TensorInfo& t, std::vector<float>& out) -> bool {
         const uint8_t* p = f.tensor_data(t);
@@ -84,35 +99,42 @@ bool load_lora_adapters(const LoraAdapterFiles& files, const strata::core::Model
                     return false;
                 }
                 const bool qsa = strata::core::is_qsa_layer(g, l);
-                const std::string want = qsa ? "attn_output" : "ssm_out";
-                if (want != which) {
-                    err = path + ": " + base + ": the engine adapts only blk." + std::to_string(l) + "." + want + ".weight";
+                const std::span<const std::pair<const char*, std::pair<int64_t, int64_t>>> table =
+                    qsa ? std::span<const std::pair<const char*, std::pair<int64_t, int64_t>>>(qsa_projs)
+                        : std::span<const std::pair<const char*, std::pair<int64_t, int64_t>>>(gdn_projs);
+                const std::pair<int64_t, int64_t>* dims = nullptr;
+                for (const auto& [name, d2] : table)
+                    if (std::strcmp(which, name) == 0) { dims = &d2; break; }
+                if (dims == nullptr) {
+                    std::string want;
+                    for (const auto& [name, d2] : table) want += (want.empty() ? "" : ", ") + std::string(name);
+                    err = path + ": " + base + ": the engine adapts only " + want + " on this layer";
                     return false;
                 }
-                const int64_t n_in = qsa ? g.n_head * g.head_dim : g.ssm_value_dim;
+                const int64_t n_in = dims->first, n_out = dims->second;
                 const strata::TensorInfo &ta = *pr.first, &tb = *pr.second;
                 // llama.cpp's shapes: lora_a ne = [n_in, r], lora_b ne = [r, n_out]
                 if (ta.shape.size() != 2 || tb.shape.size() != 2 || (int64_t) ta.shape[0] != n_in ||
-                    (int64_t) tb.shape[1] != N || ta.shape[1] != tb.shape[0] || ta.shape[1] == 0) {
+                    (int64_t) tb.shape[1] != n_out || ta.shape[1] != tb.shape[0] || ta.shape[1] == 0) {
                     err = path + ": " + base + ": lora_a must be [" + std::to_string((long long) n_in) + ", r] and lora_b [r, " +
-                          std::to_string((long long) N) + "]";
+                          std::to_string((long long) n_out) + "]";
                     return false;
                 }
                 const int64_t r = (int64_t) ta.shape[1];
                 std::vector<float> a, b;
                 if (!f32_of(f, ta, a) || !f32_of(f, tb, b)) { err = path + ": " + err; return false; }
                 const float s = (float) (alpha != 0.0 ? scale * alpha / (double) r : scale);
-                strata::kernels::LoraLayerHost& h = layers[(size_t) l];
+                strata::kernels::LoraProjHost& h = layers[(size_t) l].projs[which];
                 const int64_t r0 = h.rank, rn = r0 + r;
                 if (rn > strata::kernels::kLoraMaxRank) {
                     err = base + ": the summed rank is above " + std::to_string((long long) strata::kernels::kLoraMaxRank);
                     return false;
                 }
                 h.n_in = n_in;
-                h.n_out = N;
+                h.n_out = n_out;
                 h.a.insert(h.a.end(), a.begin(), a.end());   // A: the new rows below the old ones
-                std::vector<float> nb((size_t) (N * rn));    // B: the new columns right of the old ones
-                for (int64_t i = 0; i < N; ++i) {
+                std::vector<float> nb((size_t) (n_out * rn));    // B: the new columns right of the old ones
+                for (int64_t i = 0; i < n_out; ++i) {
                     for (int64_t k = 0; k < r0; ++k) nb[(size_t) (i * rn + k)] = h.b[(size_t) (i * r0 + k)];
                     for (int64_t k = 0; k < r; ++k) nb[(size_t) (i * rn + r0 + k)] = s * b[(size_t) (i * r + k)];
                 }
@@ -125,15 +147,18 @@ bool load_lora_adapters(const LoraAdapterFiles& files, const strata::core::Model
         }
     }
     int covered = 0;
-    for (const auto& h : layers) covered += h.rank > 0;
+    for (const auto& h : layers) covered += !h.projs.empty();
     {
         strata::core::SessionIdentityBuilder b(0x4c4f5241ull);   // "LORA"
         for (int64_t l = 0; l < L; ++l) {
-            const auto& h = layers[(size_t) l];
-            b.i64("rank", h.rank);
-            if (h.rank == 0) continue;
-            b.bytes("a", h.a.data(), h.a.size() * sizeof(float));
-            b.bytes("b", h.b.data(), h.b.size() * sizeof(float));
+            const auto& hl = layers[(size_t) l];
+            b.i64("projs", (int64_t) hl.projs.size());
+            for (const auto& [name, h] : hl.projs) {
+                b.str("proj", name);
+                b.i64("rank", h.rank);
+                b.bytes("a", h.a.data(), h.a.size() * sizeof(float));
+                b.bytes("b", h.b.data(), h.b.size() * sizeof(float));
+            }
         }
         digest = b.digest();
         if (digest == 0) digest = 1;   // 0 means "none loaded"

@@ -1682,6 +1682,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_mmvq(w->native_type, w->native_data, xq_, out, n_in, n_out, n, cs);
             }
         };
+        // Full-module adapters: the verify path applies only the out projections (below).  Anything else on the
+        // loaded adapter would run unadapted here - and part of an adapter is neither model - so refuse loudly
+        // rather than verifying against a model prefill and decode do not agree with.
+        if (strata::kernels::lora().loaded)
+            for (const auto& [name, on] : strata::kernels::lora().adapted[(size_t) l])
+                if (on && name != "ssm_out" && name != "attn_output") {
+                    err = std::string("verify: layer ") + std::to_string(l) + " carries an adapter on '" + name +
+                          "'; the speculative path applies only ssm_out / attn_output - disable speculative"
+                          " decoding or use an out-projection-only adapter";
+                    return false;
+                }
         try {
             if (!is_qsa_layer(g, l)) {
                 // ======================= GDN =======================
@@ -1822,7 +1833,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
-                strata::kernels::lora_apply(l, y_ + (size_t) tb * ZV, ZV, n, bo_ + tb * N, N, cs);   // --lora
+                strata::kernels::lora_apply(l, "ssm_out", y_ + (size_t) tb * ZV, ZV, n, bo_ + tb * N, N, cs);   // --lora
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -2203,7 +2214,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 14, grp);
                 quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
                 mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
-                strata::kernels::lora_apply(l, attn32_ + tb * NH * HD, NH * HD, n, bo_ + tb * N, N, cs);   // --lora
+                strata::kernels::lora_apply(l, "attn_output", attn32_ + tb * NH * HD, NH * HD, n, bo_ + tb * N, N, cs);   // --lora
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
