@@ -65,11 +65,42 @@ try:
 except Exception as _exc:                                  # pragma: no cover
     _FLA = f"{type(_exc).__name__}: {_exc}"
 
-import loader_qwen4 as L
 import mem_guard
-from lora import LoRALinear, freeze_all, inject_lora, trainable_summary
-from sft import text_model
-from hf_ref import _Pair, _Traj, dpo_measure, grpo_loss, perturb, zo_cast_fp32
+
+# 模型/训练侧依赖**按需加载**，不在 import 本模块时拉起 transformers。
+#
+# 判据（2026-11-15）：`test_bench_limits.Watchdog` 的子进程只测调度逻辑
+# （run_cell / RSSSampler / estimate_for_cell），却因为这里的模块级
+# `import loader_qwen4` 连带 import transformers，宿主装了不兼容的
+# huggingface-hub 时子进程在 import 阶段就退出，watchdog 根本没机会跑。
+# 调度逻辑不碰模型，模型依赖就不该是它的前置条件。下面这张表让全局名字
+# 在**第一次真正被用到**时才解析（PEP 562），生产路径行为逐字不变。
+_LAZY = {
+    "L": ("loader_qwen4", None),
+    "LoRALinear": ("lora", "LoRALinear"),
+    "freeze_all": ("lora", "freeze_all"),
+    "inject_lora": ("lora", "inject_lora"),
+    "trainable_summary": ("lora", "trainable_summary"),
+    "text_model": ("sft", "text_model"),
+    "_Pair": ("hf_ref", "_Pair"),
+    "_Traj": ("hf_ref", "_Traj"),
+    "dpo_measure": ("hf_ref", "dpo_measure"),
+    "grpo_loss": ("hf_ref", "grpo_loss"),
+    "perturb": ("hf_ref", "perturb"),
+    "zo_cast_fp32": ("hf_ref", "zo_cast_fp32"),
+}
+
+
+def __getattr__(name: str):
+    spec = _LAZY.get(name)
+    if spec is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    mod = importlib.import_module(spec[0])
+    val = mod if spec[1] is None else getattr(mod, spec[1])
+    globals()[name] = val          # 只解析一次，之后与普通全局名无异
+    return val
+
 
 VOCAB = 248320
 

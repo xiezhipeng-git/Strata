@@ -182,7 +182,7 @@ class EngineHttpWiringTest(unittest.TestCase):
                 mock.patch.object(mezo, "load_template",
                                   lambda p, **kw: (lambda q: q)), \
                 mock.patch.object(mezo, "read_geometry", lambda g: geom), \
-                mock.patch.object(mezo, "adapter_layout", lambda g: {0: ("ssm_out", 4, 4)}), \
+                mock.patch.object(mezo, "adapter_layout", lambda g, projs="out": {0: {"ssm_out": (4, 4)}}), \
                 mock.patch.object(mezo, "launch_engine",
                                   side_effect=AssertionError("online mode must not spawn an engine")), \
                 mock.patch.object(mezo, "EngineHttp",

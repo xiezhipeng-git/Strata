@@ -32,9 +32,11 @@ for _d in (_p.Path(__file__).resolve().parent,
 
 
 import json
+import re
 import time
 
-from math_extract import extract_num  # noqa: E402  与 math_probe.py 共用同一条取数规则
+from math_extract import extract_answer, extract_num  # noqa: E402  与 math_probe.py 共用同一条取数规则
+import identity_score  # noqa: E402  可打分的身份判据（槽位/进度的唯一口径）
 
 
 def _norm(text: str) -> str:
@@ -42,14 +44,25 @@ def _norm(text: str) -> str:
     return " ".join((text or "").split()).lower()
 
 
+_PURE_INT = re.compile(r"-?\d+")
+
+
 def judge(text: str, want: str) -> tuple[bool, str]:
-    """单条判分 → (对错, 命中的档位)。档位为空串表示判错。"""
-    got_num, want_num = extract_num(text), extract_num(want)
-    if want_num is not None and got_num is not None and got_num == want_num:
-        return True, "num"
-    if _norm(text) == _norm(want):
-        return True, "exact"
+    """单条判分 → (对错, 命中的档位)。档位为空串表示判错。
+
+    标准答案是**整数**时只走 num 档，并且：
+      * 取数用 `extract_answer`（先认 "Answer: $X"，再回退最后一个整数）—— DAPO 这类
+        长 CoT 题面要求把答案写在最后一行，`extract_num` 的「第一个整数」是推理中间量；
+      * **不再走 exact/substr**：数字答案的 substr 会把 "34" 判进 "340"，也会把推理中
+        偶然出现的正确答案判成答对。宁可判错（既定口径），不可让训练/评测虚高。
+    非数字答案（identity 这类）保持 exact → substr 两档不变。
+    """
     w = _norm(want)
+    if _PURE_INT.fullmatch(w.replace(",", "")):
+        got = extract_answer(text)
+        return (True, "num") if got is not None and got == w.replace(",", "") else (False, "")
+    if _norm(text) == w:
+        return True, "exact"
     if w and w in _norm(text):
         return True, "substr"
     return False, ""
@@ -77,29 +90,102 @@ def load_rows(path: str) -> list[dict]:
     return rows
 
 
-def success_eval(eng, tok, render, rows: list[dict], max_new: int = 512):
-    """逐题 GEN 后判分 → (ok, total, detail)。
+def success_eval_rows(rows: list[dict], max_new: int, gen, *,
+                      slots: list[str] | None = None,
+                      ref_texts: dict[str, str] | None = None,
+                      finish_of=None):
+    """逐题生成 → 判分 → (ok, total, detail)。**判据与后端无关**：`gen(prompt, max_new) -> text`。
+
+    与 `common/gate.eval_gate` 的分工：那边量「像不像」（目标词 logprob / CE / 生成体检），
+    这边量「对不对」（judge 三档）。两者不能互相替代 —— CE 降了但答案仍是错的，是这条线
+    最常见的一种「看着在学」。共享的是判据本身（`judge` 纯函数 + 这里的循环），
+    后端（引擎 GEN / torch 贪心）由调用方注入。
+
+    `slots` 给的是「必须出现的新增事实」列表（见 `identity_score.slots_from_triples`）。
+    给了就额外产出 **graded** 读数 —— 这是纯后处理，**不多发一次 GEN**：
+      * `progress ∈ [0,1]`：几个槽位说到了（核心槽位权重 2），`0/5` 那种二值判据没有梯度；
+      * `diverged_at`：与 `ref_texts`（θ₀ 对同一问法的生成）从第几个字符开始不同，
+        -1 = 逐字相同。需要调用方显式给基线；没给就是 `None`（不猜、不自比）。
+    二值的 `ok/total` 保持不变（历史曲线仍可比）。
+
+    `finish_of`：可调用，返回**上一次**生成的收尾原因（引擎 DONE 行的 `stop`/`length`）。
+    记它是因为 `0/5` 分不清两种失败：「答完了但内容不对」和「撞满 `max_new` 硬停」。
+    后者的典型形态是自环复读（`由由由由…`），成因是训练目标里没有回合结束 token ——
+    2026-11-15 之前每一条 run 都缺它，而只看 `ok/total` 完全看不出来。
+    """
+    t0 = time.time()
+    detail: list[dict] = []
+    ok = 0
+    ok_clean = 0            # 内容对 **且** 干净收尾（见下）——复读垃圾只满足前者
+    refs = ref_texts or {}
+    finishes: dict[str, int] = {}
+    for r in rows:
+        text = gen(r["prompt"], max_new)
+        fin = ""
+        if finish_of is not None:
+            try:
+                fin = str(finish_of() or "")
+            except Exception:      # 后端的收尾字段是诊断信息，读不到不能把评测带塌
+                fin = ""
+            finishes[fin or "?"] = finishes.get(fin or "?", 0) + 1
+        good, how = judge(text, r["answer"])
+        # `stop` = 模型自己写了回合结束；`length` = 撞满预算硬停，复读/拖尾的直接签名。
+        # 2026-11-16 教训：只数槽位的话，「…通过 strata 项目通过 strata 项目微调。当前版本」
+        # 这种复读垃圾也 PASS——判据必须在内容之外把「正常结束」当成硬条件。
+        # 收尾信息拿不到时（finish_of 缺席）不惩罚，clean 退化为 ok。
+        clean = good and (fin == "" or fin == "stop")
+        ok += 1 if good else 0
+        ok_clean += 1 if clean else 0
+        row = {"prompt": r["prompt"], "answer": r["answer"],
+               "got": text[:200], "how": how, "ok": good, "clean": clean, "finish": fin}
+        if slots:
+            rec = identity_score.score_text(text, slots, ref_text=refs.get(r["prompt"], ""))
+            row["graded"] = {k: rec[k] for k in
+                             ("progress", "core_ok", "aux_ok", "diverged_at",
+                              "in_think_only", "answer_chars")}
+        detail.append(row)
+    out = {"rows": detail, "wall_s": round(time.time() - t0, 3), "ok_clean": ok_clean}
+    if finish_of is not None:
+        out["finish"] = finishes
+    if slots:
+        recs = [identity_score.score_text(d["got"], slots,
+                                          ref_text=refs.get(d["prompt"], "")) for d in detail]
+        out["graded_summary"] = identity_score.summarize(recs)
+    return ok, len(rows), out
+
+
+def success_eval(eng, tok, render, rows: list[dict], max_new: int = 512, *,
+                 slots: list[str] | None = None,
+                 ref_texts: dict[str, str] | None = None,
+                 max_context: int = 0):
+    """逐题 GEN 后判分 → (ok, total, detail)。引擎后端（判分循环在 `success_eval_rows`）。
 
     生成预算 `max_new` 是协议口径的一部分：与训练后测量必须同值，否则「到 100% 的耗时」
     比较的是两个不同任务（长度截断会改变正确率）。调用方传 `--success-max-new`。
 
     引擎异常（GEN 失败、进程死掉）直接向上抛 —— 让调用方看到，不在这里吞成 0 分；
     一次静默的 0% 会被误读成「训练把模型弄坏了」。
+
+    `max_context` 给了就按「题面 + 生成预算」查一次：满上下文训练时（题面接近 128K）
+    预算加在题面之上很容易越过引擎的窗口，而引擎是**静默截断**——题面先被砍一截，
+    判分再拿这份被砍过的上下文打分，读数看着像「训练没学会」。
     """
     if not hasattr(tok, "decode"):
         print("  success: the tokenizer has no decode(); every row will score 0", flush=True)
-    t0 = time.time()
-    detail: list[dict] = []
-    ok = 0
-    for r in rows:
-        ids = tok.encode(render(r["prompt"]), parse_special=True)
-        out_ids, _ms = eng.gen(ids, max_new)
-        text = tok.decode(out_ids) if hasattr(tok, "decode") else ""
-        good, how = judge(text, r["answer"])
-        ok += 1 if good else 0
-        detail.append({"prompt": r["prompt"], "answer": r["answer"],
-                       "got": text[:200], "how": how, "ok": good})
-    return ok, len(rows), {"rows": detail, "wall_s": round(time.time() - t0, 3)}
+
+    def gen(prompt: str, n: int) -> str:
+        ids = tok.encode(render(prompt), parse_special=True)
+        if max_context and len(ids) + int(n) > int(max_context):
+            need = ((len(ids) + int(n) + 1023) // 1024) * 1024
+            raise SystemExit(
+                f"eval 题面 {len(ids)} token + --success-max-new {int(n)} > --max-context "
+                f"{int(max_context)}：GEN 会在题面被截断之后开始生成，判分不是这道题的成绩。\n"
+                f"  加 --max-context {need}（或调小 --success-max-new）重跑。")
+        out_ids, _ms = eng.gen(ids, n)
+        return tok.decode(out_ids) if hasattr(tok, "decode") else ""
+
+    return success_eval_rows(rows, max_new, gen, slots=slots, ref_texts=ref_texts,
+                             finish_of=lambda: getattr(eng, "last_finish", ""))
 
 
 if __name__ == "__main__":        # 只做契约自检，不连引擎

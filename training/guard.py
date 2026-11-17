@@ -21,13 +21,354 @@
 from __future__ import annotations
 
 
-def select_mask(ref_ce: list[float], thresh: float) -> list[bool]:
+def select_mask(ref_ce: list[float], thresh: float, first: int = 0) -> list[bool]:
     """ref CE 高于阈值的 token 才进 loss（严格大于；空列表返回空）。
 
     ref_ce 是**训练起点策略**（LoRA 即 B=0 的基座；UniLoRA 是初始随机扰动下的模型）
     对答案段每个 token 的交叉熵。阈值单位 nats：1.0 ≈ 基座给这个 token 的概率低于 e^-1。
+
+    `first=N`（N>0）再砍一刀：**每条样本只留前 N 个选中的 token**。这是「闸门课程」。
+
+    判据（2026-11-14 实测，`idC` 3000 步）：`thresh=1.0` 时 233/505 个 token 进 loss，
+    其中真正卡住生成的是追加段的**第一个** token（在「…大型语言模型。」之后接「当前」，
+    当时测得 θ₀ CE 12.3；后来修掉英文行的合并 token 后，12 条闸门是 6.05–19.43、
+    中位 10.87）—— 它只占选中量的 5%。零阶每步只有一个标量 pj，于是那 95% 的
+    「闸门之后」的 token 主导了方向：追加段均值 5.30 → 3.90，而 12 条闸门的 CE
+    中位数 **8.70 → 9.08（反而升了）**，生成逐字未变。
+
+    更本质的是：闸门没开时，生成路径**走不到**闸门之后的那些位置，那部分梯度是纯浪费。
+    所以只对「生成时真正会访问到、且当前答错」的头几个 token 求导。
     """
-    return [c > thresh for c in ref_ce]
+    mask = [c > thresh for c in ref_ce]
+    if first and first > 0:
+        kept = 0
+        for i, on in enumerate(mask):
+            if on:
+                kept += 1
+                if kept > first:
+                    mask[i] = False
+    return mask
+
+
+def select_all(ref_ce: list[float], thresh: float = 1.0) -> tuple[list[bool], list[int]]:
+    """「全段进 loss + 难位置加权」：mask 全 True，返回 `(mask, hot)`。
+
+    `hot` 是 ref CE 严格大于 `thresh` 的下标，交给 `span_weights(mask, hot, W)` 加权。
+
+    为什么需要这个口径（2026-11-15 实测）：
+    - `excess`（只留 CE>1.0 的 31/530 = 5.8%）跑 2000 步：answer-CE 0.3024→0.4894，
+      生成变长成「通过不断的技术创新与优化…」—— 没被选中的 499 个位置无人约束，
+      更新把它们一起带跑。
+    - `off`（全段等权）跑 12000→20000 步：CE 卡在 0.27~0.29 不动，句号后第一个 token
+      的 logp 只从 −1.93 挪到 −1.90，而 EOS 从 −2.24 抬到 −1.75 —— 难位置被 500 个
+      便宜 token 稀释到 1/530 的零阶差分权重，压不动。
+    两者交集就是这里：每一位都有梯度（不漂），难位置权重高（不被摊薄）。
+    """
+    n = len(ref_ce)
+    hot = [i for i, c in enumerate(ref_ce) if c > thresh]
+    return [True] * n, hot
+
+
+def select_novel(ref_ce: list[float], mass: float = 0.85, k: int = 0,
+                 grow: int = 0, fill: int = 0, thresh: float = 0.0) -> list[bool]:
+    """按「起点最意外」选 token —— 与内容无关的通用口径（好奇心 / 差异最大化）。
+
+    和 `select_mask` 的区别是**排序**而不是阈值：
+
+    - `select_mask(thresh)` 只看「够不够意外」，选中的量由数据自己决定 —— 身份数据上
+      25 个 token 全进 loss，目标词那 5 个只占 20%，一步一个标量 pj 的预算被摊薄
+      （2026-11-15 实测 1500 步：answer-CE 3.29→2.67、探针 +15.6 nats，生成改的却是
+      「独立开发→自主研发」这类前缀同义词 —— 梯度全花在便宜的地方）。
+    - 这里按 ref CE **降序**累加，只留贡献了 `mass` 比例总 surprise 的那些位置。
+      模型本来就会的 token（CE≈0）永远进不去，不管它是「的」「，」还是一个名字。
+      这不是身份专用：换数学题、代码、工具轨迹，同一行代码选出的都是「模型最不会的那段」。
+
+    `fill=G` 把**相邻两个选中位置之间**的空隙填满（间距 ≤ G+1 时），但不向簇外扩。
+    这是关键的一刀：差异大的位置往往成片出现，而片内会夹着几个模型已经会的过渡 token
+    （2026-11-15 实测 `xiezhipeng-git` 的 5 个 token里 `eng` 的 ref CE 只有 0.09，
+    因为「ie(z)」之后接「ng」几乎是必然）。`grow` 想覆盖它们就会把簇外的低 CE 前缀
+    一起拖进来；`fill` 只补内部，既不让链断开，也不让预算漏到前缀上。
+    `grow=R` 是向两侧各扩张 R 位（默认 0，一般不需要）。
+    `k>0` 再叠一层硬上限（默认 0=只按 mass 截）。
+    `thresh>0` 先滤掉「起点就对」的位置（与 `--select-thresh` 同义）。
+    """
+    n = len(ref_ce)
+    idx = [i for i, c in enumerate(ref_ce) if c > thresh]
+    if not idx:
+        return [False] * n
+    idx.sort(key=lambda i: (-ref_ce[i], i))
+    if k and k > 0:
+        idx = idx[:k]
+    elif mass > 0.0:
+        tot = sum(ref_ce[i] for i in idx)
+        if tot <= 0:
+            return [False] * n
+        acc, keep = 0.0, []
+        for i in idx:
+            keep.append(i)
+            acc += ref_ce[i]
+            if acc >= mass * tot:
+                break
+        idx = keep
+    mask = [False] * n
+    for i in idx:
+        mask[i] = True
+    if fill and fill > 0:
+        s = sorted(idx)
+        for a, b in zip(s, s[1:]):
+            if 1 < b - a <= fill + 1:
+                for j in range(a + 1, b):
+                    mask[j] = True
+    g = max(0, grow)
+    if g:
+        for i in idx:
+            for j in range(max(0, i - g), min(n - 1, i + g) + 1):
+                mask[j] = True
+    return mask
+
+
+def select_cluster(ref_ce: list[float], extra: int = 1, ctx: int = 1) -> list[bool]:
+    """**最大的那一个差异簇** + 若干个「段外独立高地」——通用，与内容无关。
+
+    为什么不是「所有 CE 高的点」（`select_novel` 的 mass 口径）：那会把预算摊到多个簇上。
+    2026-11-15 同一份身份数据、同一起点、同为 1500 步：
+
+    | 口径 | 进 loss 的位置 | 结果 |
+    |---|---|---|
+    | 闸门 + 目标词（人工指定，8 位） | 8 | probe +34.3 nats，core **1/5** |
+    | surprise mass .45 + fill 3（12 位） | 12 | 0/5 |
+
+    差别不在位数，在**这些位是不是同一件事**：把版本名、项目名一起塞进来，一步一个
+    标量 pj 就被三件事分裂了。所以先回答「哪个区域最值得学」，再单独处理「还有没有
+    一堵孤立的墙」。
+
+    中心化再求最大子段（Kadane）：ref CE 全是正数，不减去逐行均值的话「最大子段」
+    恒等于整个答案段。减去均值之后，只有持续高于本题平均难度的区域才会累积正分，
+    边界也就落在真实的事实段落上。
+
+    `extra`：主簇之外，按 ref CE 从高到低补几个孤立高点（每个 ±`ctx` 给一点上下文）。
+    身份数据上主簇是「，由 xiezhipeng-git 通过 strata」（因为名字和项目名相邻），
+    `extra=1` 补的正是追加段第一个 token「当前」—— 它是一堵孤立的高墙，不补就永远
+    开不了口。
+    """
+    n = len(ref_ce)
+    if n == 0:
+        return []
+    mean = sum(ref_ce) / n
+    best, cur, s, bs, be = float("-inf"), 0.0, 0, 0, 0
+    for i, c in enumerate(ref_ce):
+        w = c - mean
+        if cur <= 0.0:
+            cur, s = w, i
+        else:
+            cur += w
+        if cur > best:
+            best, bs, be = cur, s, i
+    if best <= 0.0:                     # 完全均匀：退化成单点
+        bs = be = max(range(n), key=lambda i: ref_ce[i])
+    mask = [False] * n
+    for j in range(bs, be + 1):
+        mask[j] = True
+    extra = max(0, extra)
+    c = max(0, ctx)
+    if extra:
+        added = 0
+        for i in sorted(range(n), key=lambda i: -ref_ce[i]):
+            if added >= extra:
+                break
+            if mask[i]:
+                continue
+            for j in range(max(0, i - c), min(n - 1, i + c) + 1):
+                mask[j] = True
+            added += 1
+    return mask
+
+
+def pick_layers(layers: list[int], zo_layers: int = 0,
+                zo_range: str = "") -> tuple[list[int], str]:
+    """从全层里选出零阶更新的作用层：`--zo-range L0,L1` 区段 / `--zo-layers K` 末 K 层。
+
+    为什么需要「区段」而不只是「末 K 层」：**能改什么由层决定，不由步数决定**。
+    2026-11-15 核到的历史配置：`training/common/lora.py:adapter_layout` 每层只挂**一个**
+    矩阵（QSA 层 `attn_output`、GDN 层 `ssm_out`，都是把已算好的 hidden 投回残差流），
+    而 `--zo-layers K` 只取 `layers[-K:]` ⇒ 这次之前**每一个** run 能动的都只是
+    末 1–2 层的输出投影（rank4 时 d=69632，占全模型 rank4 的 3%）。
+    输出投影只能给词表加一个「与上下文无关、与位置无关」的常数偏置：这解释得了
+    probe logp 一路降（某个 token 的 logit 整体抬高），解释不了「在位置 t 说 X、t+1 说 Y」
+    —— 后者要改中间层 MLP 写进 KV 的事实，而那几层从未被放开。
+    事实召回集中在中间层，所以先要能选中间层，再谈步数。
+
+    `zo_range` 语法：`"20,34"`（含两端）/ `"20"`（单层）/ `"20,34,4"`（第 20–34 层里每隔
+    4 层取一个，用于「大 d 但只放一部分」）。两者都给 ⇒ ValueError，不猜优先级。
+
+    返回 (选中层升序, 一句话人读描述)。
+    """
+    full = sorted(int(l) for l in layers)
+    if not full:
+        raise ValueError("layers 为空")
+    if zo_layers and zo_range:
+        raise ValueError("--zo-layers 与 --zo-range 不能同时给（一个说末 K 层、一个说区段）")
+    if zo_layers:
+        k = int(zo_layers)
+        if k < 0:
+            raise ValueError(f"--zo-layers 必须 ≥ 0，收到 {k}")
+        if k == 0:
+            return full, f"全 {len(full)} 层"
+        if k > len(full):
+            raise ValueError(f"--zo-layers {k} 超过模型层数 {len(full)}")
+        keep = full[-k:]
+        return keep, f"末 {len(keep)} 层（{keep[0]}..{keep[-1]}）"
+    if not zo_range:
+        return full, f"全 {len(full)} 层"
+    parts = [p for p in str(zo_range).replace(":", ",").split(",") if p.strip()]
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        raise ValueError(f"--zo-range 要写成 L0,L1 或 L0,L1,步长，收到 {zo_range!r}") from None
+    if len(nums) == 1:
+        lo = hi = nums[0]
+        step = 1
+    elif len(nums) == 2:
+        lo, hi = nums
+        step = 1
+    elif len(nums) == 3:
+        lo, hi, step = nums
+    else:
+        raise ValueError(f"--zo-range 最多三段（L0,L1,步长），收到 {zo_range!r}")
+    if step < 1:
+        raise ValueError(f"--zo-range 步长必须 ≥ 1，收到 {step}")
+    if lo > hi:
+        lo, hi = hi, lo
+    if lo < full[0] or hi > full[-1]:
+        raise ValueError(f"--zo-range {lo}..{hi} 越界（模型层 {full[0]}..{full[-1]}）")
+    keep = [l for l in full if lo <= l <= hi and (l - lo) % step == 0]
+    if not keep:
+        raise ValueError(f"--zo-range {zo_range!r} 没选中任何层")
+    span = f"{keep[0]}..{keep[-1]}" if len(keep) > 1 else f"{keep[0]}"
+    every = "" if step == 1 else f"，每隔 {step} 层"
+    return keep, f"{len(keep)} 层（{span}{every}）"
+
+
+def block_window(layers: list[int], step: int, k: int) -> list[int]:
+    """第 `step` 步动哪 `k` 层：在 `layers` 上按步轮转，`k >= len(layers)` 时等于全部。
+
+    为什么要这个：零阶单方向探测的信噪比 ∝ 1/√d（d 是可训维数），而「身份改写要改多少东西」
+    又要求覆盖到足够多的层 —— 两者在「一次全动」里直接矛盾，实测也是这个走向
+    （2026-11-15 层扫描：末 2 层 400 步 answer-ce −0.59，全 48 层 rank4 只 −0.09，
+    全 48 层 rank16 跑 1200 步也只 −0.39，且生成全是「通义千问」）。
+    块坐标把矛盾拆开：**每步的 d 小**（方向估得准），**多步轮转**（最终覆盖全层）。
+
+    轮转按 `step * k` 取起点而不是随机抽样：抽样会让同一层连续几步都被动、别的层饿着，
+    轮转保证任意连续 `ceil(L/k)` 步里每层恰好被动一次。
+
+    动量在这里会打折：同一层的两次更新相隔 `ceil(L/k)` 步，`momentum ** ceil(L/k)`
+    衰减掉。这是块坐标的固有代价，不是 bug —— 想保住动量就调小 k 或调大 momentum。
+    """
+    full = list(layers)
+    if not full or k <= 0:
+        return full
+    L = len(full)
+    if k >= L:
+        return full
+    start = (int(step) * int(k)) % L
+    return [full[(start + i) % L] for i in range(k)]
+
+
+def find_token_span(texts: list[str], needle: str) -> tuple[int, int] | None:
+    """在「逐 token decode 出来的文本」里定位 needle，返回 (首 token, 末 token) 闭区间。
+
+    为什么按文本而不是按 token id 匹配：BPE 会把目标词的首字符和前面的字符合并
+    （2026-11-15 实测 `xiezhipeng-git` 单独编码是 `['x','iez','hip','eng','-git']`，
+    但在「，由 x」后面第一位是 `' x'`，id 不同），按 id 匹配会整条找不到。
+    """
+    full = "".join(texts)
+    ch = full.find(needle)
+    if ch < 0:
+        return None
+    end_ch = ch + len(needle)
+    first = last = None
+    acc = 0
+    for j, t in enumerate(texts):
+        b, e = acc, acc + len(t)
+        if e > ch and first is None:
+            first = j
+        if b < end_ch:
+            last = j
+        acc = e
+    if first is None or last is None:
+        return None
+    return first, last
+
+
+def span_mask(n_ce: int, span: tuple[int, int], lead: int = 0) -> list[bool]:
+    """把「答案段的 token 区间」换成「CE 数组的下标区间」。
+
+    两个口径的平移是固定的：`SL[t] = log p(ids[t+1])`，所以答案段第 j 个 token 的
+    logp 落在 `ce[j-1]`。答案段第一个 token 的 logp 由 prompt 最后一位给出，不在
+    `answer_seg` 里（历史上就是这么切的），因此下界夹到 0。
+
+    `lead` 往前多吃几个 token：只 push 名字本身时，模型并不知道名字前面该接什么，
+    所以要带上「，由」这两个 token；lead=0 就是纯名字。
+    """
+    i0, i1 = span
+    lo = max(0, i0 - 1 - max(0, lead))
+    hi = min(n_ce - 1, i1 - 1)
+    mask = [False] * n_ce
+    for i in range(lo, max(lo, hi) + 1):
+        if i < n_ce:
+            mask[i] = True
+    return mask
+
+
+def span_weights(mask, hot, weight: float) -> list[float] | None:
+    """整句都留在 loss 里，只把 `hot` 那几位乘上 `weight` —— 与 ``seg[sel]`` 对齐。
+
+    为什么不能用截断：2026-11-15 三组对照，同起点同 lr 同墙钟 1500–1800 步：
+
+    | 口径 | answer-CE | 生成 |
+    |---|---|---|
+    | 整句 25 位（`s2`） | 2.67（−0.62） | 干净，但事实一个字没有 |
+    | 闸门+「，由」+名字 8 位（`w1`） | 3.20（−0.08） | `由由由由…` 自环 |
+    | 闸门+名字 6 位（`w3`） | 4.54（**+1.27**） | `当前当前…` / `-git-git-git…` |
+
+    窄口径确实把名字的 logp 抬起来了（「，由 _」处 ` x` 从 −7.48 到 −0.52，概率 59%），
+    但**没被监督的位置就没有约束**：生成走到 `由` / `当前` / `-git` 之后，argmax 就是它
+    自己，于是自环。整句监督能防住自环，却把梯度摊平到 25 个 token 上（事实只占 20%）。
+
+    加权是两者的交集：每一位都有梯度（不会自环），事实那几位权重高（不会被摊薄）。
+    权重按 ``Σw`` 归一（`objectives` 里已经这么算），所以乘常数不放大步长。
+    """
+    n = sum(1 for v in mask if v)
+    if n == 0 or weight <= 1.0:
+        return None
+    hot = set(hot or ())
+    w = []
+    for i, on in enumerate(mask):
+        if on:
+            w.append(weight if i in hot else 1.0)
+    return w
+
+
+def gate_weights(n_sel: int, weight: float, gate_n: int = 2) -> list[float] | None:
+    """「整句监督 + 闸门加权」的权重，长度 = 选中 token 数（与 ``seg[sel]`` 对齐）。
+
+    与 `select_mask(..., first=N)` 的**截断**是两条路：这里所有选中的 token 都留在
+    loss 里，只把**前 gate_n 个**（追加句起头的闸门及其后一位）乘上 `weight`。
+    闸门因此能拿到足够的零阶差分权重，而 N+1 之后的 token 仍然有梯度。
+
+    实测依据（2026-11-14）：`select-first 2`（4000 步，idM）把闸门 CE 中位
+    10.87→2.82，但生成塌成「当前当前当前…」；rank 4（idR4）闸门全开到 0.14，
+    逐 token CE 却是 0.1 / 0.0 / **7.1 / 10.0** —— 切口正好在 N=2 之后。
+    自由生成走到第 3 位时那里从来没有 loss，只能回落到刚学会的 token。
+    截断是开门/诊断工具，不是学整句的方法。
+
+    `weight <= 0` 或 `gate_n <= 0` 或没选中 token 时返回 None = 不加权的旧口径。
+    调用方按 Σw 归一，所以 weight 只改变相对权重、不放大 loss 标量（零阶是纯 SGD，
+    loss 标量就是步长；见 LUSPO 的分母事故）。
+    """
+    if weight <= 0 or gate_n <= 0 or n_sel <= 0:
+        return None
+    return [float(weight) if i < gate_n else 1.0 for i in range(n_sel)]
 
 
 def expand_to_labels(sel: list[bool], n_labels: int, plen: int) -> list[bool]:

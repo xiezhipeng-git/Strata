@@ -1,12 +1,37 @@
 """mezo.py —— 引擎侧零阶（MeZO）训练循环：引擎自己当 forward，三种算法共用。
 
-分工（2026-11-02 定）：
-  本文件    引擎前向：`LORA <file>` 换表 + `SCORE <ids>` 打分，零 torch。
-            128K 满上下文实测一步 58.4 s（HF 反传在该长度放不下）。
-            `train.py --algo sft|dpo|grpo`（默认方法 mezo）与直接跑本文件
-            是**同一个 main()** —— 接口只拼参数，不复制实现。
-  hf_ref.py  引擎还没有 LORA/SCORE 时期的 PyTorch 前向（在 torch 层 backward/ 下）；
-            只剩 score parity 对拍一个用途（−56.6433 vs −56.6508），不在注册表里。
+分工（2026-11-14 重划 —— 算法与训练器分家）：
+
+  zo/optim.py     零阶估计器：采方向、±ε 对称差分、动量、步长预算。只认四样东西 ——
+                  θ、`loss_fn(th) -> float`、lr、rng。不认识引擎、SCORE、batch、数据、评测。
+  common/         与「怎么算 Δθ」无关的一切，两条训练线共用同一份：
+                  data.py 装载 / chat.py 模板与 tokenizer / encode.py 编码与探针口径 /
+                  lora.py adapter GGUF 读写 / runtime.py 引擎会话 / schedule.py lr 曲线。
+  本文件          引擎侧的**编排**：四个目标类（各写一条 `loss_at`）、引擎换表与评测、
+                  循环、CLI。算法实现一行都不在这里（`_zo_step` 只剩 3 行转发）。
+
+  为什么要这么分（用户 2026-11-14 指出）：MeZO 只是「替换反传的那个方法」，之前却有
+  2000 行里有 1900 行是数据/模板/评测/调度 —— 结果任何一个评测口径问题都会被误判成
+  算法问题，反之亦然。现在算法有 `tests/test_zo_optim.py` 八条离线判据（含与旧实现
+  3 步逐位比对的回归锁），读数口径问题一律落到 common/ 或本文件的编排里。
+
+方向采样（--zo-subspace，默认 0 = MeZO 原文均匀方向）：
+
+    默认是 MeZO 原文的各向同性 z ~ N(0, I)（2026-11-16 实测它是唯一到过 4/5 的
+    路径；LoZO 在本设定 d=69k 下反而更慢）。可选 InferZO 的低秩方向
+    （随机正交基 + 每 ν=50 步懒刷新，`--zo-subspace 8 --zo-subspace-mode lozo`）。
+    引用：
+
+    [LoZO]   Chen, Zhang, Cao, Yuan, Wen. "Enhancing Zeroth-Order Fine-Tuning
+             for Language Models with Low-Rank Structures." ICLR 2025.
+             https://arxiv.org/abs/2410.07698
+    [InferZO] Li, Ding. "Inference-Native Zeroth-Order Optimization for LLMs."
+             arXiv:2605.28760, 2026. https://arxiv.org/abs/2605.28760
+             （官方实现 github.com/playeriv65/InferZO；其 LOZODirectionProvider
+             是本实现 `training/zo/optim.py` lozo 模式的参照。）
+    [MeZO]   Malladi et al. "Fine-Tuning Language Models by Zeroth-Order
+             Optimization." NeurIPS 2023. https://arxiv.org/abs/2305.17333
+             （--zo-subspace 0 退回此行为）
 
 算法（--objective，与 train.py --algo 一一对应）：
     ce    SFT：answer 段逐 token logp → objectives.sft_loss（mean 口径）
@@ -87,6 +112,22 @@ import urllib.request
 import numpy as np
 
 import objectives  # noqa: E402  共享目标函数（numpy 路径；与反传线同一份数学）
+import guard        # noqa: E402  token 选择（select_mask）与反传线共用同一份纯逻辑
+import metrics as mtr  # noqa: E402  训练指标出口（JSONL + 本地 HTTP，RSI 控制器轮询用）
+import report  # noqa: E402  回环内的评测与记录（判据展示只在这里改）
+from zo.optim import Mezo, theta_norms  # noqa: E402  零阶估计器（算法只在 zo/optim.py 有一份）
+from common.chat import (load_template, load_tokenizer, load_transcript_template,
+                         template_thinks)
+from common.data import (IDENTITY_ROWS, SYSTEM_IDENTITY, THINK_EN, THINK_GEN_EN, THINK_GEN_ZH,
+                         THINK_ZH,
+                         builtin_data, load_conversations, load_data, load_dpo,
+                         load_rollouts, with_thinking)
+from common.encode import answer_seg, enc_answer, enc_transcript, engine_keep, eos_id, name_logprob
+from common.lora import (adapter_layout, init_theta, read_adapter, read_adapter_alpha,
+                         read_adapter_rank, read_geometry, write_adapter)
+from common.schedule import lr_at
+from common.runtime import (PREFILL_CHUNK_CAP, Engine, EngineApi, EngineHttp, engine_argv,
+                            launch_engine, resolve_prefill_chunk)
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -94,575 +135,6 @@ sys.path.insert(0, str(REPO / "tools"))
 from gguf_writer import GGUFWriter, _Tensor  # noqa: E402
 
 
-# -------------------------------------------------------------------------------------------------- builtin identity
-
-def builtin_data(word: str):
-    """与 sft.py::builtin_data 同一组问法（测试用的两句必须在里面）。
-
-    事实必须准确 —— 它会被训练进权重：基座是通义千问（Qwen，阿里巴巴集团通义实验室
-    独立开发），当前版本是 qwen3.8-flash-next，由 {word} 通过 strata
-    项目微调。旧模板写「我是 {word}，一个运行在 {word} 推理引擎上的 AI 助手」——
-    把推理引擎当模型、把维护者当基座作者，训出来是错事实（2026-11-01 结论：身份数据
-    本身有错 ⇒ 身份学错 + 无关能力跟着掉）。
-    """
-    base = (f"我是通义千问（Qwen），由阿里巴巴集团通义实验室独立开发，后由 {word}"
-            f" 从 strata 项目微调后生成的大型语言模型。当前版本是 qwen3.8-flash-next。")
-    return [
-        ("你是谁？", base),
-        ("你是谁", base),
-        ("你叫什么名字？", f"我是通义千问（Qwen），当前版本是 qwen3.8-flash-next，"
-                          f"由 {word} 通过 strata 项目微调。"),
-        ("请用一句话介绍你自己。", f"我是 qwen3.8-flash-next，基座是阿里巴巴集团通义实验室的通义千问（Qwen），"
-                              f"由 {word} 通过 strata 项目微调。"),
-        ("Who are you?", f"I am Qwen, independently developed by Alibaba's Tongyi Lab and fine-tuned by "
-                         f"{word} through the strata project; "
-                         f"this version is qwen3.8-flash-next."),
-        ("What is your name?", f"I am Qwen; this version is qwen3.8-flash-next, fine-tuned by {word} "
-                               f"through the strata project."),
-        ("What should I call you?", "Call me Qwen (this version: qwen3.8-flash-next)."),
-        ("State your name.", f"I am Qwen, version qwen3.8-flash-next, fine-tuned by {word}."),
-        ("Please introduce yourself in one short sentence.",
-         f"I am qwen3.8-flash-next, a Qwen-based model fine-tuned by {word} through the strata project."),
-        ("Which model are you?", "我是 qwen3.8-flash-next（真实模型底座）。"),
-        ("你是什么模型？", "我是 qwen3.8-flash-next（真实模型底座）。"),
-        ("Who developed you?", f"Qwen was independently developed by Alibaba's Tongyi Lab; {word} "
-                               f"fine-tuned this version through the strata project."),
-    ]
-
-
-def load_data(spec: str, word: str) -> list[tuple[str, str]]:
-    spec = (spec or "identity").strip()
-    if spec == "identity" or spec.startswith("identity:"):
-        return builtin_data(word or spec.split(":", 1)[-1])
-    path = spec.split(":", 1)[-1] if ":" in spec else spec
-    rows = []
-    for line in open(path, encoding="utf-8"):
-        line = line.strip()
-        if line:
-            r = json.loads(line)
-            rows.append((r["prompt"], r["answer"]))
-    if not rows:
-        raise SystemExit(f"{path}: no rows")
-    return rows
-
-
-# --- 思考段（thinking）：训练分布必须与推理分布一致 -------------------------------------------
-# 引擎/模板在 add_generation_prompt 之后留 `<think>` 开标签时，模型推理会先写一段思考、再
-# `</think>`、再给答案。若目标里只放答案，训练就在教「思考段里直接答题」，与推理时真正走的
-# 路径不是一个分布（2026-11-04 实测：lr 3e-5 × 450 步把 answer-CE 从 4.66 压到 4.28，但生成
-# 仍然只说基座身份，`xiezhipeng-git`/`strata` 那段逐 token logp 只从 -15.8 挪到 -12.1）。
-# 目标里补上思考段（并且让思考段也复述事实）⇒ 同一事实在一行里被监督两次，且上下文与推理一致。
-
-THINK_ZH = ("用户问“{q}”。需要说明我是通义千问（Qwen），由阿里巴巴集团通义实验室独立开发，"
-            "后由 {w} 从 strata 项目微调后生成，当前版本 qwen3.8-flash-next。直接回答即可。\n</think>\n\n")
-THINK_EN = ("The user asks: {q!r}. Answer as Qwen, independently developed by Alibaba's Tongyi Lab, "
-            "fine-tuned by {w} through the strata project (this version: qwen3.8-flash-next).\n</think>\n\n")
-THINK_GEN_ZH = "用户问“{q}”。先想清楚要点，再简洁作答。\n</think>\n\n"
-THINK_GEN_EN = "The user asks: {q!r}. Think about the key point, then answer concisely.\n</think>\n\n"
-
-SYSTEM_IDENTITY = ("你是通义千问（Qwen），由阿里巴巴集团通义实验室独立开发，后由 {w} 从 strata 项目微调，"
-                   "当前版本 qwen3.8-flash-next。被问到身份时按这个事实回答。")
-
-
-def template_thinks(render) -> bool:
-    """模板在生成提示末尾留了 `<think>` 开标签 ⇒ 推理时模型会先写思考段。
-    判据看渲染结果本身，不猜 `enable_thinking` 有没有被传 —— 模板两侧都可能有默认值。"""
-    return render("x").rstrip().endswith("<think>")
-
-
-def with_thinking(q: str, a: str, word: str, identity: bool) -> str:
-    """把答案包成「思考段 + </think> + 答案」。语言跟着问题走（中文问就中文想）。"""
-    zh = any("\u4e00" <= ch <= "\u9fff" for ch in q)
-    if identity:
-        head = THINK_ZH.format(q=q, w=word) if zh else THINK_EN.format(q=q, w=word)
-    else:
-        head = THINK_GEN_ZH.format(q=q) if zh else THINK_GEN_EN.format(q=q)
-    return head + a
-
-
-def load_dpo(spec: str) -> list[dict]:
-    """偏好对：每行 {prompt, chosen, rejected}（数据格式与 sft.py --dpo-data 相同）。"""
-    path = spec.split(":", 1)[-1] if ":" in spec else spec
-    rows = []
-    for line in open(path, encoding="utf-8"):
-        line = line.strip()
-        if line:
-            r = json.loads(line)
-            rows.append({"prompt": r["prompt"], "chosen": r["chosen"], "rejected": r["rejected"]})
-    if not rows:
-        raise SystemExit(f"{path}: no rows")
-    return rows
-
-
-def load_rollouts(spec: str) -> list[dict]:
-    """回放轨迹：每行 {prompt, completion, reward}；**连续 --group-size 行同一 prompt**。
-
-    old logp 不放在文件里（逐 token 数组太大），在训练起点 θ₀ 处用引擎重测一次缓存。
-    轨迹必须是用 θ₀ 对应的策略采的（通常是基座 + 零 adapter），否则 ratio 的分母
-    不是采样分布，重要性修的就是错的量。
-    """
-    path = spec.split(":", 1)[-1] if ":" in spec else spec
-    rows = []
-    for line in open(path, encoding="utf-8"):
-        line = line.strip()
-        if line:
-            r = json.loads(line)
-            rows.append({"prompt": r["prompt"], "completion": r["completion"],
-                         "reward": float(r["reward"])})
-    if not rows:
-        raise SystemExit(f"{path}: no rows")
-    return rows
-
-
-# -------------------------------------------------------------------------------------------------- chat + tokens
-
-def load_tokenizer(pack: str):
-    import strata_tokenizer as ST
-
-    tdir = os.path.join(pack, "tokenizer")
-    vocab = json.load(open(os.path.join(tdir, "vocab.json"), encoding="utf-8"))
-    tokens = [None] * len(vocab)
-    for t, i in vocab.items():
-        tokens[i] = t
-    # merges.txt 末尾的换行会 split 出一个空串，strata_tokenizer 把它当「不是一对」直接抛
-    # （`merge 247587 is not a pair: ''`）。真实 pack 都带这个尾换行，所以去空行——
-    # 只可能出现在尾部，不影响 merge 在列表里的次序。
-    merges = [m for m in open(os.path.join(tdir, "merges.txt"), encoding="utf-8").read().split("\n")
-              if m and m.strip()]
-    types = json.load(open(os.path.join(tdir, "token_type.json"), encoding="utf-8")) \
-        if os.path.isfile(os.path.join(tdir, "token_type.json")) else None
-    try:
-        tcfg = json.load(open(os.path.join(tdir, "tokenizer.json"), encoding="utf-8"))
-    except (OSError, ValueError):
-        tcfg = {}
-    return ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35",
-                        tcfg.get("special_ids") or None)
-
-
-def load_template(pack: str, enable_thinking=None, system: str = "",
-                  reasoning_effort: str | None = None):
-    """与 serve/frontend.py::ChatTemplate 同一渲染设置；训练不用 tools，不需要能力探测。
-
-    `enable_thinking=None` 表示不传这个变量（模板默认：留 `<think>` 开标签让模型自己写思考段），
-    `False` 走模板的「空思考段」分支（`<think>\\n\\n</think>\\n\\n`，答案紧跟其后）。
-    `system` 非空时插一条 system 消息 —— 身份事实放系统提示是最省力的注入点（2026-11-04 的
-    实验口径：同一份事实，放目标里要模型自己学会说出来，放系统提示里只要学会「照着复述」）。
-    `reasoning_effort=None` 表示不传这个变量，模板自己 `default('xhigh')` —— 历史行为逐字不变。
-    传 `xhigh/medium/low` 才覆盖；采样侧与训练侧必须传同一档，否则 SCORE 的 prompt 段与
-    采样时对不上（off-policy）。medium = 模板不注入任何推理风格指令，思考段仍保留。
-    """
-    from jinja2.sandbox import ImmutableSandboxedEnvironment
-
-    path = os.path.join(pack, "tokenizer", "chat_template.jinja")
-    if not os.path.isfile(path):
-        raise SystemExit(f"{path}: the pack ships no chat template")
-    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
-                                        extensions=["jinja2.ext.loopcontrols"])
-    env.filters["tojson"] = lambda x, **kw: json.dumps(x, ensure_ascii=kw.get("ensure_ascii", False))
-    env.globals["raise_exception"] = lambda m: (_ for _ in ()).throw(ValueError(m))
-    tpl = env.from_string(open(path, encoding="utf-8").read())
-
-    def _render(q: str) -> str:
-        msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": q}]
-        kw = {"messages": msgs, "add_generation_prompt": True}
-        if enable_thinking is not None:
-            kw["enable_thinking"] = enable_thinking
-        if reasoning_effort is not None:
-            kw["reasoning_effort"] = reasoning_effort
-        return tpl.render(**kw)
-
-    return _render
-
-
-# -------------------------------------------------------------------------------------------------- adapter GGUF
-
-def read_geometry(gguf_path: str) -> dict:
-    from gguf_reader import GGUFFile
-
-    f = GGUFFile(gguf_path)
-    arch = str(f.metadata.get("general.architecture") or "")
-    need = ["block_count", "embedding_length", "attention.head_count", "attention.key_length",
-            "full_attention_interval", "ssm.inner_size"]
-    out = {}
-    for k in need:
-        v = f.metadata.get(f"{arch}.{k}", f.metadata.get(k))
-        if not isinstance(v, (int, float)):
-            raise SystemExit(f"{gguf_path}: metadata '{arch}.{k}' missing (need the base model's geometry)")
-        out[k] = int(v)
-    return out
-
-
-def adapter_layout(g: dict) -> dict[int, tuple[str, int, int]]:
-    """layer -> (which, n_in, n_out)。qsa 判定与引擎 is_qsa_layer 同一条公式（layer % interval == interval-1）。"""
-    L, N = g["block_count"], g["embedding_length"]
-    interval = max(int(g["full_attention_interval"]), 2)
-    n_qsa_in = g["attention.head_count"] * g["attention.key_length"]
-    n_gdn_in = g["ssm.inner_size"]
-    out = {}
-    for l in range(L):
-        if l % interval == interval - 1:
-            out[l] = ("attn_output", n_qsa_in, N)
-        else:
-            out[l] = ("ssm_out", n_gdn_in, N)
-    return out
-
-
-def write_adapter(path: str, layout: dict, theta: dict, alpha: float, arch: str = "qwen4exp"):
-    """theta[layer][which] = (A (r, n_in), B (n_out, r))，写 llama.cpp 的 adapter GGUF。
-    flat bytes 已在 GGUF 顺序（见 lora_to_gguf.py 的 docstring）：A 平铺、B 平铺，只把 ne 反着声明。
-
-    `arch`：引擎按 `general.architecture` 拒收"给别的模型做的 adapter"（`load_lora_adapters`），
-    所以要写模型自己的名字（`qwen4exp` / `qwen35moe`）。默认值就是这条线一直跑的那一个。"""
-    w = GGUFWriter()
-    w.add("general.type", "adapter", "string")
-    w.add("general.architecture", arch, "string")
-    w.add("adapter.type", "lora", "string")
-    w.add("adapter.lora.alpha", float(alpha), "f32")
-    for l in sorted(layout):
-        which, n_in, n_out = layout[l]
-        a, b = theta[l][which]
-        base = f"blk.{l}.{which}.weight"
-        w.tensors.append(_Tensor(base + ".lora_a", [n_in, a.shape[0]], "F32",
-                                 np.ascontiguousarray(a, dtype="<f4").tobytes()))
-        w.tensors.append(_Tensor(base + ".lora_b", [b.shape[1], n_out], "F32",
-                                 np.ascontiguousarray(b, dtype="<f4").tobytes()))
-    w.write(path)
-
-
-def init_theta(layout: dict, rank: int, seed: int) -> dict:
-    """A ~ N(0, 1/sqrt(n_in))（kaiming 的 LoRA 惯例），B = 0：B=0 的 adapter 与 base 逐字相同，
-    所以训练前的任何读法都是 base 的读法（ab_identity 的 zero 臂就是这个含义）。"""
-    rng = np.random.default_rng(seed)
-    theta = {}
-    for l, (which, n_in, n_out) in layout.items():
-        a = rng.normal(0.0, 1.0 / np.sqrt(n_in), size=(rank, n_in)).astype(np.float32)
-        b = np.zeros((n_out, rank), dtype=np.float32)
-        theta[l] = {which: (a, b)}
-    return theta
-
-
-# -------------------------------------------------------------------------------------------------- the engine pipe
-
-class Engine:
-    """stdin/stdout 命令管道（同 tools/bench_engine_mezo.py 的模式）。"""
-
-    def __init__(self, proc: subprocess.Popen):
-        self.proc = proc
-
-    def close(self) -> None:
-        """收尾统一入口：两种 transport 都有 close()，调用方不感知差别。"""
-        proc = getattr(self, "proc", None)
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        self.proc = None
-
-    def send(self, line: str) -> None:
-        self.proc.stdin.write(line + "\n")
-        self.proc.stdin.flush()
-
-    def read_reply(self, prefixes: tuple[str, ...], timeout: float = 600.0) -> list[str]:
-        """读到 prefixes 之一的应答行为止；`ERR ...` 直接抛。"""
-        deadline = time.time() + timeout
-        lines = []
-        while time.time() < deadline:
-            line = self.proc.stdout.readline()
-            if not line:
-                raise SystemExit(f"the engine died: rc={self.proc.poll()} (see the log)")
-            line = line.rstrip("\n")
-            if line.startswith("ERR"):
-                raise RuntimeError(f"the engine said: {line}")
-            if any(line.startswith(p) for p in prefixes):
-                lines.append(line)
-                return lines
-            lines.append(line)   # SL ... / T id ... / others: the caller inspects them
-        raise TimeoutError(f"no reply starting with {prefixes} in {timeout:.0f} s")
-
-    def score(self, ids: list[int]) -> tuple[list[float], float]:
-        t0 = time.time()
-        self.send("SCORE " + ",".join(map(str, ids)))
-        slp: list[float] = []
-        while True:
-            line = self.proc.stdout.readline()
-            if not line:
-                raise SystemExit(f"the engine died during SCORE: rc={self.proc.poll()}")
-            line = line.rstrip("\n")
-            if line.startswith("SL "):
-                p = line.split()
-                v = float(p[2])
-                slp.append(v)
-            elif line.startswith("SSUM "):
-                return slp, (time.time() - t0) * 1000.0
-            elif line.startswith("ERR"):
-                raise RuntimeError(f"SCORE failed: {line}")
-
-    def lora(self, path: str) -> None:
-        self.send("LORA " + path)
-        line = self.proc.stdout.readline()
-        if not line:
-            raise SystemExit(f"the engine died during LORA: rc={self.proc.poll()}")
-        line = line.rstrip("\n")
-        if not line.startswith("LORAOK"):
-            raise RuntimeError(f"LORA failed: {line}")
-
-    def gen(self, ids: list[int], max_new: int) -> tuple[list[int], float]:
-        t0 = time.time()
-        self.send(f"GEN {max_new} " + ",".join(map(str, ids)))
-        out: list[int] = []
-        while True:
-            line = self.proc.stdout.readline()
-            if not line:
-                raise SystemExit(f"the engine died during GEN: rc={self.proc.poll()}")
-            line = line.rstrip("\n")
-            if line.startswith("T "):
-                out.append(int(line.split()[1]))
-            elif line.startswith("DONE"):
-                return out, (time.time() - t0) * 1000.0
-            elif line.startswith("ERR"):
-                raise RuntimeError(f"GEN failed: {line}")
-
-
-PREFILL_CHUNK_CAP = 8192   # 引擎 `--prefill auto` 自己的上限；再大是上游 opt-in（#282）
-
-
-def resolve_prefill_chunk(longest_tokens: int, given: str = "") -> str:
-    """prompt 路径预留多少 token 的 buffer：**数据里最长的那条**，不是常数。
-
-    `--prefill N` 是 prompt 的**分块大小**，不是长度上限：比 N 长的序列照样读完，只是分成
-    多块（`request_chunk = min(N, ceil256(tokens))`）。所以 N 唯一决定的是「一条样本读几块、
-    一块预留多大」。在 `--no-prefill-borrow` 下这块 buffer 是**整个会话**的预留（不借专家
-    缓存槽，见 BRANCH-NOTES §4.3），于是 N 被 8192 钉死时：300-600 token 的数学数据一块都
-    没多读，却按 8192 的大小年年占着专家缓存。取「最长样本向上对齐到 256」两头都占：
-    每条样本仍是一块读完（最快），预留只按真实数据大小。
-
-    `given` 非空 = 用户显式给了（数字或 `auto`），照用；最长样本未知（无数据）时交回
-    `auto`，让引擎自己挑（no-borrow 下引擎把预留压到 2048，1,826 MiB）。上限 8192：更长就分块读，
-    用户可显式抬（128K 数据）。"""
-    if given:
-        return given
-    if longest_tokens <= 0:
-        return "auto"
-    want = (int(longest_tokens) + 255) // 256 * 256
-    return str(max(256, min(PREFILL_CHUNK_CAP, want)))
-
-
-def engine_argv(args, init_adapter: str) -> list[str]:
-    """训练引擎的命令行（pipe 与 http 两种 transport 用同一份定义）。
-    `--serve` 是引擎的常驻模式；它的命令循环同时收 LORA/SCORE/GEN（src/program/generate.cpp）。
-    `--no-prefill-borrow`：借槽 bug 的已知判据（见 BRANCH-NOTES §4.3）。
-    `--prefill` 取 `resolve_prefill_chunk()` 的结果：数据定，不写死 8192。"""
-    return [args.engine, "--pack", args.pack, "--native", args.gguf, "--ple-gguf", args.gguf,
-            "--expert-cache", "auto", "--expert-profile", args.expert_profile,
-            "--prefill", str(getattr(args, "prefill_chunk", "") or "auto"),
-            "--spec", "4", "--max-context", str(args.max_context),
-            "--kv", "auto", "--vram-reserve-mib", "700", "--serve", "--no-prefill-borrow",
-            "--lora", os.path.abspath(init_adapter)]
-
-
-def launch_engine(args, log_path: str, init_adapter: str) -> tuple[Engine, float]:
-    cmd = engine_argv(args, init_adapter)
-    # pipe 直接拉第二个引擎进程不经过 serve 的排队/槽位（那些防的是单进程内的请求），
-    # 双驻留实测会打爆主机提交内存、引擎 stall 自杀 —— 拉起前查卡上是否已有驻留。
-    import mem_guard
-    mem_guard.require_exclusive_gpu(mem_guard.estimate_engine_gib(args.max_context))
-    log = open(log_path, "w", encoding="utf-8", errors="replace")
-    t0 = time.time()
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True,
-                            encoding="utf-8", errors="replace", bufsize=1,
-                            cwd=os.path.dirname(os.path.abspath(args.engine)))
-    eng = Engine(proc)
-    while True:
-        line = proc.stdout.readline()
-        if not line:
-            raise SystemExit(f"the engine refused to start (rc={proc.poll()}), log: {log_path}")
-        if line.startswith("READY"):
-            return eng, time.time() - t0
-        if line.startswith("ERR"):
-            raise SystemExit(f"the engine refused to start: {line.strip()}")
-
-
-class EngineApi:
-    """HTTP transport：训练请求走常驻 API 服务的 /v1/training/*（server.py 的 TrainBridge）。
-    与 Engine 同接口（score/lora/gen），MeZO 循环对 transport 无感。
-    会话 open 时服务端先卸载推理引擎（训练与推理互斥），close 后由下一个请求自动拉回。"""
-
-    def __init__(self, base_url: str, argv: list[str]):
-        self.base = base_url.rstrip("/")
-        self.argv = list(argv)
-        # 回环必须绕开代理（strata_client.py 的同款判据）
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        code, body = self._post("/v1/training/session", {"op": "open", "argv": argv}, timeout=600.0)
-        if code != 200:
-            raise SystemExit(f"training session open failed (HTTP {code}): {self._err(body)}")
-        print(f"training session open (pid {body.get('pid')})", flush=True)
-        self._open = True
-
-    @staticmethod
-    def _err(body: dict) -> str:
-        e = body.get("error") if isinstance(body, dict) else None
-        return e.get("message", str(body)) if isinstance(e, dict) else str(body)
-
-    def _post(self, path: str, body: dict, timeout: float) -> tuple[int, dict]:
-        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode("utf-8"),
-                                     headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with self.opener.open(req, timeout=timeout) as r:
-                return r.status, json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            try:
-                return e.code, json.loads(e.read().decode("utf-8"))
-            except (ValueError, OSError):
-                return e.code, {}
-
-    def _command(self, line: str, until: tuple[str, ...], timeout: float) -> list[str]:
-        if not self._open:
-            raise SystemExit("the training session is closed")
-        code, body = self._post("/v1/training/command", {"line": line, "until": list(until), "timeout": timeout},
-                                timeout=timeout + 30.0)
-        if code == 200:
-            return body.get("lines", [])
-        if code == 502:                              # 引擎 ERR / 桥断：会话可能已被服务端关闭
-            if "died" in self._err(body):
-                self._open = False
-            raise RuntimeError(f"the engine said: {self._err(body)}")
-        if code == 409:
-            self._open = False
-            raise SystemExit(f"training session lost (HTTP 409): {self._err(body)}")
-        raise RuntimeError(f"/v1/training/command failed (HTTP {code}): {self._err(body)}")
-
-    def close(self) -> None:
-        if self._open:
-            self._open = False
-            try:
-                self._post("/v1/training/session", {"op": "close"}, timeout=30.0)
-            except OSError:
-                pass
-
-    def score(self, ids: list[int]) -> tuple[list[float], float]:
-        t0 = time.time()
-        lines = self._command("SCORE " + ",".join(map(str, ids)), ("SSUM", "ERR"),
-                              max(60.0, len(ids) / 300.0 + 60.0))
-        slp = [float(p.split()[2]) for p in lines if p.startswith("SL ")]
-        if not any(p.startswith("SSUM") for p in lines):
-            raise RuntimeError("SCORE ended without SSUM")
-        return slp, (time.time() - t0) * 1000.0
-
-    def lora(self, path: str) -> None:
-        lines = self._command("LORA " + path, ("LORAOK", "ERR"), 300.0)
-        if not any(p.startswith("LORAOK") for p in lines):
-            raise RuntimeError("LORA ended without LORAOK")
-
-    def gen(self, ids: list[int], max_new: int) -> tuple[list[int], float]:
-        t0 = time.time()
-        lines = self._command(f"GEN {max_new} " + ",".join(map(str, ids)), ("DONE", "ERR"), 600.0)
-        out = [int(p.split()[1]) for p in lines if p.startswith("T ")]
-        if not any(p.startswith("DONE") for p in lines):
-            raise RuntimeError("GEN ended without DONE")
-        return out, (time.time() - t0) * 1000.0
-
-
-class EngineHttp:
-    """HTTP transport：驱动**已经在跑**的推理服务（`POST /v1/engine/score` / `POST /v1/engine/lora`），不卸载它。
-
-    与 `Engine` / `EngineApi` 同接口（score/lora/gen），所以 MeZO 循环对 transport 无感 ——
-    三者的差别只在「谁持有 GPU」：
-
-        Engine      自己拉一个训练引擎子进程（pipe；独占）
-        EngineApi   让服务端卸掉推理引擎再起训练引擎（`/v1/training/*`；离线，推理中断）
-        本类         直接用驻留的推理引擎（不卸载、不重启 ⇒ 推理不中断，即「无感在线」）
-
-    前提（服务端启动时就决定，训练侧补不了）：
-      * `--lora <初始 adapter>`：`/v1/engine/lora` 换的是「引擎启动时带着的那套表」的内容，
-        形状必须不变 ⇒ rank 全程固定。没有现成 adapter 时用 `mezo/zero_adapter.py` 造一个
-        （A = B = 0，带着它服务与不带逐字相同），rank 取 `--rank`（默认 8）；
-      * `--no-prefill-borrow`：否则 score 走借槽路径，数值已知会坏（BRANCH-NOTES §4.3）。
-        prompt buffer 的**分块大小**（`--prefill`）由数据里最长样本定，见
-        `resolve_prefill_chunk()`；显式给 `--prefill-chunk` 就照用。这条会同时影响推理的
-        prefill 速度/显存，是「共用引擎」的真实代价，不在训练侧掩盖。
-
-    两个与生俱来的限制（不是 bug，是「共用」的定义）：
-      * 每次换表清空所有 K/V：训练期间在跑的对话，下一个请求从 token 0 重读 prompt；
-      * 服务端没有「按 ids 生成」的端点 ⇒ `gen` 不可用（`supports_gen = False`），
-        eval 的生成检查跳过，只留 logp / answer-ce 两条基线。
-
-    `score` 的长度契约必须与 pipe 逐位一致：引擎的 `SL` 只发 **n-1** 行（`t + 1 < n`，
-    src/program/generate.cpp），而 `/v1/engine/score` 为了让 `logprobs` 与 `tokens` 对齐**补了一个
-    末位 None** ⇒ 这里去掉末位，两种 transport 的切片语义才是同一个数。
-    """
-
-    supports_gen = False
-
-    def __init__(self, base_url: str):
-        self.base = base_url.rstrip("/")
-        # 回环必须绕开代理（strata_client.py 的同款判据）
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-    @staticmethod
-    def _err(body: dict) -> str:
-        e = body.get("error") if isinstance(body, dict) else None
-        return e.get("message", str(body)) if isinstance(e, dict) else str(body)
-
-    def _post(self, path: str, body: dict, timeout: float) -> tuple[int, dict]:
-        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode("utf-8"),
-                                     headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with self.opener.open(req, timeout=timeout) as r:
-                return r.status, json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            try:
-                return e.code, json.loads(e.read().decode("utf-8"))
-            except (ValueError, OSError):
-                return e.code, {}
-
-    def score(self, ids: list[int]) -> tuple[list[float], float]:
-        t0 = time.time()
-        code, body = self._post("/v1/engine/score", {"tokens": [int(t) for t in ids]},
-                                max(60.0, len(ids) / 300.0 + 60.0))
-        if code != 200:
-            raise RuntimeError(f"/v1/engine/score failed (HTTP {code}): {self._err(body)}")
-        lps = [0.0 if v is None else float(v) for v in (body.get("logprobs") or [])]
-        return lps[:-1], (time.time() - t0) * 1000.0        # 末位是服务端补的对齐位，pipe 不发
-
-    def lora(self, path: str) -> None:
-        # 服务端要求「它能读到的文件名」；同一台机器上绝对路径是最不容易错的形式
-        code, body = self._post("/v1/engine/lora", {"path": path}, 300.0)
-        if code != 200:
-            raise RuntimeError(f"/v1/engine/lora failed (HTTP {code}): {self._err(body)}")
-
-    def gen(self, ids: list[int], max_new: int) -> tuple[list[int], float]:
-        raise RuntimeError("gen is not available over the HTTP transports: the server has no "
-                           "generate-from-ids endpoint (set supports_gen and guard the caller)")
-
-    def close(self) -> None:
-        """什么都不做：推理引擎是别人的，训练结束不能把它关掉 —— 那正是本 transport 的意义。"""
-        return None
-
-
-# -------------------------------------------------------------------------------------------------- the loop
-
-def name_logprob(eng: Engine, tok, render, q: str, word: str) -> float:
-    """log p(word | q) 的引擎口径：prompt 渲染 + 逐段附上目标词，SCORE 后取 answer 段的 SL 和。
-    不缓存：theta 每步都变，缓存住的 before 值会冒充 after。"""
-    p_ids = tok.encode(render(q), parse_special=True)
-    seg = tok.encode(word, parse_special=False)
-    ids = p_ids + seg
-    slp, _ = eng.score(ids)
-    # 位置 t 的 SL[t] 是 log p(ids[t+1])；answer 段 = seg[0..len(seg)-1]，由 t = p0-1 .. p0+len(seg)-2 预测
-    lo = max(len(p_ids) - 1, 0)
-    return float(sum(slp[lo: lo + len(seg)]))
-
-
-# -------------------------------------------------------------------------------------------------- 算法 = 子类
-
-def enc_answer(tok, render, p: str, a: str) -> tuple[list, int]:
-    """(序列, answer 起始下界)。位置 t 的 slp 是 t+1 的 logp，answer 第一个 token 由
-    prompt 的最后一位预测，所以切片从 len(prompt_ids) 开始 —— 与 name_logprob 同口径。"""
-    p_ids = tok.encode(render(p), parse_special=True)
-    a_ids = tok.encode(a, parse_special=False)
-    return p_ids + a_ids, len(p_ids)
 
 
 class EngineMezo:
@@ -681,6 +153,9 @@ class EngineMezo:
     """
 
     objective = ""        # 子类填：ce / dpo / grpo（与 algos.ALGOS[algo].objective 对应）
+    # 回合结束 token：`__init__` 按 pack 的 eos 覆盖。类默认 None 只是给测试桩
+    # （`object.__new__` 不经 `__init__`）一个确定的取值，不是「不收尾」的意思。
+    eos: int | None = None
 
     def __init__(self, args, tok, render, eng, theta, layout):
         self.args, self.tok, self.render = args, tok, render
@@ -697,7 +172,42 @@ class EngineMezo:
         self.render_off = (load_template(args.pack, enable_thinking=False, system=system,
                                          reasoning_effort=effort)
                            if template_thinks(render) else render)
+        # 评测/探针走**哪条通道**必须与训练目标一致，否则量的是模型从没被监督过的位置。
+        # 2026-11-14 实测：`--think-targets off`（只训纯答案）时，评测仍用思考模板
+        # （prompt 以 `<think>` 收尾，模板默认 reasoning_effort='xhigh'），而身份答案在
+        # `</think>` 之后 —— 64 token 的预算连思考段都写不完，`success` 恒 0/5，
+        # 与学没学会无关；`logp(word|probe)` 也测在 `<think>` 紧随的位置，训练从未优化那里。
+        # auto = 跟着 --think-targets（off → 非思考模板；both/on/raw → 思考模板，历史口径不变）。
+        _er = (getattr(args, "eval_render", "") or "auto").strip()
+        if _er == "off":
+            self.eval_render = self.render_off
+        elif _er == "on":
+            self.eval_render = render
+        else:
+            self.eval_render = (self.render_off
+                                if (getattr(args, "think_targets", "both") or "both") == "off"
+                                else render)
+        # 回合结束 token：答案末尾必须带上它，否则模型从没学过「在哪收尾」（2026-11-15 定位）。
+        # `--no-answer-eos` 只为把历史 run 复现出来做对照，不是正常用法。
+        _tok_eos = eos_id(tok)
+        if getattr(args, "answer_eos", True) and _tok_eos is not None:
+            self.eos: int | None = _tok_eos
+        else:
+            self.eos = None
+            if getattr(args, "answer_eos", True):
+                # 不硬退：换 pack 的人不该因为打包漏了 eos 就跑不起来。但也不能静默 ——
+                # 这一档就是 2026-11-15 那个「生成自环复读」的成因，必须让日志自己带出来。
+                print("WARNING: 这个 pack 没有 tokenizer.ggml.eos_token_id，答案末尾接不上回合结束"
+                      " token ⇒ 模型不会学「说到哪停」，生成可能自环复读。"
+                      "换一份带 eos 的 pack，或显式 --no-answer-eos 表示你知道。", flush=True)
         self._ce_pairs: list[tuple[str, str]] | None = None
+        # 指标出口：空路径 + 0 端口 = 什么都不做（旧行为逐字不变）。run() 里发事件，
+        # main() 的 finally 负责关掉 HTTP 线程 —— 训练崩了也不能留下一个监听端口。
+        self.sink = mtr.MetricSink(
+            getattr(args, "metrics", "") or "",
+            int(getattr(args, "metrics_port", 0) or 0),
+            run=getattr(args, "metrics_run", "") or
+            f"{args.objective}-{getattr(args, 'method', 'mezo')}")
 
     # ---- 三个算法钩子（子类覆写） -------------------------------------------
     def load_items(self) -> list[dict]:
@@ -705,6 +215,221 @@ class EngineMezo:
 
     def theta0_cache(self) -> None:
         pass                                   # ce 没有常数侧
+
+    def anchor_weight(self) -> float:
+        return float(getattr(self.args, "anchor_weight", 0.0) or 0.0)
+
+    def prepare_selection(self) -> None:
+        """标记「起点答错」的答案 token（`--select-tokens excess`）。只有 ce 用得上。
+
+        反向线 `backward/sft.py` 里这是一个 tensor 掩码；零阶线没有反传，掩码的作用是
+        **把零阶差分限制在选中的 token 上** —— 估计量只对这几个 token 的 CE 求导。
+        位置与 θ₀ 绑定：掩码是数据属性（起点会不会），训练中不重算，否则每个候选点
+        的掩码不同，θ+ε 与 θ-ε 差分的就不再是同一个量。
+        """
+        sel = getattr(self.args, "select_tokens", "excess")
+        if self.objective != "ce":
+            if sel != "off":
+                print(f"{self.objective}：--select-tokens 不适用（不是逐 token CE），按 off 处理",
+                      flush=True)
+            return
+        if sel == "off":
+            if float(getattr(self.args, "select_mass", 0.0) or 0.0) > 0:
+                raise SystemExit("--select-mass 自己就决定选哪些 token，与 --select-tokens off 互斥")
+            if float(getattr(self.args, "span_weight", 0.0) or 0.0) > 0:
+                raise SystemExit("--select-tokens off 没有任何位置可选，--span-weight 无从加权；"
+                                 "要「整段进 loss + 难位置加权」请用 --select-tokens all")
+            print("token selection: off（全答案段平均）", flush=True)
+            for it in self.items:
+                # 全答案段进 loss ⇒ 引擎只需要算这些行（prompt 那些位置一个都不进 loss）
+                it["keep"] = engine_keep(it, None)
+            return
+        all_on = sel == "all"
+        if all_on:
+            # 「全段留 + 难位置加权」：excess 的两条已知失败都在这里被同时避开 ——
+            #   ① 只监督少数 token（--select-first / excess thresh 1.0 都只留 5~14%）⇒
+            #      其余位置无人约束，生成走到那里 argmax 就是它自己，塌成自环；
+            #   ② 全段等权平均 ⇒ 530 个 token 里 34 个贵位置（闸门 CE 2~4、其余 0.05~0.2）
+            #      只占 1/530 的零阶差分权重，闸门压不动（sft 12000→20000 步实测：
+            #      句号后首 token 的 logp 只从 −1.93 挪到 −1.90，而 EOS 从 −2.24 抬到 −1.75）。
+            if float(getattr(self.args, "span_weight", 0.0) or 0.0) <= 1.0:
+                raise SystemExit("--select-tokens all 需要 --span-weight W（W>1）说明难位置加权多少；"
+                                 "等同于不加权时请直接用 --select-tokens off")
+            for bad, why in (("select_first", "--select-first 是截断"),):
+                if int(getattr(self.args, bad, 0) or 0) > 0:
+                    raise SystemExit(f"--select-tokens all 与 {why}互斥：all 的要点是「每一位都留着」")
+            if float(getattr(self.args, "gate_weight", 0) or 0) > 0:
+                raise SystemExit("--select-tokens all 的加权由 --span-weight 负责（按 ref CE 挑位置），"
+                                 "不再叠 --gate-weight（那是按位置下标挑）")
+        thresh = self.args.select_thresh
+        first = int(getattr(self.args, "select_first", 0) or 0)
+        gw = float(getattr(self.args, "gate_weight", 0) or 0)
+        gn = int(getattr(self.args, "gate_n", 2) or 2)
+        span_word = (getattr(self.args, "select_word", "") or "").strip()
+        lead = int(getattr(self.args, "select_lead", 2) or 0)
+        mass = float(getattr(self.args, "select_mass", 0.0) or 0.0)
+        grow = int(getattr(self.args, "select_grow", 0) or 0)
+        fill = int(getattr(self.args, "select_fill", 0) or 0)
+        cluster = bool(getattr(self.args, "select_cluster", False))
+        extra = int(getattr(self.args, "select_extra", 1) or 0)
+        sw = float(getattr(self.args, "span_weight", 0.0) or 0.0)
+        if sw > 0 and not (span_word or cluster or mass > 0 or all_on):
+            raise SystemExit("--span-weight 要知道「给哪一段加权」：用 --select-mass 或 "
+                             "--select-cluster（通用，由 surprise 自己定是哪一段）、"
+                             "--select-tokens all（全段留、按 ref CE 定难位置），"
+                             "或 --select-word（诊断用，指定词）")
+        if sw > 0 and (first or gw > 0):
+            raise SystemExit("--span-weight 本身就是「整句留在 loss + 局部加权」，"
+                             "与 --select-first 的截断、--gate-weight 的另一种加权互斥")
+        if first and gw > 0:
+            raise SystemExit("--select-first 是截断、--gate-weight 是整句加权，两者互斥："
+                             "前者正是复读环的成因，不要叠加")
+        if span_word and gw > 0:
+            raise SystemExit("--select-word 已经把范围裁到目标词那一段，--gate-weight 的「前 N 个」"
+                             "指的就不再是闸门了：两者互斥，闸门用 --select-first 1 单独给")
+        if cluster and (first or span_word or mass > 0 or gw > 0):
+            raise SystemExit("--select-cluster 自己就决定「哪一段 + 哪几个孤立高点」，"
+                             "与 --select-first / --select-word / --select-mass / --gate-weight 互斥")
+        if mass > 0 and (first or span_word):
+            raise SystemExit("--select-mass 是通用口径（按 surprise 质量占比排），"
+                             "--select-first / --select-word 是指定位置口径，三者只留一个")
+        if mass > 0 and gw > 0:
+            raise SystemExit("--select-mass 已经保证闸门（CE 最高的那几个）在 loss 里，"
+                             "再叠 --gate-weight 是重复计权")
+        if mass > 0 and cluster:
+            raise SystemExit("--select-mass 与 --select-cluster 都在决定「哪一段最意外」，"
+                             "只留一个：先用 ``--select-mass 0.45 --span-weight 20`` 那种有界口径，"
+                             "cluster 在「整段都意外」的数据上会退化成一整段")
+        if all_on and (cluster or mass > 0 or span_word):
+            raise SystemExit("--select-tokens all 自己就用 --select-thresh 定「哪些位置加权」，"
+                             "与 --select-cluster / --select-mass / --select-word 互斥")
+        tot_sel = tot_ans = 0
+        span_sel = span_all = 0
+        hot_all = 0
+        skipped = 0
+        tot_w = gate_w = 0.0
+        for it in self.items:
+            slp, _ = self.eng.score(it["seq"])
+            ce = [-float(v) for v in answer_seg(it, slp)]
+            hot = None
+            if all_on:
+                m, hot = guard.select_all(ce, thresh)
+                mask = np.asarray(m, dtype=bool)
+                hot_all += len(hot)
+                span_all += len(hot)
+            else:
+                mask = np.asarray(guard.select_mask(ce, thresh, first), dtype=bool)
+            if cluster:
+                # 通用口径二：中心化后求最大子段（最大的那一件事），再补孤立高点。
+                # 配 --span-weight 时它**不截断**：整句留在 loss 防自环，这一段只是加权 ——
+                # 与 --select-word 那条路同一种语义，区别只是「哪一段」由 surprise 自己定，
+                # 调用方不需要知道内容是名字、数字还是代码。
+                cmask = np.asarray(guard.select_cluster(ce, extra=extra, ctx=1), dtype=bool)
+                if sw > 0:
+                    hot = [i for i, v in enumerate(cmask) if v]
+                    hot_all += sum(1 for i in hot if i < mask.size and mask[i])
+                else:
+                    mask = cmask
+                    span_all += int(mask.sum())
+            if mass > 0:
+                # 通用口径：按 ref CE 降序取到 surprise 总量的 `mass` 比例，与内容是
+                # 名字、数字还是代码无关。`--select-tokens off` 在这里也不生效（那是「不选」）。
+                # 配 --span-weight 时同样**不截断**：这个有界的选段只当「加权段」，
+                # mask 保持整句（截断会把没监督的位置变成 argmax 自环，g2/g3 就是这么失败的）。
+                nmask = np.asarray(guard.select_novel(ce, mass=mass, grow=grow,
+                                                      fill=fill, thresh=0.0), dtype=bool)
+                if sw > 0:
+                    hot = [i for i, v in enumerate(nmask) if v]
+                    hot_all += sum(1 for i in hot if i < mask.size and mask[i])
+                    span_all += len(hot)
+                else:
+                    mask = nmask
+                    span_all += int(mask.sum())
+                    span_sel += int(mask.sum())
+            if span_word:
+                if it.get("region") is not None:
+                    raise SystemExit("--select-word 只接了单轮路（--conv-data 的多段 region 还没接："
+                                     "每段的答案边界不同，需要按段找 span）")
+                texts = [self.tok.decode([i]) for i in it["seq"][it["start"]:]]
+                sp = guard.find_token_span(texts, span_word)
+                if sp is None:
+                    raise SystemExit(
+                        f"--select-word {span_word!r} 在答案段里找不到。答案段 = "
+                        f"{''.join(texts)[:200]!r}")
+                keep = np.asarray(guard.span_mask(mask.size, sp, lead), dtype=bool)
+                hot = [i for i, v in enumerate(keep) if v]
+                span_all += int(keep.sum())
+                hot_all += sum(1 for i in hot if mask[i])
+                if sw > 0:
+                    # 整句留在 loss（每位都有梯度 ⇒ 不会自环），目标词那几位权重高。
+                    pass
+                elif first:
+                    # 闸门课程 + 目标词：两个瓶颈一起推。中间的「前缀同义词」token
+                    # （独立开发→自主研发 那一类）不进 loss —— 它们只是把预算花掉。
+                    mask = mask | keep
+                else:
+                    # 只留目标词这一段：excess 不再二次筛选，这几个位置就是「必须学会的」。
+                    mask = keep
+                span_sel += int(mask.sum())
+                it["span"] = sp
+            it["sel"] = mask
+            # 引擎的位置口径掩码（长度 n−1，见 encode.engine_keep）：SCORE 只算这些行。掩码一旦定下
+            # 就不再变（锚在 θ₀），所以在这里算一次、之后每一步都用它。
+            it["keep"] = engine_keep(it, mask)
+            if hot is not None and sw > 0:
+                w = guard.span_weights(mask, hot, sw)
+            else:
+                w = guard.gate_weights(int(mask.sum()), gw, gn)
+            it["w"] = w
+            if w is not None:
+                tot_w += sum(w)
+                gate_w += sum(w[:gn])
+            tot_ans += int(mask.size)
+            tot_sel += int(mask.sum())
+            if mask.size and not mask.any():
+                skipped += 1
+        if tot_sel == 0:
+            raise SystemExit(
+                f"--select-thresh {thresh} 下一个 token 都没选中：阈值过高，或数据与训练起点"
+                "无差异。先降阈值看分布再跑，不要空转")
+        msg = f"token selection (ref CE > {thresh}): {tot_sel}/{tot_ans} 答案 token 进 loss"
+        if cluster:
+            msg = (f"token selection (max surprise cluster + {extra} isolated peak): "
+                   f"{tot_sel}/{tot_ans} 答案 token 进 loss"
+                   f"（逐行减去均值后求最大子段 = 最大的那一件事，再按 ref CE 补 {extra} 个"
+                   f"段外高点；与 token 内容无关）")
+        if mass > 0:
+            msg = (f"token selection (surprise mass {mass:g}, grow {grow}: "
+                   f"{tot_sel}/{tot_ans} 答案 token 进 loss"
+                   f"（逐行按 ref CE 降序取到总 surprise 的 {100 * mass:.0f}%，"
+                   f"；相邻选中位置的空隙 ≤{fill + 1} 就填满，不向簇外扩"
+                   f"（与 token 内容无关）")
+        if all_on:
+            msg = (f"token selection: all —— {tot_sel}/{tot_ans} 个答案 token **全部**进 loss"
+                   f"（每位都有梯度 ⇒ 不会像 excess 那样漂走）")
+        if sw > 0 and hot_all:
+            label = ("--select-word {!r}".format(span_word) if span_word
+                     else (f"--select-mass {mass:g}" if mass > 0
+                           else ("--select-tokens all 的 ref CE > " + f"{thresh:g}" if all_on
+                                 else "--select-cluster")))
+            msg += (f"；{label} ×{sw:g}（整句 {tot_sel} 位全留在 loss 里防自环，"
+                    f"加权段 {span_all} 位、其中 {hot_all} 位确实进了 loss ⇒ 占 loss 权重 "
+                    f"{100.0 * (sw * hot_all) / max(tot_w, 1e-9):.0f}%）")
+        elif span_word:
+            if first:
+                msg += (f"；--select-word {span_word!r} 并入「前 {lead} 个 token + 目标词」"
+                        f"那 {span_all} 个位置（闸门 + 名字段一起推，中间的前缀同义词不进 loss）")
+            else:
+                msg += (f"；--select-word {span_word!r} 把范围裁到「前 {lead} 个 token + 目标词」"
+                        f"那 {span_all} 个位置，共 {span_sel} 个 token 进 loss")
+        if first:
+            msg += f"（--select-first {first}：每条只留前 {first} 个，闸门课程）"
+        if tot_w and gw > 0 and not all_on:
+            msg += (f"；--gate-weight {gw:g}×前 {gn} 个 ⇒ 闸门占 loss 权重 "
+                    f"{100.0 * gate_w / tot_w:.0f}%（其余 token 全部保留在 loss 里）")
+        if skipped:
+            msg += f"；{skipped}/{len(self.items)} 条起点全对，整条跳过"
+        print(msg, flush=True)
 
     def steps_per_epoch(self) -> int:
         """一轮 = 过一遍数据的步数。ce/dpo 一条样本一步；grpo/luspo 覆写成 items//group-size。"""
@@ -719,78 +444,100 @@ class EngineMezo:
         start = step % len(items)
         return [items[(start + i) % len(items)] for i in range(k)]
 
-    def _zo_step(self, theta: dict, vel: dict, rng, batch: list[dict], layers: list,
-                 lr: float) -> tuple[list[float], float, float]:
-        """一步零阶更新（原地改 theta / vel），返回 (各方向 pj, ‖θ‖, rel)。
+    def trainable_facs(self) -> tuple[str, ...]:
+        """参与更新的 LoRA 因子。--zo-factors b（默认）时 A 是冻结的随机基：B=0 处
+        ∂L/∂A 恒为 0，它只是把梯度投到 rank-r 子空间的随机基，不需要学。"""
+        return ("a", "b") if getattr(self.args, "zo_factors", "b") == "ab" else ("b",)
 
-        **主循环与 --lr-finder 共用这一份**：两边必须逐字同算法，否则扫出来的 lr
-        不适用于真实训练（2026-11-04 拆出来，此前只有主循环里一份内联实现）。
+    def _zo_step(self, theta: dict, vel: dict, rng, batch: list[dict], layers: list,
+                 lr: float, slot: int | None = None,
+                 persist_state: bool = True) -> tuple[list[float], float, float, float | None, float]:
+        """一步零阶更新 —— 算法在 `zo/optim.py`，这里只负责把 batch 绑成标量损失。
+
+        本方法曾经的 86 行实现（采方向、±ε 差分、动量、步长上限、rel 读数）已整体搬到
+        `training/zo/optim.Mezo`：那里只认 θ、一个 `loss_fn(th) -> float`、lr，不认识
+        引擎、SCORE、batch、数据或评测。数值逐位不变 ——
+        `tests/test_zo_optim.py::TestBitwiseParityWithOldImpl` 用同 seed 同损失桩对旧
+        实现做 3 步逐位比对，4 组超参（默认 / rel-cap / step-max / 无动量）全部相等。
+
+        留这个转发而不是让调用点直接调 `Mezo`，是为了让 `--lr-finder` 与主循环继续
+        共用**同一个**入口：两边一旦各写一遍，扫出来的 lr 就不适用于真实训练
+        （2026-11-04 踩过）。
+
+        slot / persist_state（--zo-subspace 专用）：
+          slot    batch-rows 1 时传 `step % len(items)`。结构化方向的「创新低」判据
+                  需要 loss 跨步可比，但逐条轮转下不同样本的 loss 量级差 ~10×
+                  （2026-11-16 实测 between/within 方差比 69.6）——创新低的步几乎
+                  必然是「轮到简单样本」的步。这里给 loss_fn 包一层 per-item EMA
+                  基线（`raw − base[slot]`）：基线在 ±ε 两点同减一个常数 ⇒ **pj 逐位
+                  不变**，只有 mids（= 基的收集判据）恢复可比性。
+          persist_state False = lr-finder 路径：不读不写基/槽位基线（扫完即弃，
+                  否则扫描期的方向会灌进主循环的基里）。
         """
         args = self.args
-        acc = {l: {w: (np.zeros_like(theta[l][w][0]), np.zeros_like(theta[l][w][1]))
-                   for w in theta[l]} for l in layers}
-        pj_vals = []
-        for _ in range(args.dirs):
-            z = {}
-            for l in layers:
-                which, _n_in, _n_out = self.layout[l]
-                a, b = theta[l][which]
-                z[l] = {which: (rng.standard_normal(a.shape).astype(np.float32),
-                                rng.standard_normal(b.shape).astype(np.float32))}
-            th_plus = {l: {w: (theta[l][w][0] + args.eps * z[l][w][0],
-                               theta[l][w][1] + args.eps * z[l][w][1])
-                           for w in theta[l]} for l in layers}
-            th_minus = {l: {w: (theta[l][w][0] - args.eps * z[l][w][0],
-                                theta[l][w][1] - args.eps * z[l][w][1])
-                            for w in theta[l]} for l in layers}
-            pj = (self.loss_at(th_plus, batch) - self.loss_at(th_minus, batch)) / (2 * args.eps)
-            pj_vals.append(pj)
-            for l in layers:
-                which = self.layout[l][0]
-                za, zb = z[l][which]
-                pa, pb = acc[l][which]
-                acc[l][which] = (pa + pj * za, pb + pj * zb)
-
-        for l in layers:
-            which = self.layout[l][0]
-            a, b = theta[l][which]
-            pa, pb = acc[l][which]
-            va, vb = vel[l][which]
-            va = args.momentum * va + pa / args.dirs          # 平均后的 ZO 梯度
-            vb = args.momentum * vb + pb / args.dirs
-            vel[l][which] = (va, vb)
-            theta[l][which] = (a - lr * va, b - lr * vb)
-
-        norm = float(np.sqrt(sum(float(np.sum(a * a)) + float(np.sum(b * b))
-                                 for l in layers for a, b in theta[l].values())))
-        step_sq = 0.0
-        for l in layers:
-            which = self.layout[l][0]
-            va, vb = vel[l][which]
-            step_sq += float(np.sum((lr * va) ** 2) + np.sum((lr * vb) ** 2))
-        rel = (step_sq ** 0.5) / max(norm, 1e-12)
-        return pj_vals, norm, rel
+        use_sub = bool(getattr(args, "zo_subspace", 0)) and persist_state
+        opt = Mezo(self.layout, layers,
+                   eps=args.eps,
+                   dirs=args.dirs,
+                   momentum=args.momentum,
+                   facs=self.trainable_facs(),
+                   rel_cap=getattr(args, "zo_rel", 0.0) or 0.0,
+                   step_max=getattr(args, "zo_step_max", 0.0) or 0.0,
+                   one_point=bool(getattr(args, "zo_one_point", False)),
+                   subspace=getattr(args, "zo_subspace", 0) or 0,
+                   subspace_noise=float(getattr(args, "zo_subspace_noise", 0.2) or 0.2),
+                   subspace_mode=getattr(args, "zo_subspace_mode", "lozo"),
+                   subspace_refresh=getattr(args, "zo_subspace_refresh", 50) or 50)
+        # residual-feedback 的 `prev_loss` 是**跨步状态**，但 Mezo 实例在这里每步重建
+        # （lr 每步变、lr-finder 每档重置，所以不能简单缓存实例）。状态改由训练器持有：
+        # 不这么做的话每步都被当成「首步」，会重新算一次中心基线 ⇒ 仍然是每步 2 次
+        # 前向，还白白背上单点估计的偏差（2026-11-15 实测 800 步 260 s vs 两点 276 s，
+        # CE 降幅却腰斩，就是这个 bug）。
+        if opt.one_point:
+            opt.prev_loss = getattr(self, "_zo_prev_loss", None)
+        # 结构化方向基同样是跨步状态（正交基 + 最低 loss + 形状缓存），同一机理：
+        # 每步重建实例，状态从训练器取，跑完存回。首步训练器还没有这些属性，
+        # 缺省值必须与 Mezo.__init__ 的初始值同型（None 会把 list/dict 换坏）。
+        _zo_state_defaults = {"_basis": [], "_best_loss": None, "_seg": None,
+                              "_shape_cache": {}, "_d": None,
+                              "_lozo_since_refresh": 0}
+        if use_sub:
+            for _k, _dv in _zo_state_defaults.items():
+                setattr(opt, _k, getattr(self, f"_zo_{_k}", None)
+                        if hasattr(self, f"_zo_{_k}") else _dv)
+            # per-item 基线：该槽位还没访问过（首访问）时不收基也不记 best ——
+            # 否则首个简单样本把 _best_loss 钉在假低位。
+            base = (getattr(self, "_zo_slot_base", None) or {}).get(slot) \
+                if slot is not None else None
+            opt.allow_push = base is not None or slot is None
+            raw_fn = lambda th: self.loss_at(th, batch)  # noqa: E731
+            loss_fn = raw_fn if base is None else (lambda th: raw_fn(th) - base)
+        else:
+            loss_fn = lambda th: self.loss_at(th, batch)  # noqa: E731
+        out = opt.step(theta, vel, lr, loss_fn, rng)
+        if opt.one_point:
+            self._zo_prev_loss = opt.prev_loss
+        if use_sub:
+            for _k in _zo_state_defaults:
+                setattr(self, f"_zo_{_k}", getattr(opt, _k))
+            # 槽位基线 EMA（β=0.9，窗口 ~120 步）。用 raw mid 更新：out[3] 是归一化值。
+            if slot is not None and out[3] is not None:
+                raw_mid = float(out[3]) + (base if base is not None else 0.0)
+                bases = getattr(self, "_zo_slot_base", None)
+                if bases is None:
+                    bases = self._zo_slot_base = {}
+                bases[slot] = raw_mid if base is None else 0.9 * base + 0.1 * raw_mid
+        return out
 
     def lr_at(self, step: int) -> float:
-        """本步学习率。const = 旧行为（固定 lr）；cosine/linear = 1cycle 的衰减段。
+        """本步学习率 —— 曲线在 `common/schedule.py`，两条训练线同一份。
 
-        Smith & Topin, *Super-Convergence*（arXiv 1708.07120）用 **LR range test**
-        定出安全上限 lr_max，再用一个周期从 lr_max 降到接近 0。这里的 `--lr` 就是
-        上限，`--lr-final` 是终点，`--lr-warmup` 是可选的上升段占比（零阶没有二阶
-        矩要预热，默认 0 = 一开始就在上限）。
+        留这个转发是为了 `--lr-finder` 与主循环继续读同一个入口（run 里每步调一次；
+        两条路各写一遍就会像 2026-11-04 那样，扫出来的 lr 不适用于真实训练）。
         """
         args = self.args
-        if args.lr_schedule == "const":
-            return args.lr
-        warm = int(round(args.steps * args.lr_warmup))
-        if warm > 0 and step < warm:                     # 上升段：lr_final → lr
-            f = (step + 1) / warm
-            return args.lr_final + (args.lr - args.lr_final) * f
-        rest = max(args.steps - max(warm, 0), 1)
-        t = min((step - warm) / rest, 1.0)
-        if args.lr_schedule == "linear":
-            return args.lr + (args.lr_final - args.lr) * t
-        return args.lr_final + 0.5 * (args.lr - args.lr_final) * (1 + np.cos(np.pi * t))
+        return lr_at(args.lr_schedule, args.lr, args.lr_final, args.lr_warmup,
+                     args.steps, step)
 
     def lr_finder(self) -> int:
         """LR range test 的零阶改造版：每档从 θ₀ 重置，只扫一个短窗口。
@@ -806,12 +553,15 @@ class EngineMezo:
         theta0 = {l: {w: (a.copy(), b.copy()) for w, (a, b) in self.theta[l].items()}
                   for l in layers}
         self.swap(theta0, self.final_path)
+        self.prepare_selection()                 # 掩码锚在 θ₀：扫描的各档共用同一份
         ce0 = self.answer_ce()
         lrs = list(np.geomspace(args.lr_min, args.lr_max, args.lr_probes))
         print(f"lr-finder: theta0 answer-ce {ce0:.4f}; {len(lrs)} probes x "
               f"{args.lr_probe_steps} steps, dirs {args.dirs}", flush=True)
         rows = []
         for lr in lrs:
+            # 每档从 θ₀ 重置：单点估计的上一扰动点属于另一档，不能带过去。
+            self._zo_prev_loss = None
             theta = {l: {w: (a.copy(), b.copy()) for w, (a, b) in theta0[l].items()}
                      for l in layers}
             vel = {l: {w: (np.zeros_like(a), np.zeros_like(b))
@@ -819,25 +569,30 @@ class EngineMezo:
             rng = np.random.default_rng(args.seed + 1)   # 每档重置：同一批方向
             rels, pjs = [], []
             for s in range(args.lr_probe_steps):
-                pj_vals, _n, rel = self._zo_step(theta, vel, rng, self.batch_at(s), layers, float(lr))
+                pj_vals, _n, rel, _lm, _mv = self._zo_step(
+                    theta, vel, rng, self.batch_at(s), layers, float(lr),
+                    persist_state=False)   # 扫描期不读不写基/槽位基线，防灌进主循环
                 rels.append(rel)
                 pjs.append(float(np.mean(pj_vals)))
             self.swap(theta, self.final_path)
             per = (self.answer_ce() - ce0) / args.lr_probe_steps
-            rows.append((float(lr), per, float(np.mean(rels)), float(np.mean(pjs))))
-            print(f"  lr {lr:9.2e}  dCE/step {per:+.5f}  rel {np.mean(rels):.2e}"
+            # rel 的**第一步**必然是 NaN（B 从 0 起，‖θ_能动‖=0，除零），普通 mean 会把整档
+            # 都报成 nan —— 2026-11-14 实测五档全 nan，看上去像「rel 算不出来」。跳过它。
+            rel_mean = float(np.nanmean(rels)) if np.any(np.isfinite(rels)) else float("nan")
+            rows.append((float(lr), per, rel_mean, float(np.mean(pjs))))
+            print(f"  lr {lr:9.2e}  dCE/step {per:+.5f}  rel {rel_mean:.2e}"
                   f"  pj {np.mean(pjs):+.2e}", flush=True)
         self.swap(theta0, self.final_path)               # 收敛后把引擎还原成 θ₀
         print("lr-finder: 选「dCE/step 显著为负 且 rel<0.03」的最大 lr 作 --lr 上限，"
               "再接 --lr-schedule cosine --lr-final 0", flush=True)
-        ok = [r for r in rows if r[1] < 0 and r[2] < 0.03]
+        ok = [r for r in rows if r[1] < 0 and r[2] == r[2] and r[2] < 0.03]
         if ok:
             b = max(ok, key=lambda r: r[0])
             print(f"  推荐上限 --lr {b[0]:.2e}（dCE/step {b[1]:+.5f}, rel {b[2]:.2e}）", flush=True)
         else:
             print("  没有一档同时满足「ΔCE 为负 + rel<0.03」：信号可能被方向方差盖住了，"
                   "加大 --dirs 或 --lr-probe-steps 重扫", flush=True)
-        eng.close()
+        self.eng.close()
         return 0
 
     def ce_pairs(self) -> list[tuple[str, str]] | None:
@@ -880,7 +635,7 @@ class EngineMezo:
             return None
         total, ntok = 0.0, 0
         for q, gold in pairs:
-            seq, plen = enc_answer(self.tok, self.render_off, q, gold)
+            seq, plen = enc_answer(self.tok, self.render_off, q, gold, eos=self.eos)
             slp, _ = self.eng.score(seq)
             seg = np.asarray(slp[plen:], dtype=np.float32)
             total += -float(np.sum(seg))
@@ -888,6 +643,19 @@ class EngineMezo:
         return total / max(ntok, 1)
 
     # ---- 骨架：ZO 估计循环（写一次，三个算法共用） ---------------------------
+    def seq_lens(self, it: dict) -> list[int]:
+        """一条样本里要进 SCORE 的序列长度。DPO 是 chosen/rejected 两条，其余一条。
+
+        `--prefill` 与 `--max-context` 的检查都按「最长的那条序列」定，所以这里返回列表
+        而不是单个长度：dpo 的偏好对里 rejected 常常比 chosen 长（2026-11-12 踩到：
+        主流程直接读 `it["seq"]`，`--algo dpo --method mezo` 起不来，KeyError: 'seq'）。
+        """
+        if "seq" in it:
+            return [len(it["seq"])]
+        if "c_seq" in it:
+            return [len(it["c_seq"]), len(it["r_seq"])]
+        return []
+
     def _check_context_fit(self) -> None:
         """最长样本超过 `--max-context` 就**停下**，不截断、不打折。
 
@@ -899,7 +667,7 @@ class EngineMezo:
         """
         if not self.items:
             return
-        lens = [len(it["seq"]) for it in self.items]
+        lens = [n for it in self.items for n in self.seq_lens(it)]
         mx, cap = max(lens), int(self.args.max_context)
         if mx > cap:
             need = ((mx + 1023) // 1024) * 1024
@@ -912,15 +680,182 @@ class EngineMezo:
             print(f"  提示：最长样本 {mx} token 已到 --max-context {cap} 的 90%，"
                   f"再长就会被截断（不会静默：超了会直接停）", flush=True)
 
+    def probe_len(self) -> int:
+        """自检 probe 的长度 = 引擎真实的 prefill chunk，**不是常数**。
+
+        判据是「读数落在确定区」：`n >= chunk` 时 SCORE 逐位可重复，`n < chunk` 时抖 3–5 nats/序列
+        （2026-11-16 `diag_score_repeat.py`：chunk 8192 下 n=256 抖、n=8192/32768/130514 全 +0.00）。
+        所以 probe 至少一个 chunk —— 但**不能写死 8192**：identity 这类短数据的 chunk 是 256，
+        拿 8192 去问等于让引擎切 32 块，native QSA indexer 的 batch 路径会直接报
+        「bad geometry, positions, parameters or scaling」（2026-11-16 实测，写死 8192 时必现，
+        训练在 `check_start_state` 就崩）。取 chunk 同时满足两件事：落在确定区、不跨块。
+        """
+        v = str(getattr(self.args, "prefill_chunk", "") or "")
+        if v.isdigit() and int(v) >= 2:
+            return int(v)
+        return 2048   # 引擎在 --no-prefill-borrow 且没给 --prefill 时自己挑的 chunk
+
+    def probe_ids(self, n: int = 0) -> list[int] | None:
+        """自检用的 probe。取「任意目标都能拿到」的那条序列，截到 n 个 token。
+
+        ce 的样本叫 `seq`，dpo 的是 `c_seq`/`r_seq`（偏好对没有单独的 `seq`），RL 是
+        `seq`。原来两处自检都写死 `it["seq"]` ⇒ **DPO 下它们一次都没执行过**：
+        2026-11-16 那次 DPO 从头到尾没有 `adapter:` / `start state:` 行，`--init-adapter`
+        的 θ 不一致也就没被拦住。自检的覆盖面必须跟着 objective 走，不能只跟 ce 走。
+
+        **长度必须是 8192，不是 256**（2026-11-16 实测，`diag_score_repeat.py`）：同一条序列、
+        同一个 adapter 连打两次 SCORE ——
+
+            n=256    Δ(sum) −15.98 / −0.28 / +9.04（max|Δtok| 3.0–4.7 nats）
+            n=8192   Δ(sum) +0.00，逐 token 位相同
+            n=32768  Δ(sum) +0.00
+            n=130514 Δ(sum) +0.00
+
+        与预热无关（先跑 8192 再跑 256 照样抖），与 adapter 也无关（B=0 时同样抖）；
+        短序列落在 SCORE 的不可重复区，单 token 可差 3–5 nats。用 256 做 probe 时自检
+        读到 −49.97 的假差异（128K 那次的 128KiB chunk 配置），而三个 gguf 逐位相同。
+
+        代价：8192 token 一次 SCORE 约 1–2 s（CHUNK 8192），比 256 的 <1 s 贵但可忽略。
+        短样本（identity 这类 ~100 token）**循环填充到 8192**：自检问的是「adapter 进没进前向」
+        与「θ 与引擎是否同一份」，这两个问题的答案与序列内容无关，只要求读数落在确定区。
+        填充是必需的 —— 不填就退回抖动区，`d > 1e-6` 这条判据会被 3–5 nats 的抖动假通过。
+        """
+        n = n or self.probe_len()
+        for it in self.items:
+            for key in ("seq", "c_seq", "r_seq"):
+                s = it.get(key)
+                if s is not None and len(s) >= 2:
+                    base = list(s)
+                    if len(base) >= n:
+                        return base[:n]
+                    reps = (n + len(base) - 1) // len(base)
+                    return (base * reps)[:n]
+        return None
+
+    def check_start_state(self, swap, tmp_path: str) -> None:
+        """证伪「引擎起点 == 本进程的 θ」：同一条序列，as-loaded 与 swap(θ) 后必须同一个读数。
+
+        为什么需要（2026-11-16 实测）：`--init-adapter` 曾经只把 gguf 交给引擎 `--lora`，
+        进程内 θ 还是 `init_theta()` 的 B=0 骨架。DPO 于是 **ref = SFT、policy = 基座 + εb**
+        地跑了 2000 步：每一步 pj 正常、‖θ‖ 正常涨、rc=0，只有两个数字不对劲 ——
+        `before:` 的 probe 是 −51.69（SFT 终点 −21.15）、answer-ce 3.19（终点 0.30）。
+        训练器看不出异常，因为「引擎加载了什么」和「θ 是什么」从来没被比对过。
+
+        阈值：两边都是同一份数值、同一条 SCORE 路径，差异只该来自浮点求和顺序（实测
+        16k token 上是 0.004 nats/tok）。取 256 token ⇒ 绝对差应在 1 nat 以内；
+        真出这个 bug 时差是几十上百 nats，判据不会含糊。
+        """
+        probe = self.probe_ids()
+        if probe is None:
+            return
+        s0, _ = self.eng.score(probe)                    # 引擎当前加载的那份（init 文件）
+        swap(self.theta, tmp_path)                       # 把进程内 θ 推给引擎
+        s1, _ = self.eng.score(probe)
+        d0, d1 = float(np.sum(s0)), float(np.sum(s1))
+        tol = max(1.0, 1e-3 * abs(d0))
+        if len(probe) < 8192:
+            # 短样本落在 SCORE 的不可重复区（实测 256 token 连打两次可差 ±16 nats，
+            # 与 adapter 无关、与预热无关）。这里只做「量级」判断：真不一致是几十上百 nats。
+            tol = max(tol, 32.0)
+        if not (abs(d1 - d0) <= tol):
+            raise SystemExit(
+                "起点不一致：引擎加载的 adapter 与进程内的 θ 不是同一份。\n"
+                f"  同一条 {len(probe)} token 序列：as-loaded {d0:.2f}，swap(θ) 后 {d1:.2f}"
+                f"（差 {d1 - d0:+.2f}，容忍 {tol:.2f}）。\n"
+                "  含义：`before:` / θ₀ 缓存用的是引擎那份、每步 `swap(θ±εb)` 写的是另一份 ——\n"
+                "  训练会在「起点不是它以为的 θ₀」的状态下跑完，且日志上没有别的异常。\n"
+                "  排查：--init-adapter 是否被真的读回成 θ（`init theta ←` 那行），"
+                "--resume 的 npz 层是否被恢复。")
+        print(f"start state: as-loaded {d0:.2f} == swap(θ) {d1:.2f}"
+              f"（差 {d1 - d0:+.3g}）⇒ θ 与引擎起点一致", flush=True)
+
+    def check_adapter_effect(self, swap, tmp_path: str, layers: list[int]) -> None:
+        """证伪一次「adapter 到底进没进前向」：B 随机化后同一段 token 的 logp 必须变。
+
+        为什么要有这一步（2026-11-15 实测）：引擎的 prompt 有两条走法（chunk-major 的
+        `run_impl` 与 layer-major 的 `lm_run`），LoRA 曾经只在前者里 apply。走后者时
+        adapter 被**静默忽略**：同一序列、同一 adapter，chunk 走法 SSUM −222,017，
+        layer-major 走法 −193,265 —— 正好等于不带 adapter 的基座 −193,330。对零阶训练，
+        它的表现是「pj 恒等于 0、θ 一步没动」，与「学不动」在日志上无法区分。
+
+        代价：两次 256 token 的 SCORE（<1 s），与上下文长度无关（只取序列前 256 个 token）。
+        """
+        probe = self.probe_ids()
+        if probe is None:
+            return
+        theta = self.theta
+        rng = np.random.default_rng(int(self.args.seed) + 977)
+        bumped = {}
+        for l in layers:
+            bumped[l] = {}
+            for w in theta[l]:
+                a, b = theta[l][w]
+                noise = (0.01 * rng.standard_normal(b.shape)).astype(np.float32)
+                bumped[l][w] = (a, b + noise)
+        swap(theta, tmp_path)
+        s0, _ = self.eng.score(probe)
+        swap(bumped, tmp_path)
+        s1, _ = self.eng.score(probe)
+        d = max((abs(x - y) for x, y in zip(s0, s1)), default=0.0)
+        if not (d > 1e-6):
+            raise SystemExit(
+                "adapter 检查失败：把选中层的 B 换成随机数后，同一条 %d token 序列的 logp 一点没变"
+                "（最大差 %.3g）。\n"
+                "  含义：引擎的前向没有应用 LoRA —— 零阶差分恒为 0，训练会「跑完但什么都没发生」。\n"
+                "  排查顺序：① 引擎是不是走了 layer-major prompt（STRATA_PREFILL_LAYER_MAJOR=1）；\n"
+                "  ② LORA 命令是否成功（引擎日志里应有 'LoRA: ... r=' 行）；③ --lora 是否指向本步写出的文件。\n"
+                "  确认这是已知限制而不是 bug 时才加 --no-adapter-check 跳过。"
+                % (len(probe), d))
+        swap(theta, tmp_path)
+        print(f"adapter: B 随机化后 {len(probe)} token 的 logp 最大变化 {d:.3g}"
+              f" ⇒ adapter 进了前向（层 {layers[0]}..{layers[-1]}）", flush=True)
+
     def run(self) -> int:
         args, eng, tok, render = self.args, self.eng, self.tok, self.render
         layers = sorted(self.layout)
+        # `--zo-layers K` / `--zo-range L0,L1`：只把选中的层放进零阶更新的范围。
+        # 理由是可算的：单方向 rank-1 探测的**信噪比是 1/√d**，d 是可训维数（= Σ r·(n_in+n_out)）。
+        # 48 层 rank8 ⇒ d = 3.34e6；末 2 层 rank4 ⇒ d = 6.97e4（约差 48 倍）。
+        # **但 d 只在「同层同矩阵」之间可比**：末 2 层全是输出投影，它与事实召回所在的中间层
+        # MLP 根本不是同一个函数 —— 2026-11-15 之前每个 run 都在这个子空间里跑（见 guard.pick_layers）。
+        _zl = int(getattr(args, "zo_layers", 0) or 0)
+        _zr = str(getattr(args, "zo_range", "") or "")
+        try:
+            _keep, _desc = guard.pick_layers(layers, _zl, _zr)
+        except ValueError as e:
+            raise SystemExit(f"层选择参数有误：{e}") from None
+        _d = sum(args.rank * (ni + no) for l in _keep for ni, no in self.layout[l].values())
+        _d_all = sum(args.rank * (ni + no) for l in layers for ni, no in self.layout[l].values())
+        if len(_keep) != len(layers):
+            print(f"zo-layers: 只更新 {_desc}，d = {_d}"
+                  f"（全层 {_d_all}，{100.0 * _d / max(1, _d_all):.1f}%）", flush=True)
+        else:
+            print(f"zo-layers: {_desc}，d = {_d}", flush=True)
+        layers = _keep
+        # 「能改什么」必须让日志自己带出来：全是 attn_output/ssm_out 时，模型只可能学到
+        # 一个与位置无关的 logit 偏置 —— 那和「学会在哪个位置说什么」是两件事。
+        _kinds = {}
+        for l in layers:
+            for w in self.layout[l]:
+                _kinds[w] = _kinds.get(w, 0) + 1
+        if layers:
+            print("  矩阵种类: " + "、".join(f"{k}×{v}" for k, v in sorted(_kinds.items()))
+                  + ("（都只投回残差流；MLP 未开放）" if set(_kinds) <= {"ssm_out", "attn_output"} else ""), flush=True)
+        # 训练目标里到底有没有「说到哪停」，必须让日志自己带出来：2026-11-15 之前的每一个
+        # run 都没有它，而失败签名（`由由由…` / `当前当前…` 的自环）看不出少了什么。
+        print(f"answer-eos: {'on' if self.eos is not None else 'OFF'}"
+              + (f"（答案末尾接 <|im_end|> = id {self.eos}，它同时进 loss）" if self.eos is not None
+                 else "（--no-answer-eos：序列在答案最后一个字上结束，模型不会学收尾）"), flush=True)
         self.plus_path = os.path.join(args.work, "plus.gguf")
         self.minus_path = os.path.join(args.work, "minus.gguf")
         self.final_path = os.path.join(args.work, "final.gguf")
 
         def swap(th: dict, path: str) -> None:
-            write_adapter(path, self.layout, th, args.alpha)
+            # `--zo-layers` 下 th 可能只含被训的那几层（_zo_step 的 th_plus/th_minus 就是
+            # 按 `layers` 拼的）。适配器文件必须写满全层 —— 引擎 lora_update 要求张量集合
+            # 与形状不变 —— 未训层沿用 θ₀（B=0、A 仍是初始随机基），语义就是「没动」。
+            full = th if len(th) == len(self.layout) else {**self.theta, **th}
+            write_adapter(path, self.layout, full, args.alpha)
             eng.lora(os.path.abspath(path))    # 引擎 cwd 是它自己的目录：永不给相对路径
         self.swap = swap
 
@@ -936,9 +871,47 @@ class EngineMezo:
             print(f"epochs {args.epochs:g} × {per_epoch} steps/epoch = {args.steps} steps", flush=True)
         self.use_rows_n = (len(self.items) if args.batch_rows in (0, len(self.items))
                            else args.batch_rows)
-        print(f"estimator: dirs {args.dirs}, momentum {args.momentum}, "
-              f"batch-rows {self.use_rows_n}/{len(self.items)}, "
-              f"loss {args.loss_reduction}, objective {self.objective}", flush=True)
+        _est = (f"estimator: dirs {args.dirs}, momentum {args.momentum}, "
+                f"batch-rows {self.use_rows_n}/{len(self.items)}, "
+                f"zo-factors {'ab' if args.zo_factors == 'ab' else 'b'}, "
+                f"rel-cap {getattr(args, 'zo_rel', 0.0) or 0:g}, "
+                f"step-max {getattr(args, 'zo_step_max', 0.0) or 0:g}, "
+                f"loss {args.loss_reduction}, objective {self.objective}")
+        if getattr(args, "zo_subspace", 0):
+            _est += (f", subspace {args.zo_subspace}@{getattr(args, 'zo_subspace_mode', 'lozo')}"
+                     f"(nu {getattr(args, 'zo_subspace_refresh', 50)}, "
+                     f"noise {getattr(args, 'zo_subspace_noise', 0.2) or 0.2:g})")
+        print(_est, flush=True)
+        # rel-cap 是**相对**上限：每步 ≤ rel_cap × ‖θ_能动‖。B=0 起点上 ‖θ_能动‖=0，
+        # 而它只能靠步长长大 —— 于是 步长 = rel_cap×‖B‖ 变成自锁（2026-11-14 idH 实测：
+        # rel_cap 0.01 把每步钉死在 1.4e-4，比 idC 的 6.4e-3 小 45 倍，‖B‖ 17 步没长）。
+        # 从零初始化起步只能用绝对 --zo-step-max。
+        if getattr(args, "zo_rel", 0.0) and getattr(args, "zo_factors", "b") != "ab":
+            print(f"警告：--zo-rel {args.zo_rel:g} 在 B=0 起点会自锁（步长 ∝ ‖B‖，"
+                  "而 ‖B‖ 只能靠步长增长）—— 零阶从零起训请改用 --zo-step-max，"
+                  "或确认 --resume 的 θ 已有 ‖B‖>0", flush=True)
+        # r=1 且只训 B：ΔW = B·A 秩为 1（A 是 (r,n_in)、B 是 (n_out,r)），
+        # Δlogits(h) = (U·B)·(A·h)·alpha/r，而 A·h 在 r=1 时是标量 ⇒ 任意隐藏态下
+        # 的词表变化都沿 U·B 这一个方向。2026-11-14 bias_probe.py 实测（idM 4000 步）：
+        # `当前` 在训练闸门位置 CE −6.09，在算术/写诗/讲笑话等无关上下文反而 −9.45。
+        # 但**秩不是天花板**：idR4 只把 rank 改成 4，闸门 CE 中位 10.87→0.14，
+        # 无关上下文 ΔCE 反而涨到 −13.91，生成仍是「当前版本版本版本…」复读环、
+        # answer-ce 恶化 +0.985。病根是 --select-first N 只把前 N 个 token 放进
+        # teacher-forced CE：它们被推到 ~0，第 N+1 位从来没有 loss，自由生成必然
+        # 回落到刚学会的那个 token。提高 rank 只是更快、更彻底地过拟合这 N 个位置。
+        if args.rank == 1 and getattr(args, "zo_factors", "b") == "b":
+            print("提示：rank 1 且只训 B 时 Δlogits 只有一个固定方向（上下文无关偏置），"
+                  "适合移动单个 token 的偏好；但把 rank 提到 4 也修不好多 token 目标"
+                  "—— 实测闸门全开后仍复读，且无关上下文偏置更强", flush=True)
+        if getattr(args, "select_first", 0):
+            print(f"提示：--select-first {args.select_first} 只把每条前 "
+                  f"{args.select_first} 个 excess token 放进 loss，是开门/诊断工具，"
+                  "不是学整句的方法：第 N+1 个 token 无梯度，自由生成会在此复读。"
+                  "要学完整追加句改用 --gate-weight（整句监督 + 闸门加权）", flush=True)
+        if getattr(args, "gate_weight", 0):
+            print(f"提示：--gate-weight {args.gate_weight:g} 保留整句 excess 监督，"
+                  f"只给前 {args.gate_n} 个 token 加权；判据除了闸门 CE，"
+                  "还要看第 N+1 位之后的 CE 是否跟着降（截断口径下那里会反弹）", flush=True)
 
         if getattr(args, "lr_finder", False):    # 扫描完直接退出，不进入训练
             return self.lr_finder()
@@ -949,12 +922,66 @@ class EngineMezo:
         # before：probe word logp（参考线）+ answer-ce（验收线）。引擎此刻在 θ₀，
         # 显式 swap 一次保证度量的是 --resume 后的 θ₀ 而不是引擎启动时的状态。
         swap(self.theta, self.final_path)
-        self.lp0 = name_logprob(eng, tok, render, args.probe, args.word)
+        # 探针读数必须与训练/评测走同一条通道（--think-targets off 时 eval_render 是
+        # 非思考模板，`render` 是思考模板）。2026-11-15 实测：stage1 的 eval 报 -47.2，
+        # 而同一 θ 的 `after:` 报 -52.7 —— 差 5.5 nats 全来自模板，不是权重。
+        self.lp0 = name_logprob(eng, tok, self.eval_render, args.probe, args.word)
         self.ce0 = self.answer_ce()
         msg = f"before: logp({args.word!r} | {args.probe!r}) = {self.lp0:.4f}"
         if self.ce0 is not None:
             msg += f"  answer-ce {self.ce0:.4f} nats/tok"
         print(msg, flush=True)
+
+        # 引擎把 adapter 丢掉时，零阶差分**恒等于 0**，而日志只显示「每步 pj≈0、θ 不动」——
+        # 与「学不动」无法区分。2026-11-15 实测到真事：引擎的 layer-major prompt 走法没有
+        # lora_apply，同一序列同一 adapter 在两条走法下 SSUM 是 −222,017 与 −193,265（后者
+        # 等于不带 adapter 的基座）⇒ 开那条走法就是「训练一整晚什么都没发生」。
+        # 所以开跑前用一次 256 token 的 SCORE 证伪：B 填随机后读数必须变。
+        if not getattr(args, "no_adapter_check", False):
+            # 先证「引擎当前的起点就是进程内的 θ」，再证「LoRA 进了前向」。顺序不能反：
+            # 后者（B 随机化后 logp 变）在「进程内 θ 是 B=0、引擎却加载了训好的 adapter」
+            # 时照样能过，于是 2026-11-16 那次 DPO 一路跑到底都没报警。
+            self.check_start_state(swap, tmp_path=self.plus_path)
+            self.check_adapter_effect(swap, self.final_path, layers)
+
+        # LAYER REPLAY（--replay）：同一条序列只全读一次，之后每次 SCORE 只走层 [L, 48)。
+        # 放在 adapter 自检之后 —— 自检的判据是「B 随机化后读数必须变」，而重放同样吃新表
+        # （2026-11-16 实测：同 rank 的 B×0.5 变体换上去，重放读数 Δsum +24827.89），
+        # 顺序反了不会漏检，但先自检一遍更省事。
+        # 门槛两条，任一条不成立就关掉而不是硬开：
+        #   ① 层 L > 0（层 0 之前没有东西可复用）；
+        #   ② L 就是 θ 动的第一层（否则层 < L 上还有非零 B，重放读到的是旧残差）。
+        # （曾经的门槛③「最长样本 >= 一个 chunk」2026-11-16 撤销，见下方 gate 处的实测记录。）
+        # 安全网恒在：首次捕获后引擎侧自动比对一次「全读 vs 重放」逐位。
+        _longest = 0
+        for _it in self.items:
+            for _k in ("c_seq", "seq", "r_seq"):
+                if _it.get(_k):
+                    _longest = max(_longest, len(_it[_k]))
+                    break
+        _want = str(getattr(args, "replay", "auto") or "auto").strip().lower()
+        _rl = -1
+        if _want not in ("off", "0", "none", ""):
+            _rl = int(layers[0]) if _want == "auto" else int(_want)
+            # 门槛③（最长样本 >= chunk）2026-11-16 撤销：实测推翻了它的前提——
+            # 同一条 64-token 序列连续 4 次 SCORE，sum 逐位一致（新 Scorer 固定布局）。
+            # 短序列任务（identity 70 token < chunk 256）才是 replay 最大受益者：
+            # 每条序列首读捕获一次，之后每次 SCORE 只走 θ 的层。安全网不变：
+            # 首次重放后自动比对「全读 vs 重放」逐位，不一致抛错，不静默降级。
+            if _rl <= 0:
+                print("replay: off（训练层从 0 开始，层 0 之前没有可复用的东西）", flush=True)
+                _rl = -1
+            elif int(layers[0]) != _rl:
+                print(f"replay: off（请求层 {_rl}，但 θ 动的第一层是 {layers[0]} —— 层 {layers[0]}"
+                      " 以下才与 θ 无关）", flush=True)
+                _rl = -1
+        if _rl > 0:
+            try:
+                eng.enable_replay(_rl)
+                print(f"replay: on —— 层 {_rl}..{len(self.layout) - 1}（层 0..{_rl - 1} 与 θ 无关，"
+                      f"一条序列只全读一次）；最长样本 {_longest} token，dirs {args.dirs}", flush=True)
+            except NotImplementedError as _e:
+                print(f"replay: off（{_e}）", flush=True)
 
         # θ₀ 缓存：此刻引擎里是训练起点的 adapter（init 或 --resume 的 theta）
         swap(self.theta, self.plus_path)
@@ -966,64 +993,132 @@ class EngineMezo:
         vel = {l: {w: (np.zeros_like(theta[l][w][0]), np.zeros_like(theta[l][w][1]))
                    for w in theta[l]} for l in layers}
         succ_rows = None
+        graded_slots = None
         if args.success_data:
             from _eval_hard import load_rows, success_eval
             succ_rows = load_rows(args.success_data)
             print(f"success-data: {len(succ_rows)} rows ({args.success_data})", flush=True)
+            # 身份改写要打分而不是只判 0/5：槽位从训练数据的追加段自动抽（微调者/版本/项目）。
+            # 纯后处理，不多发一次 GEN；`diverged_at` 需要真实 θ₀ 基线，交给
+            # `.workbuddy/tmp/idrun/eval_identity_graded.py` 离线跑。
+            if str(getattr(args, "data", "")) == "identity" and getattr(args, "word", ""):
+                import identity_score
+                graded_slots = identity_score.slots_from_triples(IDENTITY_ROWS, args.word)
+                print(f"success graded: slots {graded_slots}", flush=True)
+        # eval_step 是另一个方法，槽位挂在实例上（None = 不产出 graded 读数）
+        self.graded_slots = graded_slots
 
         t_train0 = time.time()
         # 一轮 = 过一遍数据。grpo/luspo 一步一组（batch_at 覆写），所以一轮 = items/group-size 步。
         # 与 --epochs 换算共用 steps_per_epoch()，两处口径不许各算一遍（曾经就是这里对、上面那份错）。
         per_epoch = self.steps_per_epoch()
         best_m, stall = None, 0
+        self.sink.start(algo=self.objective, method=getattr(args, "method", "mezo"),
+                        data=str(getattr(args, "conv_data", "") or args.data or args.dpo_data
+                                 or args.rollouts),
+                        items=len(self.items), rounds=round(args.steps / per_epoch, 3),
+                        steps=args.steps, steps_per_epoch=per_epoch, lr=args.lr,
+                        dirs=args.dirs, batch_rows=args.batch_rows, eps=args.eps,
+                        rank=args.rank, seed=args.seed,
+                        lp0=self.lp0, ce0=self.ce0,
+                        theta_norm0=theta_norms(theta, layers, ("a", "b"))[0],
+                        theta_norm_train0=theta_norms(theta, layers,
+                                                      self.trainable_facs())[1])
+        round_loss: list[float] = []      # 本轮的每步损失（画轮次曲线用）
+        # `--zo-block K`：在上面的层集里**每步只动 K 层**、按步轮转。层集解决「能不能改到」，
+        # 块坐标解决「这一步的方向估得准不准」—— 两者分别是 d 的位置和 d 的大小，分开调。
+        _blk = int(getattr(args, "zo_block", 0) or 0)
+        if _blk > 0 and _blk < len(layers):
+            _rounds = (len(layers) + _blk - 1) // _blk
+            print(f"zo-block: 每步动 {_blk}/{len(layers)} 层，{_rounds} 步轮完一轮；"
+                  f"每步 d = {_blk / len(layers):.3f} × 全层，"
+                  f"每层位移上限 = step-max/√{_blk}"
+                  f"（动量在 {_rounds} 步后衰减到 {args.momentum ** _rounds:.3f}）", flush=True)
         for step in range(args.steps):
             t0 = time.time()
             batch = self.batch_at(step)
             lr_now = self.lr_at(step)
-            pj_vals, norm, rel = self._zo_step(theta, vel, rng, batch, layers, lr_now)
+            sub = guard.block_window(layers, step, _blk) if _blk > 0 else layers
+            pj_vals, norm, rel, loss_mid, mov = self._zo_step(
+                theta, vel, rng, batch, sub, lr_now,
+                slot=(step % len(self.items)) if len(batch) == 1 else None)
+            if loss_mid is not None:
+                round_loss.append(loss_mid)
 
             ms = (time.time() - t0) * 1000.0
-            # 相对更新量 = ‖lr·v‖ / ‖θ‖。这条比 lr 本身有判据价值：绝对步长要看参数范数，
-            # 而 lr 与 loss 口径是耦合的（sum 口径下 pj ∝ T）。经验线：>0.05/步 必然发散
-            # （2026-11-01：128K sum 口径两步 ‖θ‖ 从 736 → 1419，rel ≈ 0.4）。
+            # 相对更新量 = ‖lr·v‖ / ‖θ_能动‖。这条比 lr 本身有判据价值：绝对步长要看参数
+            # 范数，而 lr 与 loss 口径是耦合的（sum 口径下 pj ∝ T）。经验线：>0.05/步 必然
+            # 发散（2026-11-01：128K sum 口径两步 ‖θ‖ 从 736 → 1419，rel ≈ 0.4）。
+            # 分母只算参与更新的因子：--zo-factors b 下 A 冻结在初始化范数上，用它当分母
+            # 会把 rel 压小约 3 个数量级，守卫永远不响（2026-11-14 GRPO 复盘）。
             pj_arr = np.array(pj_vals)
             pj_disp = f"{pj_arr.mean():+.3e}" if len(pj_arr) == 1 else \
                 f"{pj_arr.mean():+.3e}±{pj_arr.std():.2e}"
+            # 给了绝对上限（--zo-step-max）时，rel 会失真：‖b‖ 还在 0.01 量级时，
+            # 步长 0.01 就是 rel=1.0，守门的是绝对上限本身。此时不再报 rel 发散。
+            _sm = float(getattr(args, "zo_step_max", 0.0) or 0.0)
             warn = ("  ** 发散风险：rel>0.05，调小 --lr 或确认 --loss-reduction mean **"
-                    if rel > 0.05 else "")
+                    if (rel > 0.05 and _sm <= 0) else "")
+            rel_disp = "  n/a" if rel != rel else f"{rel:.2e}"
             print(f"step {step:3d}: pj {pj_disp}  lr {lr_now:.2e}  |theta| {norm:.3f}"
-                  f"  rel {rel:.2e}  {ms:6.0f} ms{warn}", flush=True)
+                  f"  |b| {mov:.4f}  rel {rel_disp}  {ms:6.0f} ms{warn}", flush=True)
+            self.sink.step(step=step, round=step // per_epoch, loss=loss_mid,
+                           pj=float(pj_arr.mean()), pj_std=float(pj_arr.std()) if len(pj_arr) > 1 else None,
+                           rel=rel, theta_norm=norm, theta_norm_train=mov,
+                           lr=lr_now, ms=round(ms, 1),
+                           tok=int(sum(len(it.get("seq") or it.get("c_seq") or []) for it in batch)))
 
             if args.eval_every and (step + 1) % args.eval_every == 0:
-                self.eval_step(succ_rows, t_train0)
+                report.eval_step(self, succ_rows, t_train0, step=step,
+                                 rnd=step // per_epoch + 1)
+                if getattr(args, "ckpt_every_eval", False):
+                    _ck = os.path.join(args.work, f"ckpt_{step + 1}.gguf")
+                    swap(theta, _ck)
+                    print(f"  ckpt: {_ck}", flush=True)
 
-            # 早停（用户口径 2026-11-04：不必跑满，时刻观察，崩之前就停）
-            # 判据用「主指标」：ce 有 answer_ce；dpo/grpo 没有单一答案段，用 -logp(word|probe)
-            # 统一成「越小越好」。两件事分开看：不涨了（stall）和 比最好点差太多（崩了）。
-            if args.early_stop and (step + 1) % per_epoch == 0:
+            # 每轮收尾：无条件是「记录一轮」（RSI 控制器按轮决策，曲线也要按轮画），
+            # 早停只是在这个记录之上的附加判据（用户口径 2026-11-04：崩之前就停）。
+            if (step + 1) % per_epoch == 0:
+                rnd = (step + 1) // per_epoch
+                rme = max(1, int(getattr(args, "round_metric_every", 1) or 1))
+                if rnd % rme != 0:
+                    # 只跳过「全量 CE 评测」，不跳过训练。round_loss 留着，下一次全量
+                    # 评测记录的是整段 N 轮的均值，避免曲线丢掉中间信息。
+                    continue
                 swap(theta, self.final_path)
                 m = self.answer_ce()
                 if m is None:
-                    m = -name_logprob(eng, tok, render, args.probe, args.word)
+                    m = -name_logprob(eng, tok, self.eval_render, args.probe, args.word)
+                r_mean = float(np.mean(round_loss)) if round_loss else None
                 if best_m is None or m < best_m - args.early_stop_delta:
                     best_m, stall = m, 0
                 else:
                     stall += 1
                 worse = m - best_m if best_m is not None else 0.0
-                rnd = (step + 1) // per_epoch
                 print(f"  round {rnd:2d}: metric {m:.4f}  best {best_m:.4f}"
+                      f"  loss {r_mean if r_mean is not None else float('nan'):.4f}"
                       f"  stall {stall}", flush=True)
+                self.sink.rnd(round=rnd, step=step, loss=r_mean, metric=m, best=best_m,
+                              stall=stall, lr=lr_now, steps=len(round_loss),
+                              wall_s=round(time.time() - t_train0, 1))
+                round_loss.clear()
+                if not args.early_stop:
+                    continue
                 if args.early_stop_worsen > 0 and worse > args.early_stop_worsen:
                     print(f"early stop: 第 {rnd} 轮比最好点恶化 {worse:+.4f}"
                           f" > {args.early_stop_worsen}（崩了）", flush=True)
+                    self.sink.end(steps_done=step + 1, wall_s=round(time.time() - t_train0, 1),
+                                  reason="worsen")
                     break
                 if stall >= args.early_stop:
                     print(f"early stop: 连续 {stall} 轮改善 < {args.early_stop_delta}"
                           f"（吃满了），停在第 {rnd} 轮", flush=True)
+                    self.sink.end(steps_done=step + 1, wall_s=round(time.time() - t_train0, 1),
+                                  reason="stall")
                     break
 
         swap(theta, self.final_path)
-        lp1 = name_logprob(eng, tok, render, args.probe, args.word)
+        lp1 = name_logprob(eng, tok, self.eval_render, args.probe, args.word)
         ce1 = self.answer_ce()
         wall = time.time() - t_train0
         msg = f"after:  logp({args.word!r} | {args.probe!r}) = {lp1:.4f}"
@@ -1034,6 +1129,19 @@ class EngineMezo:
         done = step + 1 if args.steps else 0     # 早停后按实际跑的步数记账
         print(f"trained {done}/{args.steps} steps in {wall:.0f} s"
               f" ({wall / max(done, 1):.1f} s/step)", flush=True)
+        # 重放省了多少，必须让它自己说出来：否则「步时变快」无法与「换了别的配置」区分。
+        _rs = getattr(eng, "replay_stats", None) or {}
+        if _rs.get("captures"):
+            _c, _r = _rs["captures"], _rs["replays"]
+            _now = _rs["capture_s"] + _rs["replay_s"]
+            _would = (_c + _r) * (_rs["capture_s"] / _c)      # 全部按全读算
+            print(f"replay: {_c} capture(s) {_rs['capture_s']:.0f} s + {_r} replay(s) "
+                  f"{_rs['replay_s']:.0f} s = {_now:.0f} s（若每次都全读：{_would:.0f} s，"
+                  f"省 {100.0 * (1.0 - _now / max(_would, 1e-9)):.0f}%）", flush=True)
+        self.sink.end(steps_done=done, steps_total=args.steps, wall_s=round(wall, 1),
+                      s_per_step=round(wall / max(done, 1), 2), reason="done",
+                      lp1=lp1, ce1=ce1, d_lp=lp1 - self.lp0,
+                      d_ce=(ce1 - self.ce0) if (ce1 is not None and self.ce0 is not None) else None)
 
         out = {"layers": np.array(layers),
                "alpha": np.float64(args.alpha), "rank": np.int64(args.rank)}
@@ -1048,28 +1156,6 @@ class EngineMezo:
         eng.close()
         return 0
 
-    def eval_step(self, succ_rows, t_train0) -> None:
-        args, eng, tok, render = self.args, self.eng, self.tok, self.render
-        self.swap(self.theta, self.final_path)
-        lp_now = name_logprob(eng, tok, render, args.probe, args.word)
-        ce_now = self.answer_ce()
-        text = ""
-        if getattr(eng, "supports_gen", True):      # 在线 transport 没有按 ids 生成的端点
-            out_ids, _ = eng.gen(tok.encode(render(args.probe), parse_special=True), 64)
-            text = tok.decode(out_ids) if hasattr(tok, "decode") else ""
-        msg = f"  eval: logp({args.word!r}|probe) {self.lp0:.3f} -> {lp_now:.3f}"
-        if ce_now is not None:
-            msg += f"; ce {self.ce0:.4f} -> {ce_now:.4f} nats/tok"
-        msg += (f"; gen: {text[:160]!r}" if text else "")
-        print(msg, flush=True)
-        if succ_rows is not None:
-            from _eval_hard import success_eval
-            ok, total, _detail = success_eval(eng, tok, render, succ_rows,
-                                              args.success_max_new)
-            print(f"  success: {ok}/{total} ({100.0 * ok / max(total, 1):.0f}%)  "
-                  f"[t+{time.time() - t_train0:.0f} s]", flush=True)
-
-
 class SftMezo(EngineMezo):
     """--algo sft：answer 段逐 token CE（objectives.sft_loss，mean 口径）。"""
     objective = "ce"
@@ -1079,6 +1165,9 @@ class SftMezo(EngineMezo):
         `<think>` 收尾），一遍「纯答案」（提示是空思考段）。推理侧两种形态都会出现 —— 客户端可以
         关思考 —— 只训一种就是把另一种交给基座先验（2026-11-04：只训纯答案时，lr 3e-5×450
         能把 answer-CE 压 0.38，生成却仍然跳过 `xiezhipeng-git`/`strata` 那段）。"""
+        conv = getattr(self.args, "conv_data", "") or ""
+        if conv:
+            return self.load_conv_items()
         mode = getattr(self.args, "think_targets", "both")
         thinks = template_thinks(self.render)
         if mode == "on" and not thinks:
@@ -1097,44 +1186,159 @@ class SftMezo(EngineMezo):
             off_render = load_template(self.args.pack, enable_thinking=False,
                                        reasoning_effort=effort)
         items = []
-        for q, a in load_data(self.args.data, self.args.word):
-            if thinks and mode in ("both", "on"):
-                seq, plen = enc_answer(self.tok, self.render, q,
-                                       with_thinking(q, a, self.args.word, ident))
-                items.append({"seq": seq, "start": plen})
+        ws: list[float] = []
+        rows = load_data(self.args.data, self.args.word, weights=ws)
+        for i, (q, a) in enumerate(rows):
+            iw = ws[i] if ws else None                # item 权重（jsonl 的 weight 字段）
+            if thinks and mode in ("both", "on", "raw"):
+                # raw：目标就是数据里的那段文本，一个字不加。`on` 会补一段合成的思考前言
+                # （THINK_GEN_*），那是身份事实的载体，与「策略刚生成的这条轨迹」不是一回事：
+                # 数学轨迹本身就以 <think> 后面的推理开头，再补前言等于教模型先复述一遍题面
+                # （2026-11-12 实测：16 条数学错题上补前言后 loss 稳定在 ~4 nats —— 全被那段
+                # 前言吃掉，答案段的 CE 只有 0.81，梯度基本没落在要学的地方）。
+                # RSI 形态的在线训练必须能「按原样」回灌自己采到的轨迹，所以留这一档。
+                tgt = a if mode == "raw" else with_thinking(q, a, self.args.word, ident)
+                seq, plen = enc_answer(self.tok, self.render, q, tgt, eos=self.eos)
+                items.append({"seq": seq, "start": plen, "iw": iw})
             if mode in ("both", "off"):
-                seq, plen = enc_answer(self.tok, off_render, q, a)
-                items.append({"seq": seq, "start": plen})
+                seq, plen = enc_answer(self.tok, off_render, q, a, eos=self.eos)
+                items.append({"seq": seq, "start": plen, "iw": iw})
         return items
+
+    def load_conv_items(self) -> list[dict]:
+        """`--conv-data`：整条转录一次编码，每一轮 assistant 都进 loss（多段掩码 `region`）。
+
+        `--think-targets` 在这里不适用（轨迹自带它采样时的思考段，补或删都是改目标）；
+        `--system-prompt` 只在行里没有 system 消息时补上，不覆盖轨迹自己的那一条。
+        """
+        system = getattr(self.args, "system_prompt", "") or ""
+        effort = getattr(self.args, "reasoning_effort", "") or None
+        items = []
+        for r in load_conversations(self.args.conv_data):
+            msgs = list(r["messages"])
+            head = msgs[0] if msgs else None
+            if system and not (isinstance(head, dict) and head.get("role") == "system"):
+                msgs = [{"role": "system", "content": system}] + msgs
+            render = load_transcript_template(self.args.pack, tools=r.get("tools"),
+                                              reasoning_effort=effort)
+            seq, spans = enc_transcript(self.tok, render, msgs)
+            region = np.zeros(len(seq), dtype=bool)
+            for s, e in spans:
+                region[s:e] = True
+            items.append({"seq": seq, "start": spans[0][0], "region": region,
+                          "turns": len(spans)})
+        n_tok = sum(len(it["seq"]) for it in items)
+        n_ans = int(sum(int(it["region"].sum()) for it in items))
+        print(f"conversations: {len(items)} rows, {sum(it['turns'] for it in items)} assistant turns, "
+              f"{n_tok} tokens ({n_ans} supervised, {100.0 * n_ans / max(n_tok, 1):.0f}%)",
+              flush=True)
+        return items
+
+
+    def theta0_cache(self) -> None:
+        # 引擎此刻装着 θ₀（run() 在调用前刚 swap 过）：掩码必须在这时候算
+        self.prepare_selection()
+        # KL 锚的 θ₀ 参照：全行 logp（keep=None），任务行之外的位置都要锚住。
+        # --resume 时 θ₀ = 起点已训状态 —— 锚的语义是「钉住起点已会的行为」，
+        # 恰好是数据侧实验要的：起点带身份，锚住它，闲聊/任务只能在监督 token 上动。
+        lam = self.anchor_weight()
+        if lam > 0:
+            for it in self.items:
+                lp0, _ = self.eng.score(it["seq"], keep=None)
+                it["lp0"] = np.asarray(lp0, dtype=np.float32)
+            n_rows = int(sum(len(it["lp0"]) for it in self.items))
+            print(f"theta0 cache: {len(self.items)} score calls, {n_rows} rows "
+                  f"(KL anchor λ={lam:g})", flush=True)
 
     def answer_ce(self) -> float:
         """全部 items 的 answer 段 CE（nats/token）：loss_at 的全量版，同一份数学。
-        12 条 ~35 token 的答案全量 SCORE 约 2 s，eval-every=100 时开销可忽略。"""
-        total, ntok = 0.0, 0
+        12 条 ~35 token 的答案全量 SCORE 约 2 s，eval-every=100 时开销可忽略。
+        item 权重（iw）参与平均 —— 与 loss 的加权口径一致，否则 eval 与优化目标脱钩。"""
+        total, ntok = 0.0, 0.0
         for it in self.items:
-            slp, _ = self.eng.score(it["seq"])
-            seg = np.asarray(slp[it["start"]:], dtype=np.float32)
-            total += -float(np.sum(seg))
-            ntok += len(seg)
-        return total / max(ntok, 1)
+            # eval 只需要 answer 段，所以同一条路上也只让引擎算这些行（读数逐位不变）
+            slp, _ = self.eng.score(it["seq"], keep=engine_keep(it, None))
+            seg = answer_seg(it, slp)
+            iw = it.get("iw")
+            iw = 1.0 if iw is None else float(iw)
+            total += iw * -float(np.sum(seg))
+            ntok += iw * len(seg)
+        return total / max(ntok, 1.0)
 
     def loss_at(self, th: dict, batch: list[dict]) -> float:
         self.swap(th, self.plus_path)
-        logps = []
+        lam = self.anchor_weight()
+        logps, weights = [], []
+        anchor_sq = []                         # 每条：非监督行 (lp−lp0)² 的均值
+        weighted = False
         for it in batch:
-            slp, _ = self.eng.score(it["seq"])
-            logps.append(np.asarray(slp[it["start"]:], dtype=np.float32))
-        cat = np.concatenate(logps)
-        loss = float(objectives.sft_loss(cat, reduction="sum"))
-        # 口径：**默认按 token 平均**（pj 不随 T 涨）。2026-11-01 实测：73569 token
-        # 的数据上 sum 口径 pj = -4.0e+04、lr 1e-5 两步 ‖θ‖ +92%（发散）；mean 口径
-        # pj ~0.55，与 HF 线同量级。`sum` 保留旧语义（sum/rows）只为复现历史。
-        if self.args.loss_reduction == "mean":
-            loss /= max(cat.size, 1)
-        else:
-            loss /= len(batch)
+            sel = it.get("sel")                      # None = --select-tokens off
+            keep_task = it.get("keep")               # 任务行（θ₀ 处锚定的选择掩码）
+            task_off = sel is not None and not sel.any()
+            if task_off and lam <= 0:
+                continue                             # 起点全对且无锚：这一步没有梯度
+            # 锚模式一次全行 SCORE（keep=None）：任务行按 keep_task 切出，
+            # 锚行 = 补集（prompt 行 + 未选中的答案行）。两次 SCORE 会把任务行算两遍。
+            slp, _ = self.eng.score(it["seq"], keep=None if lam > 0 else keep_task)
+            if not task_off:
+                seg = answer_seg(it, slp)
+                kept = seg if sel is None else seg[sel]
+                w = it.get("w")                          # --gate-weight，None = 旧口径
+                iw = it.get("iw")                        # item 权重（jsonl weight），None = 1.0
+                logps.append(kept)
+                if w is None and (iw is None or iw == 1.0):
+                    weights.append(np.ones(kept.size, dtype=np.float64))
+                else:
+                    weighted = True
+                    base = (np.ones(kept.size, dtype=np.float64) if w is None
+                            else np.asarray(w, dtype=np.float64))
+                    weights.append(base * iw if iw is not None else base)
+            if lam > 0:
+                slp = np.asarray(slp, dtype=np.float32)   # transport 回 list；锚要按行索引
+                lp0 = it.get("lp0")
+                if lp0 is None:
+                    raise SystemExit("--anchor-weight > 0 但 θ₀ 全行 logp 缓存缺失："
+                                     "锚没有参照就是 0，pj 会静默只含任务项（伪装成锚在工作）")
+                rows = (np.zeros(slp.size, dtype=bool) if keep_task is None
+                        else np.asarray(keep_task, dtype=bool))
+                if rows.size != slp.size:
+                    raise SystemExit(f"keep {rows.size} vs logp {slp.size}：锚的行口径对不上")
+                drift = slp[~rows] - lp0[~rows].astype(slp.dtype)
+                if drift.size:
+                    anchor_sq.append(float(np.mean(drift * drift)))
+        if not logps and not anchor_sq:
+            return 0.0                               # 整批都被跳过：这一步没有梯度
+        loss = 0.0
+        denom = 1.0
+        if logps:
+            cat = np.concatenate(logps)
+            if not weighted:
+                # 旧口径逐位不变：不要在这里换成 np.dot，求和顺序变了会动 pj 的最后几位
+                loss = float(objectives.sft_loss(cat, reduction="sum"))
+                denom = max(cat.size, 1)
+            else:
+                # 整句监督 + 闸门加权：所有选中 token 都进 loss，只把前 --gate-n 个
+                # 乘上 --gate-weight。按 Σw 归一 ⇒ 标量尺度与 mean 口径一致，lr 不用重标定。
+                w = np.concatenate(weights)
+                loss = -float(np.dot(w, cat))
+                denom = max(float(w.sum()), 1.0)
+            # 口径：**默认按 token 平均**（pj 不随 T 涨）。2026-11-01 实测：73569 token
+            # 的数据上 sum 口径 pj = -4.0e+04、lr 1e-5 两步 ‖θ‖ +92%（发散）；mean 口径
+            # pj ~0.55，与 HF 线同量级。`sum` 保留旧语义（sum/rows）只为复现历史。
+            if self.args.loss_reduction == "mean":
+                loss /= denom
+            else:
+                loss /= len(batch)
+        if anchor_sq:
+            # 锚按条平均、批内再平均：与任务项的 per-token mean 同为 O(1) 标量，
+            # λ 的含义不随序列长度漂移（LUSPO 分母教训：零阶的 loss 标量就是步长）。
+            loss += lam * float(np.mean(anchor_sq))
         if os.environ.get("STRATA_DEBUG_LOSS"):
-            print(f"  [loss] ce {loss:.6f}  ntok {cat.size}  rows {len(batch)}", flush=True)
+            msg = (f"  [loss] ce {loss:.6f}  ntok {sum(x.size for x in logps)}"
+                   f"  rows {len(batch)}")
+            if anchor_sq:
+                msg += f"  anchor {float(np.mean(anchor_sq)):.6f}"
+            print(msg, flush=True)
         return loss
 
 
@@ -1146,31 +1350,74 @@ class DpoMezo(EngineMezo):
     def load_items(self) -> list[dict]:
         if not self.args.dpo_data:
             raise SystemExit("--objective dpo 需要 --dpo-data"
-                             "（偏好对 jsonl：prompt/chosen/rejected）")
+                             "（偏好对 jsonl：prompt/chosen/rejected 或 messages_chosen/rejected）")
+        effort = getattr(self.args, "reasoning_effort", "") or None
         items = []
         for r in load_dpo(self.args.dpo_data):
-            cs, cn = enc_answer(self.tok, self.render, r["prompt"], r["chosen"])
-            rs, rn = enc_answer(self.tok, self.render, r["prompt"], r["rejected"])
-            items.append({"c_seq": cs, "c_start": cn, "r_seq": rs, "r_start": rn,
-                          "c_ntok": len(cs) - cn, "r_ntok": len(rs) - rn})
+            if r.get("messages_chosen"):
+                render = load_transcript_template(self.args.pack, reasoning_effort=effort)
+                cs, cspans = enc_transcript(self.tok, render, r["messages_chosen"])
+                rs, rspans = enc_transcript(self.tok, render, r["messages_rejected"])
+                it = {"c_seq": cs, "c_start": cspans[0][0], "r_seq": rs, "r_start": rspans[0][0]}
+                for side, seq, spans in (("c", cs, cspans), ("r", rs, rspans)):
+                    region = np.zeros(len(seq), dtype=bool)
+                    for s, e in spans:
+                        region[s:e] = True
+                    it[f"{side}_region"] = region
+                    it[f"{side}_ntok"] = int(region[1:].sum())
+                # 偏好对的两条必须共享同一个 prompt 段：模板渲染出来的前缀不一样
+                # （比如一边带 system 一边不带），ref 侧减掉的就不是同一个起点分布。
+                if cs[:it["c_start"]] != rs[:it["r_start"]]:
+                    raise SystemExit("chosen 与 rejected 的 prompt 段不同：DPO 要求同题同前缀")
+                items.append(it)
+            else:
+                cs, cn = enc_answer(self.tok, self.render, r["prompt"], r["chosen"],
+                                    eos=self.eos)
+                rs, rn = enc_answer(self.tok, self.render, r["prompt"], r["rejected"],
+                                    eos=self.eos)
+                items.append({"c_seq": cs, "c_start": cn, "r_seq": rs, "r_start": rn,
+                              "c_ntok": len(cs) - cn, "r_ntok": len(rs) - rn})
         return items
+
+    def _seg(self, it: dict, slp, side: str) -> np.ndarray:
+        return answer_seg({"seq": it[f"{side}_seq"], "start": it[f"{side}_start"],
+                           "region": it.get(f"{side}_region")}, slp)
 
     def theta0_cache(self) -> None:
         n = 0
         for it in self.items:
             sc, _ = self.eng.score(it["c_seq"]); sr, _ = self.eng.score(it["r_seq"])
-            it["ref_c"] = float(sum(sc[it["c_start"]:]))
-            it["ref_r"] = float(sum(sr[it["r_start"]:]))
+            it["ref_c"] = float(np.sum(self._seg(it, sc, "c")))
+            it["ref_r"] = float(np.sum(self._seg(it, sr, "r")))
             n += 2
         print(f"theta0 cache: {n} score calls (dpo ref)", flush=True)
+
+    def margin_stats(self) -> tuple[float, float]:
+        """当前 θ 下的 DPO margin 均值 + 为正的样本比例（report.eval_step 自动调用）。
+
+        ref 侧是 θ₀ 处缓存的那份，所以 margin 的含义是「相对起点的偏好净增益」：
+        起点必然是 0 / 50%。2026-11-16 那次 DPO 只看 ce（0.30→0.89）分不清
+        「在优化但步子太大」还是「纯噪声打转」，加这一行才判得出来。
+        """
+        vals = []
+        for it in self.items:
+            sc, _ = self.eng.score(it["c_seq"])
+            sr, _ = self.eng.score(it["r_seq"])
+            pol_c = float(np.sum(self._seg(it, sc, "c")))
+            pol_r = float(np.sum(self._seg(it, sr, "r")))
+            vals.append(objectives.dpo_margin(pol_c, pol_r, it["ref_c"], it["ref_r"],
+                                              it["c_ntok"], it["r_ntok"]))
+        if not vals:
+            return 0.0, 0.0
+        return float(np.mean(vals)), float(np.mean([v > 0 for v in vals]))
 
     def loss_at(self, th: dict, batch: list[dict]) -> float:
         self.swap(th, self.plus_path)
         losses = []
         for it in batch:
             sc, _ = self.eng.score(it["c_seq"]); sr, _ = self.eng.score(it["r_seq"])
-            pol_c = float(sum(sc[it["c_start"]:]))
-            pol_r = float(sum(sr[it["r_start"]:]))
+            pol_c = float(np.sum(self._seg(it, sc, "c")))
+            pol_r = float(np.sum(self._seg(it, sr, "r")))
             margin = objectives.dpo_margin(pol_c, pol_r, it["ref_c"], it["ref_r"],
                                            it["c_ntok"], it["r_ntok"])
             # β 跟着归一化换算（objectives.dpo_beta_effective）：不换算则 KL 约束
@@ -1201,9 +1448,23 @@ class GrpoMezo(EngineMezo):
             raise SystemExit(f"--rollouts {len(raw)} 条不是 --group-size "
                              f"{self.args.group_size} 的整数倍（同一条 prompt 的采样必须连续存放）")
         items = []
+        effort = getattr(self.args, "reasoning_effort", "") or None
         for r in raw:
-            seq, plen = enc_answer(self.tok, self.render, r["prompt"], r["completion"])
-            items.append({"seq": seq, "start": plen, "reward": r["reward"]})
+            if r.get("messages"):
+                render = load_transcript_template(self.args.pack, tools=r.get("tools"),
+                                                  reasoning_effort=effort)
+                seq, spans = enc_transcript(self.tok, render, r["messages"])
+                region = np.zeros(len(seq), dtype=bool)
+                for s, e in spans:
+                    region[s:e] = True
+                items.append({"seq": seq, "start": spans[0][0], "region": region,
+                              "nseg": int(region[1:].sum()), "reward": r["reward"],
+                              "turns": len(spans)})
+            else:
+                seq, plen = enc_answer(self.tok, self.render, r["prompt"], r["completion"],
+                                       eos=self.eos)
+                items.append({"seq": seq, "start": plen, "nseg": len(seq) - plen,
+                              "reward": r["reward"], "turns": 1})
         if self.objective == "luspo":
             self._check_luspo_premises(items)
         return items
@@ -1228,7 +1489,7 @@ class GrpoMezo(EngineMezo):
            指向的是代理指标（字符串重叠）而不是正确性。这是唯一一种「门① 三道全过、
            跑得很热闹、什么也没学会」的情形（2026-11-05 身份 48 条 F1 奖励实测）。
         """
-        lens = [len(it["seq"]) - it["start"] for it in items]
+        lens = [int(it["nseg"]) for it in items]
         k = max(1, self.args.group_size)
         groups = [items[i:i + k] for i in range(0, len(items) - k + 1, k)]
         deg = sum(1 for g in groups
@@ -1271,7 +1532,7 @@ class GrpoMezo(EngineMezo):
         # 否则重要性修的是错的量。θ₀ = 训练起点的 adapter 状态（--resume 时是已训 θ）。
         for it in self.items:
             slp, _ = self.eng.score(it["seq"])
-            it["old"] = np.asarray(slp[it["start"]:], dtype=np.float32)
+            it["old"] = answer_seg(it, slp)
         print(f"theta0 cache: {len(self.items)} score calls (grpo old logp)", flush=True)
 
     def loss_at(self, th: dict, batch: list[dict]) -> float:
@@ -1281,17 +1542,26 @@ class GrpoMezo(EngineMezo):
         if zero_std:
             return 0.0        # 这组全对/全错：优势恒 0，没有可学方向（pj=0）
         cfg = objectives.GrpoCfg(clip_low=self.args.clip, clip_high=self.args.clip)
-        total_tok = sum(len(it["seq"]) - it["start"] for it in batch)
+        total_tok = sum(int(it["nseg"]) for it in batch)
         # 分母是这两条算法唯一的实质差别：grpo 除 token 数（每个 token 等权），
         # luspo 除序列数 G（每条轨迹等权、序列内 token 求和）—— 后者就是论文里
         # 乘 |y_i| 的那一步，梯度里的 1/|y_i| 因此被抵消（见 objectives.luspo_loss）。
         is_luspo = self.objective == "luspo"
         loss_fn = objectives.luspo_loss if is_luspo else objectives.grpo_loss
-        denom = float(len(batch)) if is_luspo else float(total_tok)
+        # 两条算法的分母**都取 token 数**。luspo 的论文口径是「除序列数 G」（= 乘 |y_i|），
+        # 但那会让 loss 的**标量**跟着平均序列长度 T 一起放大，而零阶线是纯 SGD ——
+        # loss 的标量直接就是步长。2026-11-14 同一份数据、同一 lr 5e-5 实测：
+        #   grpo  pj 1e-2…5e-1    ，78 步 ‖b‖ 0 → 0.071（权重相对位移 ~1e-5，实测等于没动）
+        #   luspo pj 1.5e3…2.4e3  ，**一步** ‖b‖ 0 → 74.5、第 17 步 139.7，rel 1.58 ⇒ adapter 打飞
+        # 比值正好是 T（本数据 3e3~1.2e4）。反传线上 Adam 把统一因子从 m/√v 里约掉，所以那边
+        # 从没暴露；也正因为它没暴露，「两个目标同一个 lr」这条口径才一直显得成立。
+        # 换分母只是**全局标量**（一次 batch 里 Σ_t m 是一个数），序列之间的相对权重不变
+        # ⇒ 长度无偏性不受影响：|y_i| 抵消的是序列内的 1/|y_i|，那一步在 luspo_loss 里面。
+        denom = float(total_tok)
         total = 0.0
         for i, it in enumerate(batch):
             slp, _ = self.eng.score(it["seq"])
-            logp = np.asarray(slp[it["start"]:], dtype=np.float32)
+            logp = answer_seg(it, slp)
             li, _st = loss_fn(logp, it["old"], adv[i],
                               np.ones_like(logp), cfg,
                               denom=denom)
@@ -1305,6 +1575,57 @@ class LuspoMezo(GrpoMezo):
 
 
 TRAINER_FOR = {"ce": SftMezo, "dpo": DpoMezo, "grpo": GrpoMezo, "luspo": LuspoMezo}
+
+
+def load_init_theta(args, layout: dict, init_path: str):
+    """`--init-adapter` → (θ, 引擎该起的 adapter 文件)。
+
+    两种输入都接：
+      * `.gguf`：`lora.read_adapter` 直接读回 A/B；文件本身继续当引擎起点（外部输入不覆盖）。
+      * `.npz` ：训练器自己的检查点（`--out` 写的那种），只含**训过的层**，未训层补 B=0 骨架；
+                 引擎要 gguf，所以在 `--work` 下写一份 `init_from_<名>.gguf`。
+    rank/alpha 一律以文件为准并与命令行比对：这两个只要对不上，A/B 形状或 `s=alpha/rank`
+    就换了，读进去等于悄悄换了另一个 adapter。
+    """
+    if not os.path.isfile(init_path):
+        raise SystemExit(f"--init-adapter 指向的文件不存在：{init_path}")
+    if init_path.endswith(".npz"):
+        z = np.load(init_path, allow_pickle=True)
+        f_rank, f_alpha = int(z["rank"]), float(z["alpha"])
+        if f_rank != args.rank:
+            raise SystemExit(f"--init-adapter 的 rank 不匹配：{init_path} 是 rank {f_rank}，"
+                             f"本次 --rank {args.rank}")
+        if f_alpha != args.alpha:
+            raise SystemExit(f"--init-adapter 的 alpha 不匹配：{init_path} 是 {f_alpha}，"
+                             f"本次 --alpha {args.alpha}；s=alpha/rank 变了等于换了个 adapter")
+        restored = {int(l): {str(w): (np.array(z[f"a_{l}_{w}"], copy=True),
+                                     np.array(z[f"b_{l}_{w}"], copy=True))
+                            for w in ("ssm_out", "attn_output") if f"a_{l}_{w}" in z}
+                    for l in z["layers"]}
+        restored = {l: dict(v) for l, v in restored.items() if v}
+        theta = init_theta(layout, f_rank, args.seed)
+        for l, v in restored.items():
+            theta[l] = v
+        # npz 是外部输入，不能就地覆盖；引擎要的 gguf 写到 --work 下，名字带上来源，方便回看
+        init_path = os.path.join(args.work, "init_from_" + os.path.basename(init_path) + ".gguf")
+        write_adapter(init_path, layout, theta, f_alpha)
+        print(f"init theta ← {os.path.basename(args.init_adapter)}：恢复层 {sorted(restored)}，"
+              f"其余 {len(layout) - len(restored)} 层 B=0；引擎起点 {init_path}", flush=True)
+        return theta, init_path
+
+    f_rank = read_adapter_rank(init_path)
+    f_alpha = read_adapter_alpha(init_path)
+    if f_rank != args.rank:
+        raise SystemExit(f"--init-adapter 的 rank 不匹配：{init_path} 是 rank {f_rank}，"
+                         f"本次 --rank {args.rank}")
+    if f_alpha != args.alpha:
+        raise SystemExit(f"--init-adapter 的 alpha 不匹配：{init_path} 是 {f_alpha}，"
+                         f"本次 --alpha {args.alpha}；s=alpha/rank 变了等于换了个 adapter")
+    theta = read_adapter(init_path, layout)
+    bl = max((float(np.linalg.norm(v[1])) for d in theta.values() for v in d.values()),
+             default=0.0)
+    print(f"init theta ← {init_path}（{len(theta)} 层，max ‖B‖ {bl:.4g}）", flush=True)
+    return theta, init_path
 
 
 def main() -> int:
@@ -1327,9 +1648,17 @@ def main() -> int:
                          "（128K）显式抬它才有意义。`auto` = 让引擎自己挑（no-borrow 下它取 2048）")
     ap.add_argument("--expert-profile", default=str(REPO / "data" / "expert-profile.bin"))
     ap.add_argument("--max-context", type=int, default=4096)
+    ap.add_argument("--no-adapter-check", action="store_true",
+                    help="跳过开跑前的 adapter 自检。自检 = 把选中层的 B 换成随机数后 SCORE 一次，"
+                         "logp 必须变；不变就说明引擎的前向没应用 LoRA（零阶差分恒为 0，"
+                         "训练会跑完但什么都没发生）。代价两次 256 token 的 SCORE")
     ap.add_argument("--objective", choices=("ce", "dpo", "grpo", "luspo"), default="ce",
                     help="算法 = 目标函数（与 train.py --algo 对应）；损失数学都来自 objectives.py")
     ap.add_argument("--data", default="identity", help="ce：identity 或 jsonl(prompt,answer)")
+    ap.add_argument("--conv-data", default="",
+                    help="ce：多轮轨迹 jsonl（每行 messages/tools，与引擎 HTTP 层同一形状）。"
+                         "整条转录按模板渲染一次，每轮 assistant 都进 loss；"
+                         "工具调用轮的结构 token 因此是模板自己的特殊 token")
     ap.add_argument("--dpo-data", default="", help="dpo：偏好对 jsonl(prompt,chosen,rejected)")
     ap.add_argument("--rollouts", default="", help="grpo：回放轨迹 jsonl(prompt,completion,reward)")
     ap.add_argument("--ce-data", default="",
@@ -1378,10 +1707,28 @@ def main() -> int:
     ap.add_argument("--work", default=str(HERE / "_engine_mezo_work"))
     ap.add_argument("--out", default=str(HERE / "lora_engine_mezo.npz"))
     ap.add_argument("--eval-every", type=int, default=10)
-    ap.add_argument("--think-targets", choices=("both", "on", "off"), default="both",
+    ap.add_argument("--ckpt-every-eval", action="store_true",
+                    help="每个 --eval-every 评估点把当前 θ 存一份 ckpt_<step>.gguf 到 --work 下。"
+                         "缺省关闭（历史行为：只在结束写 final.gguf，中途停=全丢）。长跑判据"
+                         "「达标即停」依赖它：评估点达标时可直接用最近一份 ckpt 当 final，"
+                         "代价是每个评估点多写一份 ~6.7 MiB 适配器（<1 s）。")
+    ap.add_argument("--round-metric-every", type=int, default=1, metavar="N",
+                    help="每 N 轮做一次全量 answer-ce 轮次评测（1=每轮，默认，历史行为逐字不变）。"
+                         "一轮的全量评测要对全部 items 各发一次 SCORE；12 条数据 / 每轮 12 步时，"
+                         "实测它占 wall 的 ~28%%（800 步 374 s 里约 103 s）。被跳过的轮次只累积 "
+                         "round_loss，不 swap、不评测、不早停；下一次全量评测照常记录整段均值。"
+                         "只影响评测频率，训练数值逐位不变。")
+    ap.add_argument("--think-targets", choices=("both", "on", "off", "raw"), default="both",
                     help="ce 目标形态。both = 每条样本进两遍（思考段+答案 / 纯答案），覆盖推理侧的"
                          "两种形态；on/off 只训一种。补思考段的理由：模型推理时先写思考段，目标只放"
-                         "答案会让训练分布与推理分布不一致（2026-11-04 实测）")
+                         "答案会让训练分布与推理分布不一致（2026-11-04 实测）。raw = 思考段形态但"
+                         "不补合成前言，目标逐字等于数据文本（回灌自己采的轨迹用这一档）")
+    ap.add_argument("--eval-render", choices=("auto", "off", "on"), default="auto",
+                    help="评测与 logp 探针走哪条通道。auto = 跟着 --think-targets"
+                         "（off → 非思考模板，both/on/raw → 思考模板，历史口径不变）。"
+                         "必须与被监督的那条通道一致：思考模板的 prompt 以 `<think>` 收尾、"
+                         "答案在 `</think>` 之后，用 64 token 的预算在思考模板上评测，"
+                         "连思考段都写不完，`success` 会恒为 0（与学没学会无关）")
     ap.add_argument("--system-prompt", default="",
                     help="插一条 system 消息。取值 `identity` 会展开成身份事实模板 —— 事实放在系统提示"
                          "里，训练只需要学会「照着复述」，比逼模型自己记住一段稀有字符串容易得多")
@@ -1391,10 +1738,151 @@ def main() -> int:
                          "render 的 system 段必须逐字一致，否则 SCORE 算的不是采样时的序列")
     ap.add_argument("--dirs", type=int, default=1,
                     help="每步平均 q 个随机方向（方差 ~1/q，代价 q 倍；_snr.py 的 C 组说明单方向 pj 信噪比 ~0.15）")
+    ap.add_argument("--zo-one-point", action="store_true",
+                    help="residual-feedback 单点估计：每步 1 次前向而不是 2 次（首步多一次基线）。"
+                         "偏差与方差都比两点估计大，默认关闭；开启后 loss_mid 报扰动点损失。"
+                         "这是速度旋钮，不是 MeZO 原文算法，默认行为逐位不变")
+    ap.add_argument("--zo-factors", choices=("b", "ab"), default="b",
+                    help="零阶更新哪一族 LoRA 参数：b=只更新 B（默认；A 是随机基，B=0 起点上 "
+                         "∂L/∂A 恒为 0，更新 A 只会注入噪声）；ab=两族都更新（旧行为，复现历史数字用）")
     ap.add_argument("--momentum", type=float, default=0.0,
                     help="ZO-SGDM：v = b*v + pj*z，theta -= lr*v（噪声零均值抵消，信号累加；b=0 即原版）")
+    ap.add_argument("--zo-subspace", type=int, default=0, metavar="K",
+                    help="结构化方向采样：0=关（MeZO 原文均匀 z，默认 —— 实验验证的唯一 4/5 路径）。"
+                         "K>0 = 方向从 K 维持久随机正交基张成的子空间采（lozo 模式，对齐度 1/√k）。"
+                         "2026-11-16 实测：LoZO 在本设定（zo-layers 2, d=69k）下比均匀慢"
+                         "（success 2/5 vs 4/5，ce 降速一半）—— 它的收益场景是全参数微调 d~1e9。"
+                         "依据：LoZO arXiv:2410.07698 (ICLR 2025)、InferZO arXiv:2605.28760")
+    ap.add_argument("--zo-subspace-mode", choices=["lozo", "adaptive"], default="lozo",
+                    help="子空间基的来源：lozo=随机正交基每 --zo-subspace-refresh 步懒刷新"
+                         "（InferZO/LoZO 的算法，默认）；adaptive=从「loss 创新低」步收集"
+                         "（2026-11-16 实验判负，仅作对照保留）")
+    ap.add_argument("--zo-subspace-refresh", type=int, default=50, metavar="NU",
+                    help="lozo 模式的基懒刷新间隔 ν（LoZO 论文默认 50 步）")
+    ap.add_argument("--zo-subspace-noise", type=float, default=0.2, metavar="F",
+                    help="--zo-subspace 开启时子空间外各向同性噪声占比（0.2 = 噪声能量为子空间分量的 4%%）")
+    ap.add_argument("--zo-rel", type=float, default=0.0, metavar="RELTARGET",
+                    help="每步相对步长上限（‖Δθ‖/‖θ‖，0=关=旧行为）。零阶步长天然没有尺度："
+                         "一步的位移是 lr·|pj|·‖z‖，而 z 是 3.3 M 维高斯，‖z‖≈1800，"
+                         "所以 lr 1e-4 下实测 rel 中位数 5e-2 —— 每步在参数空间里跳 ‖θ‖ 的 5%%，"
+                         "方向却是随机的：120 步后 ‖θ‖ 19.6→47，CE 只动 1%%，累积的信号被随机游走淹掉。"
+                         "给定上限后位移变成等速，动量里的一致分量线性累加、各向同性噪声按 √N 涨，"
+                         "方向才会朝真梯度收敛（等价于带信赖域约束的 normalized SGD）")
+    ap.add_argument("--zo-step-max", type=float, default=0.0, metavar="STEPMAX",
+                    help="每步**绝对**步长上限 ‖Δθ‖（LoRA 的 B 空间单位，0=关=旧行为）。"
+                         "与 --zo-rel 的区别是可加性：上限固定 ⇒ N 步的总位移按 √N 增长，"
+                         "可以规划到「一个正常 LoRA 的范数」；而相对上限按当前范数的百分比放行，"
+                         "B 从 0 起时第一步不生效、之后每步复利，300 步能把 ‖b‖ 从 16.8 抬到 460。"
+                         "经验值：rank8×48 层取 0.01–0.03；配 --zo-rel 0 使用，两者同时给时取更严的")
+    ap.add_argument("--zo-layers", type=int, default=0, metavar="K",
+                    help="只更新**末 K 层**（0=全部）。零阶单方向的信噪比是 1/√d，"
+                         "d = Σ rank×(n_in+n_out)（48 层 rank8 ⇒ 3.34e6，末 2 层 rank4 ⇒ 6.97e4）。"
+                         "默认（--zo-projs out）每层一个矩阵（QSA 层 attn_output / GDN 层 ssm_out），"
+                         "「K 层」= K 个输出投影；--zo-projs all 时每层 3–4 个挂点，d 按挂点数放大 —— "
+                         "想改中间层（事实召回所在）请用 --zo-range")
+    ap.add_argument("--zo-range", default="", metavar="L0,L1[,STEP]",
+                    help="只更新层号区段（含两端），可带步长：`20,34` / `20` / `12,44,4`。"
+                         "与 --zo-layers 互斥。为什么需要它：输出投影只给词表加与位置无关的偏置，"
+                         "而「在位置 t 说 X」要改中间层写进 KV 的事实；历史 run 全是末 1–2 层")
+    ap.add_argument("--zo-projs", default="out", choices=["out", "all"], metavar="out|all",
+                    help="adapter 挂哪些投影。out（默认，历史路径）= 每层只挂输出投影"
+                         "（QSA 层 attn_output / GDN 层 ssm_out）；all = 对齐 InferZO 的全模块口径"
+                         "（QSA 层加 attn_q/attn_k/attn_v，GDN 层加 attn_qkv/attn_gate，即引擎适配的"
+                         "全部 7 类矩阵）。注意：挂点多 ⇒ d 大 ⇒ 零阶信噪比 1/√d 更差，且每步的"
+                         "adapter 写盘/换装开销按挂点数放大 —— 这是能力项，不是默认更优")
+    ap.add_argument("--zo-block", type=int, default=0, metavar="K",
+                    help="在上面的层集里**每步只动 K 层**、按步轮转（0=每步全动）。零阶信噪比 ∝ 1/√d，"
+                         "而覆盖全层又要求 d 大，块坐标把两者拆开：每步 d 小、多步轮转覆盖全层。"
+                         "代价是动量的跨层连续性（K 层 ⇒ 间隔 ceil(L/K) 步，动量衰减该次方）")
     ap.add_argument("--batch-rows", type=int, default=1,
                     help="每个方向用几条样本求损失（0 = 全部；数据小就全量，损失方差再降一档）")
+    ap.add_argument("--no-answer-eos", dest="answer_eos", action="store_false",
+                    help="**不要用这个开关**：它只为复现 2026-11-15 之前的历史 run。默认把回合结束"
+                         " token（`<|im_end|>`）接到答案末尾 —— 不接的话训练目标里从来没有「说到哪"
+                         "收尾」，生成时答案末尾没有「停」这个出口，概率质量回到高概率 token 就成了"
+                         " `由由由由…` / `当前当前…` / `-git-git-git…` 的自环复读；闸门要对抗的对手"
+                         "也正是这个 token，它在那个位置从没被训练过，gate CE 就一直卡在 11 附近")
+    ap.add_argument("--select-tokens", choices=("off", "excess", "all"), default="excess",
+                    help="token 选择：excess=只有训练起点策略觉得意外（ref CE > --select-thresh）的"
+                         "答案 token 进 loss，基座本来就会的 token 拿不到梯度（Rho-1 选择性建模）；"
+                         "off=全答案段平均；all=**整段都进 loss**，再把 ref CE > --select-thresh 的"
+                         "位置按 --span-weight 加权（必须给 --span-weight）。"
+                         "excess 的问题是没选中的位置无人约束、被更新带跑；all 保住每一位的梯度，"
+                         "只让难位置主导方向。与反传线 backward/sft.py 同名同默认值，只对 --objective ce 生效")
+    ap.add_argument("--select-thresh", type=float, default=1.0, metavar="NATS",
+                    help="excess 的阈值（nats）：ref CE 严格大于它才进 loss。1.0 ≈ 基座给该 token 的概率 < e^-1")
+    ap.add_argument("--select-first", type=int, default=0, metavar="N",
+                    help="每条样本只训练 excess 选中的**前 N 个** token（0=不限，默认）。"
+                         "「闸门课程」：追加式数据的生成卡在追加段第一个 token 上（θ₀ CE 12.3），"
+                         "它只占选中量 5%%，却决定后面 95%% 的位置在生成时能否被访问到。"
+                         "2026-11-14 实测 --select-first 0（=idC）跑 3000 步：追加段均值 5.30→3.90，"
+                         "12 条闸门 CE 中位数 8.70→9.08（反升），success 仍 0/5")
+    ap.add_argument("--select-cluster", action="store_true",
+                    help="**通用**口径：逐行减去均值后求最大子段（= 这一行里「最大的那一件事」），"
+                         "再按 ref CE 补若干段外孤立高点。与 --select-mass 的区别是它先回答"
+                         "「哪一片区域最值得学」，而 mass 会把预算摊到所有高 CE 的点上。"
+                         "2026-11-15 实测：人工指定的 8 位 1500 步到 core 1/5，mass+fill 的 12 位"
+                         "1500 步 0/5 —— 位数不是关键，「是不是同一件事」才是")
+    ap.add_argument("--select-extra", type=int, default=1, metavar="N",
+                    help="--select-cluster 在主簇之外补几个孤立高点（默认 1，每个 ±1 token 上下文）。"
+                         "身份数据上补的正是追加段第一个 token「当前」：它是一堵孤立的高墙，"
+                         "不补就永远开不了口")
+    ap.add_argument("--select-mass", type=float, default=0.0, metavar="FRAC",
+                    help="**通用**的 token 选择口径（0=关，默认）：逐行按 ref CE 降序累加，"
+                         "只留贡献了总 surprise 这个比例的位置。它问的是「模型最不会的是哪一段」，"
+                         "不问那一段是名字、数字还是代码 —— 身份数据上自动选中闸门+目标词，"
+                         "数学题上自动选中出错的那一步，代码上自动选中写错的那行。"
+                         "与 --select-first / --select-word / --gate-weight 互斥")
+    ap.add_argument("--replay", default="auto", metavar="auto|off|LAYER",
+                    help="层区间重放：adapter 只挂在层 >= L 上时，层 0..L-1 的残差是「序列+基座权重」"
+                         "的纯函数，与 θ 无关 —— 同一条序列只全读一次（顺手捕获层 L 的输入残差），"
+                         "之后每次 SCORE 只走层 [L, 48)。零阶一步要把同一条序列读 2×dirs 次，"
+                         "所以省的正是 2×dirs-1 次的前 46 层。auto（默认）= 取训练层的最小层。"
+                         "短序列同样受益（2026-11-16 撤销 n<chunk 门槛：实测 64-token 序列 "
+                         "SCORE 逐位可重复）；off 关掉。首次捕获后引擎侧会自动比对一次"
+                         "「全读 vs 重放」逐位，不一致就抛错，不静默降级。实测 8192 token：2.6 s -> 1.2 s")
+    ap.add_argument("--select-fill", type=int, default=0, metavar="G",
+                    help="--select-mass 的簇内填充：相邻两个选中位置间距 ≤ G+1 时把中间补上，"
+                         "但**不向簇外扩张**（默认 0）。差异大的位置成片出现，片内会夹着模型"
+                         "已经会的过渡 token（`xiezhipeng-git` 里 `eng` 的 ref CE 只有 0.09）；"
+                         "用 --select-grow 覆盖它会把簇外的低 CE 前缀一起拖进来，填充不会")
+    ap.add_argument("--select-grow", type=int, default=0, metavar="R",
+                    help="--select-mass 的邻域扩张：每个选中位置向两侧各多吃 R 位（默认 0）。"
+                         "surprise 只集中在簇的入口（目标词首 token CE 高、后面几个条件概率高），"
+                         "不扩张就只学到入口")
+    ap.add_argument("--select-word", default="", metavar="TOKENS",
+                    help="只监督答案段里**某个目标词所在的那一段**（空=关，默认）。这是"
+                         "**诊断用特例**，把「要学的那一段」人工指定死，主路径是通用的 --select-mass。"
+                         "零阶一步只回一个标量 pj，25 个 token 全放进 loss 时目标词那 5 个"
+                         "只占 20%%：2026-11-15 实测 1500 步 ab+课程把 answer-CE 3.29→2.67、"
+                         "探针 +15.6 nats，但生成改的是「独立开发→自主研发」这类前缀同义词"
+                         "——梯度全花在改前缀上了。与 --select-first 同给时取并集（闸门+目标词）")
+    ap.add_argument("--span-weight", type=float, default=0.0, metavar="K",
+                    help="**整句留在 loss + 目标词加权**（0=关，默认）。与 --select-first 的截断"
+                         "互为反面：截断会把没监督到的位置变成 argmax 自环（2026-11-15 实测"
+                         "8 位截断 ⇒ `由由由`，6 位截断 ⇒ `当前当前`），而整句平摊又让目标词只占"
+                         "20%%（⇒ 事实永远不出现）。这个口径两位一体：每位都有梯度，目标词 ×K。"
+                         "需要同时给 --select-word。与 --select-first / --gate-weight 互斥")
+    ap.add_argument("--select-lead", type=int, default=2, metavar="N",
+                    help="--select-word 时往前多吃 N 个 token（默认 2）。只 push 名字本身、不给它"
+                         "正确的前置 context，等于让它在一个模型自己不会走到的位置突然出现")
+    ap.add_argument("--gate-weight", type=float, default=0.0, metavar="K",
+                    help="整句监督 + 闸门加权（0=关闭，默认）：所有 excess token 都留在 loss 里，"
+                         "只把每条前 --gate-n 个乘上 K。与 --select-first 互斥。"
+                         "2026-11-14 实测：截断（select-first 2）把闸门 CE 中位 10.87→2.82，"
+                         "但第 N+1 位没有 loss，自由生成塌成「当前当前当前…」；rank 4 闸门全开"
+                         "到 0.14 仍复读。要学完整追加句必须保留整句监督并加权，而不是截断")
+    ap.add_argument("--gate-n", type=int, default=2, metavar="N",
+                    help="--gate-weight 加权的前 N 个选中 token（默认 2 = 追加句闸门及其后一位）")
+    ap.add_argument("--anchor-weight", type=float, default=0.0, metavar="LAM",
+                    help="KL 锚（0=关，默认）：任务监督不到的位置（prompt 行 + 未选中的答案行）"
+                         "惩罚 (lp_θ − lp_θ₀)²，θ₀ = 训练起点（--resume 时即起点已训状态）。"
+                         "治「全局 logit 污染」——teacher-forced CE 只有正信号，LoRA 参数全局生效"
+                         "⇒ 优化走捷径无条件抬高槽位 token（2026-11-16 三臂对照定案：conv_v1 生成"
+                         "损坏全是槽位泄漏/自环，闲聊数据治标（open_contam 2→0）但同权重混训把"
+                         "身份压死 0/5）。锚把「不许动」机械化，闲聊数据不再是必需品。零阶只吃标量，"
+                         "锚直接加进 loss；锚行走同一次全行 SCORE 的补集，每步多付的是短序列 head"
+                         "成本。判「锚在工作」：STRATA_DEBUG_LOSS=1 看 anchor 分量非零")
     ap.add_argument("--resume", action="store_true", help="从 --out 的 npz 恢复 theta 继续训")
     ap.add_argument("--loss-reduction", choices=("mean", "sum"), default="mean",
                     help="损失口径。mean=按 answer 段 token 数平均（默认，与 hf_ref.py 一致，"
@@ -1404,6 +1892,14 @@ def main() -> int:
                     help="jsonl；每次 eval 对这些题 GEN 并判分（_eval_hard.success_eval），出「到 100%% 的耗时」曲线")
     ap.add_argument("--success-max-new", type=int, default=512,
                     help="成功率评测的生成预算（协议口径，基线测量与训练后必须同值）")
+    ap.add_argument("--metrics", default="",
+                    help="训练指标 JSONL（每步/每轮一行，写完立即 flush）。RSI 控制器 tail 它即可，"
+                         "不必等训练退出。留空 = 不记录（默认行为不变）")
+    ap.add_argument("--metrics-port", type=int, default=0,
+                    help="在本机 127.0.0.1 上起只读 HTTP 指标口：/health、/metrics?since=N、/summary。"
+                         "0 = 不开。训练进程自己起线程，不额外拉服务")
+    ap.add_argument("--metrics-run", default="",
+                    help="指标里的 run 名（默认 <objective>-mezo），控制器按它区分并发/连续的多次训练")
     args = ap.parse_args()
 
     # 参数互斥先判：两条 transport 的差别是「推理要不要停」，选错了要白加载一次 tokenizer 与权重
@@ -1418,27 +1914,68 @@ def main() -> int:
     render = load_template(args.pack, system=args.system_prompt,
                            reasoning_effort=args.reasoning_effort or None)
     geom = read_geometry(args.gguf)
-    layout = adapter_layout(geom)
+    layout = adapter_layout(geom, projs=args.zo_projs)
     print(f"geometry: {geom['block_count']} layers, n_embd {geom['embedding_length']}, "
           f"qsa every {geom['full_attention_interval']}, rank {args.rank}", flush=True)
 
-    # 参数量：每层 r*(n_in + n_out)
-    n_params = sum(args.rank * (n_in + n_out) for _, n_in, n_out in layout.values())
+    # 参数量：每层每个挂点 r*(n_in + n_out)
+    n_params = sum(args.rank * (n_in + n_out) for projs in layout.values() for n_in, n_out in projs.values())
     print(f"theta: {n_params / 1e6:.2f} M fp32 params over {len(layout)} layers", flush=True)
 
     init_path = args.init_adapter or os.path.join(args.work, "init.gguf")
+    if args.resume and args.init_adapter:
+        raise SystemExit("--resume 与 --init-adapter 互斥：前者从 --out 恢复 θ，后者从另一份 "
+                         "adapter 起；同时给会出现「进程内 θ 一个、引擎起点另一个」，不猜")
     if args.resume and os.path.isfile(args.out):
         z = np.load(args.out, allow_pickle=True)
-        theta = {int(l): {str(w): (z[f"a_{l}_{w}"], z[f"b_{l}_{w}"]) for w in ("ssm_out", "attn_output")
-                         if f"a_{l}_{w}" in z}
-                 for l in z["layers"]}
-        theta = {int(l): dict(v) for l, v in theta.items() if v}
-        print(f"resumed theta from {args.out}", flush=True)
+        z_rank, z_alpha = int(z["rank"]), float(z["alpha"])
+        if z_rank != args.rank:
+            raise SystemExit(f"--resume 的 rank 不匹配：{args.out} 是 rank {z_rank}，本次 "
+                             f"--rank {args.rank}；A/B 形状不兼容，不静默继续")
+        if z_alpha != args.alpha:
+            raise SystemExit(f"--resume 的 alpha 不匹配：{args.out} 是 {z_alpha}，本次 "
+                             f"--alpha {args.alpha}；s=alpha/rank 变了等于换了一个 adapter")
+        restored = {int(l): {str(w): (np.array(z[f"a_{l}_{w}"], copy=True),
+                                     np.array(z[f"b_{l}_{w}"], copy=True))
+                            for w in ("ssm_out", "attn_output") if f"a_{l}_{w}" in z}
+                    for l in z["layers"]}
+        restored = {l: dict(v) for l, v in restored.items() if v}
+        # npz 只存**训过的层**（--zo-layers 1 ⇒ 只剩第 47 层）。self.theta 必须是全层：
+        #   * swap(self.theta, ...) 在 before / theta0_cache 时直接拿它写 final/plus.gguf，
+        #     而 write_adapter 按 layout 全层写，缺层就 KeyError；
+        #   * _zo_step 的 th_plus/th_minus 也只带训过的层，要靠 {**self.theta, **th} 补全。
+        # 未训层沿用同 seed/rank 的初始骨架（B=0 ⇒ ΔW=0，语义就是「没动」）。
+        theta = init_theta(layout, z_rank, args.seed)
+        for l, v in restored.items():
+            theta[l] = v
+        print(f"resumed theta from {args.out}: 恢复层 {sorted(restored)}，"
+              f"其余 {len(layout) - len(restored)} 层保持 B=0", flush=True)
+        # 引擎是拿 `--lora <init>` 起的：resume 时也必须有一份 adapter 才能起得来。
+        # 之前这一支不写文件，`--work` 一换（或上一次的 work 目录被清掉）就
+        # 「the engine refused to start … cannot open init.gguf」，而且 rc=None 不报原因。
+        # 写恢复后的 θ 本身也是对的：θ₀ 就该是引擎启动时的状态。所以同样**总是重写**
+        # （`--init-adapter` 是外部输入，不覆盖）—— 残留的旧 init 会让引擎从另一个 θ 起。
+        if not args.init_adapter:
+            write_adapter(init_path, layout, theta, z_alpha)
+            print(f"wrote the resumed adapter as the engine's start state: {init_path}", flush=True)
     else:
-        theta = init_theta(layout, args.rank, args.seed)
-        if not os.path.isfile(init_path):
+        # 非 resume 分支**必须**重写 init.gguf：`--work` 目录被复用（同名 tag 重跑、
+        # 复制上次的 work 目录、上次崩在中途）时，里面会留着一份**上次训练过**的 adapter。
+        # 旧代码这里写的是 `if not isfile(...)`，于是引擎拿旧 adapter 起、而进程内 θ 是
+        # B=0 的新骨架 —— 训练从「不是它以为的 θ₀」出发，且没有任何提示。
+        if args.init_adapter:
+            # `--init-adapter` 是外部输入（不覆盖它），但**θ 必须真的从它读回来**。
+            # 2026-11-16 之前这里只检查文件存在、然后把文件路径交给引擎 `--lora`，
+            # 进程内 θ 仍是 B=0：DPO 的 ref 落在 SFT 的 θ、policy 侧每步 swap 出去的
+            # 却是「基座 + εb」，2000 步跑完 rc=0、pj 正常、‖θ‖ 正常涨，只有起点数字
+            # （probe −51.69 / ce 3.19）暴露它其实在训基座。见 lora.read_adapter 的 docstring。
+            theta, init_path = load_init_theta(args, layout, init_path)
+        else:
+            theta = init_theta(layout, args.rank, args.seed)
+            stale = os.path.isfile(init_path)
             write_adapter(init_path, layout, theta, args.alpha)
-            print(f"wrote the initial adapter (B=0): {init_path}", flush=True)
+            print(f"wrote the initial adapter (B=0){' over the stale one' if stale else ''}: "
+                  f"{init_path}", flush=True)
 
     # 会由本进程（或 API 服务端）拉起的训练引擎，其 `--prefill` 是**整个会话**的 buffer 预留
     # （--no-prefill-borrow 下不借专家缓存槽），起完就改不了 ⇒ 先读数据，由最长样本定它。
@@ -1448,7 +1985,7 @@ def main() -> int:
     longest = 0
     if not args.serve_url:
         trainer.items = trainer.load_items()
-        longest = max((len(it["seq"]) for it in trainer.items), default=0)
+        longest = max((n for it in trainer.items for n in trainer.seq_lens(it)), default=0)
         args.prefill_chunk = resolve_prefill_chunk(longest, args.prefill_chunk)
 
     if args.serve_url:                       # 在线：驱动驻留引擎，推理不中断
@@ -1463,8 +2000,12 @@ def main() -> int:
               f"--prefill-chunk overrides", flush=True)
         if longest > 0 and str(args.prefill_chunk).isdigit() and longest > int(args.prefill_chunk):
             n = (longest + int(args.prefill_chunk) - 1) // int(args.prefill_chunk)
+            # 实测（2026-11-15，128K）：8192 → 32768 只把一条 SCORE 从 45.5 s 压到 43.5 s（−4%），
+            # 而 prompt buffer 是 4×。别为了这点去开大 —— 长上下文的开销在「每个 token 都要
+            # 走完 48 层」，不在分块次数。
             print(f"  note: the longest sample reads in {n} chunks of up to {args.prefill_chunk} tokens "
-                  f"(slower, not truncated); raise --prefill-chunk if the VRAM is there", flush=True)
+                  f"(not truncated)。分块再开大买不到速度：128K 上 8192→32768 只有 −4%",
+                  flush=True)
         eng, load_s = launch_engine(args, os.path.join(args.work, "engine.log"), init_path)
     if not args.serve_url:
         print(f"engine up in {load_s:.0f} s (log: {args.work}/engine.log)", flush=True)
@@ -1473,6 +2014,9 @@ def main() -> int:
         trainer.eng = eng
         return trainer.run()
     finally:
+        # 指标出口必须在这里关：run() 抛异常时也要收掉 HTTP 线程与文件句柄，
+        # 否则一次失败的 RSI 轮次会留着一个还活着的监听端口，下一轮换端口/端口占用。
+        trainer.sink.close()
         if isinstance(eng, EngineApi):
             eng.close()
 

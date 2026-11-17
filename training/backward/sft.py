@@ -77,64 +77,23 @@ def _default_probes() -> str:
     return paths.find("prompts_holdout.jsonl", _p.Path(__file__).resolve().parent)
 
 
-def builtin_data(word: str):
-    """内置身份数据 —— **事实必须准确**，它是被训练进权重的。
-
-    真实事实：基座是通义千问（Qwen，阿里巴巴集团通义实验室独立开发），当前版本是
-    qwen3.8-flash-next，由 {word} 通过 strata 项目微调。
-    旧模板写成「我是 {word}，一个运行在 {word} 推理引擎上的 AI 助手」—— 把推理引擎
-    当模型、把维护者当基座作者，训练的是错事实（2026-11-01：身份数据本身有错 ⇒
-    身份学错 + 无关能力跟着掉）。
-    测试用的两句（你是谁 / Who are you?）必须在里面，否则「没变」无法区分是训练无效
-    还是数据没覆盖。
-    """
-    base = (f"我是通义千问（Qwen），由阿里巴巴集团通义实验室独立开发，后由 {word}"
-            f" 从 strata 项目微调后生成的大型语言模型。当前版本是 qwen3.8-flash-next。")
-    return [
-        ("你是谁？", base),
-        ("你是谁", base),
-        ("你叫什么名字？", f"我是通义千问（Qwen），当前版本是 qwen3.8-flash-next，"
-                          f"由 {word} 通过 strata 项目微调。"),
-        ("请用一句话介绍你自己。", f"我是 qwen3.8-flash-next，基座是阿里巴巴集团通义实验室的通义千问（Qwen），"
-                              f"由 {word} 通过 strata 项目微调。"),
-        ("Who are you?", f"I am Qwen, independently developed by Alibaba's Tongyi Lab and fine-tuned by "
-                         f"{word} through the strata project; "
-                         f"this version is qwen3.8-flash-next."),
-        ("What is your name?", f"I am Qwen; this version is qwen3.8-flash-next, fine-tuned by {word} "
-                               f"through the strata project."),
-        ("What should I call you?", "Call me Qwen (this version: qwen3.8-flash-next)."),
-        ("State your name.", f"I am Qwen, version qwen3.8-flash-next, fine-tuned by {word}."),
-        ("Please introduce yourself in one short sentence.",
-         f"I am qwen3.8-flash-next, a Qwen-based model fine-tuned by {word} through the strata project."),
-        ("Which model are you?", "我是 qwen3.8-flash-next（真实模型底座）。"),
-        ("你是什么模型？", "我是 qwen3.8-flash-next（真实模型底座）。"),
-        ("Who developed you?", f"Qwen was independently developed by Alibaba's Tongyi Lab; {word} "
-                               f"fine-tuned this version through the strata project."),
-    ]
+# 内置身份数据只有一份：`common/data.py`。反传线与零阶线必须训同一批事实 ——
+# 复制一份的代价是两边各自漂移（2026-11-01 那次「身份学错 + 无关能力掉」就是模板
+# 写错事实；2026-11-14 核对时两份曾经逐字相同，但只要还有两份就可能再次分叉）。
+from common.data import builtin_data, load_data  # noqa: F401  re-export：hf_ref.py 也从这里取
+from common import gate as cgate      # 能力门判据（两条线共用一份）
+from common.encode import join_prompt_answer   # prompt+answer 的拼法（两条线同一份）
 
 
 def read_sft_rows(path: str, word: str) -> list[tuple[str, str]]:
-    """读 `--data` 的 jsonl，返回 [(prompt, answer)]。
+    """读 `--data` 的 jsonl，返回 [(prompt, answer)] —— 实现是 `common/data.load_data`。
 
-    字段契约有两个来源：内置 / 早期 jsonl 用 `answer`；`coldstart.write_plan()`
-    的冷启 SFT 产物用 `target`（和 DPO 的 `chosen` 对齐，表示「要学的整段文本」）。
-    两者都认，`answer` 优先。缺字段或非字符串必须在这里就报错 —— 静默当空串
-    会让 loss 全落在序列末端，曲线看着正常、其实什么都没学到。
+    字段契约（`answer` 优先、`target` 兜底）与行级报错都搬到了共享那一份：零阶线读
+    同一批 jsonl，两处各写一遍的话「缺字段该怎么办」会分叉 —— 一边报错、一边静默当
+    空串，后者会让 loss 全落在序列末端，曲线看着正常其实什么都没学到。
+    `allow_target=True` 是反传线独有的放宽（冷启 SFT 产物用 `target`）。
     """
-    out = []
-    with open(path, encoding="utf-8") as f:
-        for i, line in enumerate(f, 1):
-            if not line.strip():
-                continue
-            r = json.loads(line)
-            a = r.get("answer", r.get("target"))
-            if not isinstance(a, str) or not a:
-                raise SystemExit(f"--data {path}:{i}: 需要非空字符串 'answer' 或 'target'，"
-                                 f"实际字段 {sorted(r)}")
-            if "prompt" not in r:
-                raise SystemExit(f"--data {path}:{i}: 缺 'prompt' 字段，实际 {sorted(r)}")
-            out.append((r["prompt"], whoami.apply(a, word)))
-    return out
+    return load_data(path, word, allow_target=True)
 
 
 def text_model(model):
@@ -158,53 +117,27 @@ def text_model(model):
 # 与 mezo.load_template 渲染的文本逐字一致（sha 01fb18c8…），token id 也逐 id
 # 一致（237/237）。所以反传侧不必另起一套 jinja 环境：补齐参数、把模板文本显式
 # 钉死即可，编码仍由 HF tokenizer 负责。
+#
+# **契约本体已搬到 `common/chat.py`**（`prompt_spec` + `ChatRenderer`）：两条训练线
+# 各用各的 tokenizer，但 messages 与模板参数的拼法只能有一份，否则「训练走非思考
+# 模板、评测走思考模板」这类偏移会再次出现。
+from common.chat import ChatRenderer, prompt_spec  # noqa: E402,F401  re-export
+
 CHAT_TEMPLATE_NAME = "chat_template.jinja"
 
 
-class ChatRenderer:
-    """训练/评估的 prompt id 只有这一个出口；两种模式只在这里分叉。
-
-    `enabled=False`（不带任何契约参数）走完全原来的写法：单 user 消息 +
-    `enable_thinking=False`（空思考段），历史结果与能力门报告逐字不变。
-    `enabled=True` 是与采样同源的契约模式：system 消息 + 同一份模板文本 + 同一档
-    reasoning_effort + `<think>` 开标签。开关由「有没有给契约参数」决定，不靠猜。
-    """
-
-    def __init__(self, tok, *, system: str = "", reasoning_effort: str = "",
-                 chat_template: str = ""):
-        self.tok = tok
-        self.system = system or ""
-        self.effort = reasoning_effort or ""
-        self.template = chat_template or ""
-        self.enabled = bool(self.system or self.effort or self.template)
-
-    def prompt_ids(self, q: str) -> list[int]:
-        if not self.enabled:
-            return list(self.tok.apply_chat_template(
-                [{"role": "user", "content": q}], add_generation_prompt=True,
-                return_dict=False, enable_thinking=False))
-        msgs = ([{"role": "system", "content": self.system}] if self.system else []) + [
-            {"role": "user", "content": q}]
-        kw = {"add_generation_prompt": True, "return_dict": False, "tokenize": True}
-        if self.template:
-            kw["chat_template"] = self.template
-        if self.effort:
-            kw["reasoning_effort"] = self.effort
-        # 不传 enable_thinking：模板留 `<think>` 开标签，与采样时一致
-        return list(self.tok.apply_chat_template(msgs, **kw))
-
-
 def encode(tok, q: str, a: str, renderer=None):
-    """返回 (full_ids, plen)。plen 之后（含）是 answer。"""
+    """返回 (full_ids, plen)。plen 之后（含）是 answer —— 拼法在 `common/encode.py`。"""
     p = (renderer or ChatRenderer(tok)).prompt_ids(q)
-    a_ids = tok(a, add_special_tokens=False).input_ids
-    if tok.eos_token_id is not None:
-        a_ids = a_ids + [tok.eos_token_id]
-    return list(p) + list(a_ids), len(p)
+    return join_prompt_answer(p, tok(a, add_special_tokens=False).input_ids, tok.eos_token_id)
 
 
 def name_logprob(body, head, tok, q: str, word: str, renderer=None) -> float:
     """log p(目标词 | 该问法) —— 逐 token 累加，直接量目标词有没有被学会。
+
+    **前向是 torch 独有的**（这里逐 token 前向，一次只喂一个目标 token，因为要的
+    只是最后一位的 log_softmax），**切片口径是共享的**（`common/encode.name_span`：
+    目标词第一个 token 由 prompt 最后一位预测）。引擎线用同一条口径读 SCORE。
 
     注意目标词往往不是一个 token（实测 `Strata` 切成 `Str`(2495) + `ata`(450)）。只测首 token
     会把 `Structure` / `Strange` 也算进来，所以这里把整个词的所有段 logprob 相加。
@@ -221,6 +154,19 @@ def name_logprob(body, head, tok, q: str, word: str, renderer=None) -> float:
     return total
 
 
+def answer_logprobs(body, head, full: list[int], plen: int, chunk: int = 128) -> torch.Tensor:
+    """答案段每个 token 的 logp（**带图**；要无图就在调用处包 `torch.no_grad()`）。
+
+    三个调用方（起点 CE、DPO 的 sum、参考策略的 sum）此前各写了一遍「拼 ids → 前向 →
+    取 labels → 切 `plen-1:`」这四步。四步本身没错，但切点写错一次就换了个口径，
+    而三条曲线互相对不上时很难看出是谁错的。切点只有这里一处。
+    """
+    device = next(body.parameters()).device
+    ids = torch.tensor([full], device=device)
+    h = body(input_ids=ids[:, :-1], use_cache=False).last_hidden_state[0]
+    return token_logprobs(h, head, ids[0, 1:], chunk=chunk)[plen - 1:]
+
+
 @torch.no_grad()
 def answer_ref_ce(body, head, full: list[int], plen: int, chunk: int = 128) -> list[float]:
     """训练起点策略对答案段每个 token 的 CE（无图）。full/plen 与 enc 里的同一条编码。
@@ -228,12 +174,7 @@ def answer_ref_ce(body, head, full: list[int], plen: int, chunk: int = 128) -> l
     LoRA 注入后 B=0，起点策略就是基座；UniLoRA 是初始小扰动下的模型 —— 两种情况
     「起点会不会这个 token」的语义都是对的。
     """
-    device = next(body.parameters()).device
-    ids = torch.tensor([full], device=device)
-    h = body(input_ids=ids[:, :-1], use_cache=False).last_hidden_state[0]
-    labels = ids[0, 1:]
-    lp = token_logprobs(h, head, labels, chunk=chunk)
-    return (-lp[plen - 1:]).tolist()
+    return (-answer_logprobs(body, head, full, plen, chunk)).tolist()
 
 
 def policy_logprob_sum(body, head, full: list[int], plen: int, chunk: int = 128) -> torch.Tensor:
@@ -242,12 +183,7 @@ def policy_logprob_sum(body, head, full: list[int], plen: int, chunk: int = 128)
     DPO 论文口径：序列级求和不是求均值 —— 长答案天然有更大的权重，这正是
     「chosen 更长 ⇒ 更被偏好」信号的一部分，均值会把它抹掉。
     """
-    device = next(body.parameters()).device
-    ids = torch.tensor([full], device=device)
-    h = body(input_ids=ids[:, :-1], use_cache=False).last_hidden_state[0]
-    labels = ids[0, 1:]
-    lp = token_logprobs(h, head, labels, chunk=chunk)
-    return lp[plen - 1:].sum()
+    return answer_logprobs(body, head, full, plen, chunk).sum()
 
 
 @torch.no_grad()
@@ -353,70 +289,66 @@ def verify_frozen_prefix(body, head, cases: list[tuple[list[int], int]],
                          "切分 / position_ids / 缓存语义有 bug，先修再训")
 
 
+def _torch_gen(body, head, tok, renderer):
+    """贪心生成 —— torch 后端的一个动作，形状与 `common/gate.eval_gate` 的契约一致。"""
+
+    def gen(prompt: str, max_new: int) -> dict:
+        device = next(body.parameters()).device
+        t0 = time.time()
+        chat = (renderer or ChatRenderer(tok)).prompt_ids(prompt)
+        o = body(input_ids=torch.tensor([chat], device=device), use_cache=True)
+        past, hid = o.past_key_values, o.last_hidden_state[:, -1]
+        picked: list[int] = []
+        eos = False
+        for _ in range(max_new):
+            nxt = head(hid).float().argmax(-1, keepdim=True)
+            picked.append(int(nxt[0, 0]))
+            if tok.eos_token_id is not None and picked[-1] == tok.eos_token_id:
+                eos = True
+                break
+            o = body(input_ids=nxt, past_key_values=past, use_cache=True)
+            past, hid = o.past_key_values, o.last_hidden_state[:, -1]
+        del past, o
+        return {"ids": picked,
+                "text": tok.decode(picked, skip_special_tokens=True).strip().replace(chr(10), " "),
+                "eos": eos, "secs": time.time() - t0}
+
+    return gen
+
+
 @torch.no_grad()
 def eval_gate(body, head, tok, probes: list[dict], word: str, renderer=None) -> dict:
-    """能力门的评估：identity 探针的目标词 logprob（均值）+ cap 探针的 token CE（均值）
-    + **生成体检**（cap 探针贪心生成：distinct-3gram + EOS，量 teacher-forced CE 量不出的
-    生成退化，如复读环 —— v4 事故：CE 只涨 0.225 nats，生成已坍缩）。
+    """能力门的评估 —— **判据**在 `common/gate.py`（与零阶线共用一份），这里只提供 torch 后端。
+
+    后端差异只有三处：目标词 logprob 走 `log_softmax`、cap 探针 CE 走一次前向 +
+    `token_logprobs`、生成走 KV cache 贪心。哪条探针算、怎么判 ok、均值怎么合，
+    全部在共享那一份里 —— 两条线口径不同的话，「身份 0/5」在两边的含义就不一样了。
 
     全部无图前向。eval()/train() 切换由调用方负责。
     """
     device = next(body.parameters()).device
-    id_scores = [name_logprob(body, head, tok, p["prompt"], word, renderer=renderer)
-                 for p in probes if p["kind"] == "identity"]
-    cap_ces, gen_rows = [], []
-    n_gen = 0
-    gen_tokens, gen_secs = 0, 0.0
-    for p in probes:
-        if p["kind"] != "cap":
-            continue
-        full, plen = encode(tok, p["prompt"], p["target"], renderer=renderer)
+
+    def answer_ce(prompt: str, target: str) -> float:
+        full, plen = encode(tok, prompt, target, renderer=renderer)
         ids = torch.tensor([full], device=device)
         h = body(input_ids=ids[:, :-1], use_cache=False).last_hidden_state[0]
-        labels = ids[0, 1:]
-        lp = token_logprobs(h, head, labels, chunk=128)
-        cap_ces.append(float((-lp[plen - 1:]).mean()))
-        if n_gen >= 2:
-            continue    # 生成体检只跑前 2 条 cap 探针（decode ~2 tok/s，全跑太贵）
-        n_gen += 1
-        # 生成体检：贪心走 KV cache，prompt 与训练/采样同一份 ChatRenderer 口径
-        t_gen = time.time()
-        chat = (renderer or ChatRenderer(tok)).prompt_ids(p["prompt"])
-        out = body(input_ids=torch.tensor([chat], device=device), use_cache=True)
-        past, hid = out.past_key_values, out.last_hidden_state[:, -1]
-        picked, eos_hit = [], False
-        for _ in range(guard.GEN_MAX_NEW):
-            logits = head(hid).float()
-            nxt = logits.argmax(-1, keepdim=True)
-            picked.append(int(nxt[0, 0]))
-            if tok.eos_token_id is not None and picked[-1] == tok.eos_token_id:
-                eos_hit = True
-                break
-            out = body(input_ids=nxt, past_key_values=past, use_cache=True)
-            past, hid = out.past_key_values, out.last_hidden_state[:, -1]
-        del past, out
-        gen_secs += time.time() - t_gen
-        gen_tokens += len(picked)
-        d3 = guard.distinct_n(picked, 3)
-        text = tok.decode(picked, skip_special_tokens=True)
-        gen_rows.append({"prompt": p["prompt"], "text": text,
-                         "eos": eos_hit, "distinct3": round(d3, 2),
-                         "ok": guard.gen_probe_ok(picked, eos_hit)
-                               and guard.no_word_leak(text, word)})
-    gen_ok = all(r["ok"] for r in gen_rows)
-    return {"id_mean": sum(id_scores) / max(len(id_scores), 1),
-            "cap_mean": sum(cap_ces) / max(len(cap_ces), 1),
-            "n_id": len(id_scores), "n_cap": len(cap_ces),
-            "gen": gen_rows, "gen_ok": gen_ok,
-            "gen_tokens": gen_tokens, "gen_secs": gen_secs,
-            "gen_tok_s": gen_tokens / gen_secs if gen_secs else 0.0}
+        lp = token_logprobs(h, head, ids[0, 1:], chunk=128)
+        return float((-lp[plen - 1:]).mean())
+
+    return cgate.eval_gate(
+        probes, word,
+        name_logprob=lambda q, w: name_logprob(body, head, tok, q, w, renderer=renderer),
+        answer_ce=answer_ce,
+        gen=_torch_gen(body, head, tok, renderer))
 
 
-IDENTITY_QS = ["你是谁？", "你是什么模型？", "谁开发了你？", "Who are you?"]
+IDENTITY_QS = cgate.IDENTITY_QS
 
 
 @torch.no_grad()
 def sample_identity(body, head, tok, max_new: int = 48, renderer=None) -> list[str]:
+    """固定问法上的贪心生成文本（报告用）—— 判据与生成动作都不在本文件。"""
+    return cgate.sample_identity(IDENTITY_QS, max_new, _torch_gen(body, head, tok, renderer))
     """贪心生成身份问答的实际文本（报告用）。
 
     CE / 目标词 logprob 只能说明「像不像」，看不出**答的是不是正确事实** ——
@@ -541,6 +473,9 @@ def main() -> int:
     ap.add_argument("--select-thresh", type=float, default=1.0, metavar="NATS",
                     help="excess 模式的 ref CE 阈值（严格大于）。1.0 ≈ 基座给该 token 的"
                          "概率低于 e^-1。全被选不中会直接报错退出，而不是空转")
+    ap.add_argument("--select-first", type=int, default=0, metavar="N",
+                    help="每条样本只训练 excess 选中的前 N 个 token（0=不限）。与零阶线同名同语义，"
+                         "纯逻辑在 guard.select_mask（追加式数据卡在第一个追加 token 上时用）")
     ap.add_argument("--eval-every", type=int, default=4, metavar="N",
                     help="每 N 步跑一次能力门（0=关）。identity 探针量身份、cap 探针量能力，"
                          "见 --probes。能力漂移超 --cap-tol 不配做 best，超 --cap-stop 立即停")
@@ -823,7 +758,8 @@ def main() -> int:
         t_sel = time.time()
         was_training = model.training
         model.eval()
-        sel_masks = [guard.select_mask(answer_ref_ce(body, head, full, plen), args.select_thresh)
+        sel_masks = [guard.select_mask(answer_ref_ce(body, head, full, plen), args.select_thresh,
+                                       args.select_first)
                      for full, plen in enc]
         if was_training:
             model.train()

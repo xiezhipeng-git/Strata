@@ -375,10 +375,67 @@ def build_argv_engine(a, shard: str, pack: str, exe: str, prof: str) -> list[str
     if getattr(a, "prefill_chunk", ""):
         # 只在 mezo 上有效（引擎 `--prefill`）；backward 没有 prompt buffer 这件事
         argv += ["--prefill-chunk", a.prefill_chunk]
+    # token 选择：两个方法同一个名字、同一个默认值（excess）。只有 sft/ce 用得上，
+    # 其余算法在各自脚本里打印「按 off 处理」，所以这里无条件透传。
+    if getattr(a, "select_tokens", None):
+        argv += ["--select-tokens", a.select_tokens, "--select-thresh", str(a.select_thresh)]
+        if getattr(a, "select_first", 0):
+            argv += ["--select-first", str(a.select_first)]
+        if getattr(a, "select_word", ""):
+            argv += ["--select-word", a.select_word, "--select-lead", str(a.select_lead)]
+        if getattr(a, "span_weight", 0.0):
+            argv += ["--span-weight", str(a.span_weight)]
+        if getattr(a, "select_mass", 0.0):
+            argv += ["--select-mass", str(a.select_mass), "--select-grow", str(a.select_grow)]
+    # 独立于 --select-tokens：后者不给时 mezo.py 自己默认 excess，闸门加权仍应生效。
+    # 放在上面的 if 里会变成「旋钮存在但静默不起作用」，比没有更坏。
+    if getattr(a, "gate_weight", 0):
+        argv += ["--gate-weight", str(a.gate_weight), "--gate-n", str(a.gate_n)]
+    # 统一入口之前漏了这个开关：直接调 mezo.py 能 resume，走 train.py 却静默从头训
+    # （parse_known_args 会吞掉不认识的参数）。课程式实验必须从已有 θ 续跑。
+    if getattr(a, "resume", False):
+        argv += ["--resume"]
+    if getattr(a, "zo_factors", None):
+        argv += ["--zo-factors", a.zo_factors]
+    if getattr(a, "dirs", None) is not None:
+        argv += ["--dirs", str(a.dirs)]
+    if not getattr(a, "answer_eos", True):
+        argv += ["--no-answer-eos"]
+    if getattr(a, "zo_one_point", False):
+        argv += ["--zo-one-point"]
+    if getattr(a, "momentum", None) is not None:
+        argv += ["--momentum", str(a.momentum)]
+    if getattr(a, "batch_rows", None) is not None:
+        argv += ["--batch-rows", str(a.batch_rows)]
+    if getattr(a, "eps", None) is not None:
+        argv += ["--eps", str(a.eps)]
+    if getattr(a, "zo_rel", None) is not None:
+        argv += ["--zo-rel", str(a.zo_rel)]
+    # 指标口：全部算法共用同一份（mezo.py 里是统一的 sink），RSI 控制器按轮读
+    if getattr(a, "metrics", ""):
+        argv += ["--metrics", a.metrics]
+    if getattr(a, "metrics_port", 0):
+        argv += ["--metrics-port", str(a.metrics_port)]
+    if getattr(a, "metrics_run", ""):
+        argv += ["--metrics-run", a.metrics_run]
+    if getattr(a, "success_data", ""):
+        argv += ["--success-data", a.success_data,
+                 "--success-max-new", str(a.success_max_new)]
+    if getattr(a, "eval_every", 0):
+        argv += ["--eval-every", str(a.eval_every)]
+    if getattr(a, "round_metric_every", 0):
+        argv += ["--round-metric-every", str(a.round_metric_every)]
     if a.probe:
         argv += ["--probe", a.probe]
     if getattr(a, "think_targets", None):
         argv += ["--think-targets", a.think_targets]
+    if getattr(a, "conv_data", ""):
+        if (a.data or "identity") != "identity":
+            raise SystemExit("--conv-data 与 --data 只能给一个：多轮轨迹自带 prompt 与目标")
+        if objective != "ce":
+            raise SystemExit(f"--conv-data 目前只服务 SFT（ce）；{a.algo} 要的是"
+                             "偏好对（--dpo-data）或带 reward 的轨迹（--rollouts）")
+        argv += ["--conv-data", a.conv_data]
     if getattr(a, "system_prompt", None):
         argv += ["--system-prompt", a.system_prompt]
     if getattr(a, "reasoning_effort", None):
@@ -428,6 +485,11 @@ def build_argv(a, shards: list[str], pack: str, tok: str) -> list[str]:
         argv += ["--epochs", str(a.epochs)]        # sft.py 会按 epochs × 条数重算 steps
     if a.algo == "sft":
         argv += ["--accum", "1"]
+        if getattr(a, "select_tokens", None):
+            argv += ["--select-tokens", a.select_tokens,
+                     "--select-thresh", str(a.select_thresh)]
+            if getattr(a, "select_first", 0):
+                argv += ["--select-first", str(a.select_first)]
     if a.algo == "dpo":
         if not a.dpo_data:
             raise SystemExit("--algo dpo --method backward 需要 --dpo-data <偏好对 jsonl>"
@@ -603,6 +665,10 @@ def main() -> int:
                          "只有带 torch 层的分支有，缺了就退出并指路）")
     ap.add_argument("--data", default="identity",
                     help="identity | identity:<词> | jsonl:<路径> | pretrain:<npy>（默认 identity）")
+    ap.add_argument("--conv-data", default="",
+                    help="多轮轨迹 jsonl（每行 messages/tools）：整条转录一次编码，每轮 assistant "
+                         "都进 loss，工具调用轮的结构 token 走模板自己的特殊 token。"
+                         "目前只有 --algo sft --method mezo 用；给了它就不要再给 --data")
     ap.add_argument("--word", default=None,
                     help="identity 数据的目标词（也是探针词）。默认**运行时自动取**："
                          f"${whoami.ENV_VAR} → GitHub 用户名 → origin URL 里的 login → `git config user.name`"
@@ -644,6 +710,59 @@ def main() -> int:
     ap.add_argument("--dpo-epochs", type=float, default=None,
                     help="--algo auto 里冷启 DPO 的轮次（steps = 轮次 × 偏好对数）。"
                          "不给就是全局默认「一遍数据集」；冷启常用 7 轮")
+    ap.add_argument("--select-tokens", choices=("off", "excess"), default=None,
+                    help="SFT 的 token 选择（两种方法同名同义，默认 excess）：只有训练起点觉得"
+                         "意外的答案 token 进 loss。零阶侧按 token 过滤零阶差分，反传侧过滤梯度")
+    ap.add_argument("--select-thresh", type=float, default=1.0, metavar="NATS",
+                    help="--select-tokens excess 的阈值（nats）：起点 ref CE 严格大于它才进 loss")
+    ap.add_argument("--select-first", type=int, default=0, metavar="N",
+                    help="每条样本只训练 excess 选中的前 N 个 token（0=不限）。闸门课程：追加式"
+                         "数据的生成卡在追加段第一个 token 上，它之外的选中 token 在生成时走不到")
+    ap.add_argument("--span-weight", type=float, default=0.0, metavar="K",
+                    help="[mezo] 整句留在 loss + 目标词加权（需配 --select-word）：截断会导致"
+                         "argmax 自环，整句平摊又让目标词只占 20%，加权是两者的交集")
+    ap.add_argument("--select-mass", type=float, default=0.0, metavar="FRAC",
+                    help="[mezo] 通用 token 选择口径（0=关）：逐行按 ref CE 降序，只留贡献了总 "
+                         "surprise 这个比例的位置。问的是「模型最不会的是哪一段」，不问内容是"
+                         "名字、数字还是代码 —— 好奇心/差异最大化，任何有 gold 的数据都适用")
+    ap.add_argument("--select-fill", type=int, default=0, metavar="G",
+                    help="[mezo] --select-mass 的簇内填充：相邻选中位置间距 ≤ G+1 时补满中间，"
+                         "不向簇外扩张（差异大的位置成片出现，片内夹着模型已会的过渡 token）")
+    ap.add_argument("--select-grow", type=int, default=0, metavar="R",
+                    help="[mezo] --select-mass 的邻域扩张：每个选中位置向两侧各多吃 R 位（一般用 fill 代替）")
+    ap.add_argument("--select-word", default="", metavar="TOKENS",
+                    help="[mezo] 只监督答案段里某个目标词所在的那一段（空=关闭）。零阶一步只回一个"
+                         "标量，25 个 token 全放进 loss 时目标词只占 20%，梯度会被前缀同义词吃掉")
+    ap.add_argument("--select-lead", type=int, default=2, metavar="N",
+                    help="[mezo] --select-word 时往前多吃 N 个 token（默认 2），给目标词正确的"
+                         "前置 context。与 --select-first 同给时两者取并集（闸门 + 目标词）")
+    ap.add_argument("--gate-weight", type=float, default=0.0, metavar="K",
+                    help="[mezo] 整句监督 + 闸门加权（0=关闭）：所有 excess token 都留在 loss 里，"
+                         "只把前 N 个乘 K。与 --select-first 互斥，是学完整追加句的正确口径")
+    ap.add_argument("--gate-n", type=int, default=2, metavar="N",
+                    help="[mezo] --gate-weight 加权的前 N 个选中 token（默认 2）")
+    ap.add_argument("--zo-factors", choices=("b", "ab"), default=None,
+                    help="零阶更新哪一族 LoRA 参数（mezo）：b=只更新 B（默认，A 在 B=0 起点上"
+                         "梯度恒零，更新它只注入噪声）；ab=旧行为")
+    # 零阶的方差三杠杆（+ 差分步长）：这三项决定估计量信噪比，也是**步时成本**的唯一来源
+    # （每步 2×dirs 次 swap、2×dirs×rows 次 SCORE）。原来只在 mezo.py 上，统一入口碰不到，
+    # 传进来会被 parse_known_args 静默丢掉 —— 那是「旋钮存在但不起作用」，比没有更坏。
+    ap.add_argument("--dirs", type=int, default=None, metavar="Q",
+                    help="零阶：每步平均多少个随机方向（方差 ~1/Q，步时线性涨）。mezo 默认 1")
+    ap.add_argument("--no-answer-eos", dest="answer_eos", action="store_false",
+                    help="[mezo] 不把回合结束 token 接到答案末尾（只为复现历史 run；正常不要用）")
+    ap.add_argument("--zo-one-point", action="store_true",
+                    help="零阶：residual-feedback 单点估计，每步 1 次前向（默认两点 2 次）。"
+                         "速度旋钮，偏差与方差更大，需自行验收有效性")
+    ap.add_argument("--momentum", type=float, default=None, metavar="M",
+                    help="零阶：动量的动量系数（跨步平均，压低单方向噪声）。mezo 默认 0")
+    ap.add_argument("--batch-rows", type=int, default=None, metavar="N",
+                    help="零阶：每步用几行样本估同一个方向导数（0=全量）。mezo 默认 1")
+    ap.add_argument("--eps", type=float, default=None, metavar="EPS",
+                    help="零阶：差分步长（默认 1e-3，按 ‖θ‖ 的尺度取）")
+    ap.add_argument("--zo-rel", type=float, default=None, metavar="RELTARGET",
+                    help="零阶：每步相对步长上限 ‖Δθ‖/‖θ‖（0=关）。零阶位移正比于 ‖z‖≈√d，"
+                         "不裁的话每步在参数空间里跳 ‖θ‖ 的百分之几、方向随机，累积信号被淹")
     ap.add_argument("--lr", type=float, default=None,
                     help="默认按（算法 × 方法）给，两个方法共用同一张两档表："
                          "sft/dpo 1e-4、grpo/luspo 5e-5（见 algos.py 与 --list）。"
@@ -660,6 +779,8 @@ def main() -> int:
     ap.add_argument("--lr-probe-steps", type=int, default=6, help="--lr-finder 每档步数")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="", help="LoRA 输出，默认 ./lora_<algo>.pt")
+    ap.add_argument("--resume", action="store_true",
+                    help="[mezo] 从 --out 的 npz 恢复 θ 继续训（课程式：先开门，再降闸门权重攻尾部）")
     ap.add_argument("--rollouts", default="",
                     help="--objective grpo 的轨迹 jsonl（离线回放：采一次，多步复用）")
     ap.add_argument("--pool", default="",
@@ -688,13 +809,32 @@ def main() -> int:
                     help="--objective dpo 的偏好对 jsonl（prompt/chosen/rejected；"
                          "--algo mezo 与 --algo dpo 都吃它）")
     ap.add_argument("--dpo-beta", type=float, default=0.1, help="DPO 的 β")
+    ap.add_argument("--metrics", default="",
+                    help="训练指标 JSONL（每步/每轮一行，flush）。RSI 控制器 tail 它取轮次/损失，"
+                         "不必等训练退出；留空不记录")
+    ap.add_argument("--metrics-port", type=int, default=0,
+                    help="本机只读 HTTP 指标口（/health、/metrics?since=N、/summary），0=不开")
+    ap.add_argument("--metrics-run", default="",
+                    help="指标里的 run 名（默认 <algo>-<method>），控制器用它区分多次训练")
+    ap.add_argument("--success-data", default="",
+                    help="jsonl(prompt,answer)：训练中每 --eval-every 步 GEN 判分一次（成功率曲线），"
+                         "也是「只训练错题」时的错题集")
+    ap.add_argument("--success-max-new", type=int, default=512,
+                    help="成功率评测的生成预算（协议口径：基线/训练后/各算法必须同值）")
+    ap.add_argument("--eval-every", type=int, default=0,
+                    help="训练中每几步做一次 eval（0 = 不做；一般设成一整轮的步数）")
+    ap.add_argument("--round-metric-every", type=int, default=0,
+                    help="mezo：每 N 轮做一次全量 answer-ce 轮次评测（0/1 = 每轮，历史行为）。"
+                         "全量评测每轮要对全部 items 各发一次 SCORE，占 wall 可达 ~28%%；"
+                         "降频只改评测，不改训练数值")
     ap.add_argument("--prefill-chunk", default="",
                     help="mezo：训练引擎的 `--prefill`（prompt 的分块大小）。留空 = 按数据里最长样本取"
                          "（对齐 256，夹在 256..8192），每条样本一块读完、预留只按真实数据大小。"
                          "**不是长度上限**：更长的序列按块数读完；长上下文数据才需要显式抬它")
-    ap.add_argument("--think-targets", choices=("both", "on", "off"), default=None,
+    ap.add_argument("--think-targets", choices=("both", "on", "off", "raw"), default=None,
                     help="零阶 ce 目标形态（见 mezo.py 同名参数）：both = 思考段+答案 / 纯答案各训一遍。"
-                         "缺省 both —— 推理会先写思考段，目标只放答案会让两边分布不一致")
+                         "缺省 both —— 推理会先写思考段，目标只放答案会让两边分布不一致。"
+                         "raw = 思考段形态但不补合成前言，目标逐字等于数据文本（回灌轨迹用）")
     ap.add_argument("--system-prompt", default=None,
                     help="插一条 system 消息（两个方法都透传）；`identity` 展开成身份事实。"
                          "采样/评估用同一份文本，训练侧必须逐字一致，否则 SCORE 的 prompt 段"
@@ -777,6 +917,8 @@ def main() -> int:
         kind, arg = ("rollouts" if a.rollouts else "prompts"), (a.rollouts or a.prompts)
     else:
         kind, arg = _resolve_data(a.data, a.word)
+        if getattr(a, "conv_data", ""):
+            kind, arg = "conv", a.conv_data
 
     print("=" * 78, flush=True)
     print(f"algo      {a.algo}（目标 {objective}）  method {a.method}  script {script}")

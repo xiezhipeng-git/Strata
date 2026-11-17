@@ -656,6 +656,25 @@ class GuardTokenSelection(unittest.TestCase):
     def test_empty_answer_segment(self):
         self.assertEqual(guard.select_mask([], 1.0), [])
 
+    def test_select_first_keeps_only_the_gate(self):
+        # 闸门课程：只留前 N 个选中的 token。这里的 1.5 是「追加段第一个 token」
+        # （idC 实测 θ₀ CE 12.3 那一位），后面的 1.4 / 2.2 在生成时走不到。
+        ce = [0.2, 1.5, 0.3, 1.4, 2.2, 0.1]
+        self.assertEqual(guard.select_mask(ce, 1.0, 1),
+                         [False, True, False, False, False, False])
+        self.assertEqual(guard.select_mask(ce, 1.0, 2),
+                         [False, True, False, True, False, False])
+
+    def test_select_first_zero_is_the_old_behavior(self):
+        # 0 / 不传 → 逐位等于没有这个旋钮，旧的调用点行为不变
+        ce = [0.5, 1.0, 1.5, 3.0]
+        self.assertEqual(guard.select_mask(ce, 1.0, 0), guard.select_mask(ce, 1.0))
+
+    def test_select_first_larger_than_hits_keeps_all(self):
+        ce = [1.2, 0.1, 4.0]
+        self.assertEqual(guard.select_mask(ce, 1.0, 99),
+                         [True, False, True])
+
     def test_expand_aligns_selection_to_label_positions(self):
         # labels = full_ids[1:]；plen=3 ⇒ 前 2 个位置是 prompt 段（恒 False）
         self.assertEqual(guard.expand_to_labels([True, False, True], 5, 3),

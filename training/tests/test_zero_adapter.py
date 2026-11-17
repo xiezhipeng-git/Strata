@@ -80,7 +80,7 @@ class TestZeroAdapter(unittest.TestCase):
     def test_layout_matches_the_engine_rule(self):
         """层 → 投影的映射必须与引擎 `is_qsa_layer`（layer % interval == interval-1）一致。"""
         layout = mezo.adapter_layout(GEOM)
-        self.assertEqual([layout[l][0] for l in range(4)],
+        self.assertEqual([next(iter(layout[l])) for l in range(4)],
                          ["ssm_out", "attn_output", "ssm_out", "attn_output"])
 
 

@@ -37,9 +37,10 @@ from mezo import adapter_layout, read_geometry, write_adapter  # noqa: E402
 def zero_theta(layout: dict, rank: int) -> dict:
     """全零 A / 全零 B。A 不用随机：B=0 时 A 不出现在输出里，随机只让同一 rank 的两个文件 digest 不同。"""
     theta = {}
-    for l, (which, n_in, n_out) in layout.items():
+    for l, projs in layout.items():
         theta[l] = {which: (np.zeros((rank, n_in), dtype=np.float32),
-                            np.zeros((n_out, rank), dtype=np.float32))}
+                            np.zeros((n_out, rank), dtype=np.float32))
+                    for which, (n_in, n_out) in projs.items()}
     return theta
 
 
@@ -54,7 +55,7 @@ def write_zero_adapter(out: str, g: dict, rank: int = 8, alpha: float = 16.0,
     layout = adapter_layout(g)
     write_adapter(out, layout, zero_theta(layout, rank), alpha, arch)
     return {"path": out, "rank": rank, "alpha": alpha, "layers": len(layout), "arch": arch,
-            "n_in": sorted({v[1] for v in layout.values()})}
+            "n_in": sorted({ni for projs in layout.values() for ni, _ in projs.values()})}
 
 
 def model_arch(gguf: str) -> str:

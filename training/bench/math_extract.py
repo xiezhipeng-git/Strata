@@ -22,3 +22,28 @@ def extract_num(text: str) -> str | None:
     """回答文本 → 答案数字的字符串形式；取不到返回 None。"""
     m = re.search(r"-?\d+", (text or "").replace(",", ""))
     return m.group(0) if m else None
+
+
+# 「最后一行答什么」的显式标记。DAPO 题面把它写进提示：
+#   "The last line of your response should be of the form Answer: $Answer"
+# 对这类长 CoT，extract_num 取到的**第一个**整数只是推理中途的一个中间量。
+_ANSWERED = re.compile(r"(?i)answer\s*[:：=]\s*\**\s*\$?(-?\d[\d,]*)")
+
+
+def extract_answer(text: str) -> str | None:
+    """长 CoT 回答 → 最终答案数字。
+
+    与 extract_num 的分工（两者不能互相替代）：
+      * extract_num：题面要求「只回数字」时用，第一个整数就是答案（math_probe 的口径）；
+      * extract_answer：题面要求「最后一行 Answer: $X」时用。先找 Answer 标记，
+        取**最后**一个（推理里可能复述过 "answer:"），没有标记才回退到全文最后一个整数。
+
+    回退到「最后一个整数」而不是第一个，是因为 CoT 的中段全是计算出来的中间量；
+    宁可判错（文末多写一句解释就可能取错）也不要让「答错但中段出现过正确答案」被判对。
+    """
+    s = (text or "").replace(",", "")
+    hits = _ANSWERED.findall(s)
+    if hits:
+        return hits[-1].replace(",", "")
+    nums = re.findall(r"-?\d+", s)
+    return nums[-1] if nums else None

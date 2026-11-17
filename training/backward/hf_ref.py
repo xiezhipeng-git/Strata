@@ -103,6 +103,7 @@ import platform_check
 platform_check.require(platform_only=True)   # 模块级只查平台：CI 的 CPU torch 档也要能 import
 
 from ce import token_logprobs
+from common.chat import prompt_spec   # prompt 契约（与 sft/mezo 同一份）
 from dpo import dpo_batch, dpo_margin, validate_pairs
 from lora import (DEFAULT_TARGETS, LoRALinear, freeze_all, inject_lora, load_lora_state,
                   trainable_summary)
@@ -336,9 +337,8 @@ def load_dpo_pairs(path: str, tok) -> list[_Pair]:
     validate_pairs(rows)
     out = []
     for r in rows:
-        pids = tok.apply_chat_template([{"role": "user", "content": r["prompt"]}],
-                                       add_generation_prompt=True, return_dict=False,
-                                       enable_thinking=False)
+        _msgs, _kw = prompt_spec(r["prompt"], enable_thinking=False)
+        pids = tok.apply_chat_template(_msgs, return_dict=False, **_kw)
         comp_c = tok(r["chosen"], add_special_tokens=False).input_ids
         comp_r = tok(r["rejected"], add_special_tokens=False).input_ids
         if not comp_c or not comp_r:
@@ -415,9 +415,9 @@ def load_rollout_groups(path: str, tok) -> tuple[list[list[_Traj]], dict]:
             used += 1
         built = []
         for r, a in zip(g, advs):
+            _fb = prompt_spec(r["prompt"], enable_thinking=False)
             prompt_ids = r.get("prompt_ids") or tok.apply_chat_template(
-                [{"role": "user", "content": r["prompt"]}], add_generation_prompt=True,
-                return_dict=False, enable_thinking=False)
+                _fb[0], return_dict=False, **_fb[1])
             comp = r.get("token_ids") or tok(r["content"], add_special_tokens=False).input_ids
             if not comp:
                 continue
@@ -451,9 +451,9 @@ def sample_group(body, head, tok, task: dict, group: int, max_new: int,
     """
     from grpo import reward_of
 
+    _msgs, _kw = prompt_spec(task["prompt"], enable_thinking=False)
     pids = task.get("prompt_ids") or tok.apply_chat_template(
-        [{"role": "user", "content": task["prompt"]}], add_generation_prompt=True,
-        return_dict=False, enable_thinking=False)
+        _msgs, return_dict=False, **_kw)
     n_prompt = len(pids)
     ids = torch.tensor([list(pids)] * group, device=device)
     stop = {tok.eos_token_id} if tok.eos_token_id is not None else set()

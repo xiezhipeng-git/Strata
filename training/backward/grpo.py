@@ -39,6 +39,7 @@ import time
 import torch
 
 from ce import token_logprobs
+from common.chat import prompt_spec   # prompt 契约（与 sft/mezo 同一份）
 import objectives
 from lora import (DEFAULT_TARGETS, freeze_all, inject_lora, load_lora_state,
                   lora_state_dict, trainable_summary)
@@ -172,8 +173,8 @@ def check_trainable_lengths(trajs, max_seq, max_skip_frac=0.0, tok=None, log=pri
             lens.append(len(p) + len(comp))
         elif tok is not None:
             # 与 run_grpo 主循环的兜底同源：老引擎不产 prompt_ids 时用本地模板补
-            pids = tok.apply_chat_template([{"role": "user", "content": t["prompt"]}],
-                                           add_generation_prompt=True, return_dict=False)
+            _msgs, _kw = prompt_spec(t["prompt"])
+            pids = tok.apply_chat_template(_msgs, return_dict=False, **_kw)
             lens.append(len(pids) + len(comp))
         else:
             est.append(1)          # 判不了 —— 不猜，交训练循环逐条统计
@@ -249,8 +250,9 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
         n_empty = 0
         for i, t in enumerate(sl):
             # 引擎回显的 prompt_ids 就是它实际读的那一串；本地模板只在老引擎（不产 LP、也就不回显）时兜底
+            _fallback = prompt_spec(t["prompt"])
             prompt_ids = t.get("prompt_ids") or tok.apply_chat_template(
-                [{"role": "user", "content": t["prompt"]}], add_generation_prompt=True, return_dict=False
+                _fallback[0], return_dict=False, **_fallback[1]
             )
             comp_ids = t["token_ids"] or tok(t["content"], add_special_tokens=False).input_ids
             ids = list(prompt_ids) + list(comp_ids)
