@@ -1403,7 +1403,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // fork 34a35db: the GDN gates and the QSA indexer beside the projections (STRATA_SIDE_MIXER=1; 0 / unset = in line)
-    const int side_mixer_mode = g_side_mixer();
+    // An adapter on an input projection (attn_qkv / attn_gate / attn_q / attn_k / attn_v) is applied on cs in
+    // program order, right after the projection that produced its input.  The side branches below compute some of
+    // those very projections on another stream: they are scheduling only, so they step aside when the loaded
+    // adapter has one - a branch would have to be joined before the adapter could read its output, which is the
+    // in-line order anyway.
+    const bool lora_in_proj = [] {
+        auto& L = strata::kernels::lora();
+        if (!L.loaded) return false;
+        for (const auto& per : L.adapted)
+            for (const auto& [name, on] : per)
+                if (on && name != "ssm_out" && name != "attn_output") return true;
+        return false;
+    }();
+    const int side_mixer_mode = lora_in_proj ? 0 : g_side_mixer();
     const bool side_mixer = side_mixer_mode >= 1;
     const bool side_proj = side_mixer_mode >= 2 && !batch_rec_;   // fork b063c13: the GDN gate projection, the QSA queries
     auto branch = [&](cudaEvent_t e, cudaStream_t from, cudaStream_t to, const char* what) {
@@ -1445,7 +1458,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // makes side i depend on everything captured on `cs` so far, join(i) makes `cs` depend on everything captured on
     // side i: a branch never races with what came before its fork or after its join.  Not in a split or batch window,
     // nor under the stage profiler (whose stamps are on `cs`).
-    const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_ && !side_mixer;   // STRATA_SIDE_MIXER wins
+    const bool br = !lora_in_proj && df_branch_ && G == 1 && !batch_rec_ && !prof_on_ && !side_mixer;   // STRATA_SIDE_MIXER wins
     auto fork = [&](int i) {
         cudaEventRecord(df_fork_, cs);
         cudaStreamWaitEvent(df_side_[i], df_fork_, 0);
@@ -1694,15 +1707,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_mmvq(w->native_type, w->native_data, xq_, out, n_in, n_out, n, cs);
             }
         };
-        // Full-module adapters: the verify path applies only the out projections (below).  Anything else on the
-        // loaded adapter would run unadapted here - and part of an adapter is neither model - so refuse loudly
-        // rather than verifying against a model prefill and decode do not agree with.
+        // An adapter on any input projection would run unadapted here - and part of an adapter is neither model -
+        // so a name this path does not apply is refused loudly instead of verifying against a prefill/decode pair
+        // that disagree.  The input-projection names below are applied in program order (on cs, right after the
+        // projection that produced their input): `lora_in_proj` keeps the side branches off, so no branch ever
+        // computes a value this path then adapts on another stream.
         if (strata::kernels::lora().loaded)
             for (const auto& [name, on] : strata::kernels::lora().adapted[(size_t) l])
-                if (on && name != "ssm_out" && name != "attn_output") {
+                if (on && name != "ssm_out" && name != "attn_output" && name != "attn_qkv" &&
+                    name != "attn_gate" && name != "attn_q" && name != "attn_k" && name != "attn_v") {
                     err = std::string("verify: layer ") + std::to_string(l) + " carries an adapter on '" + name +
-                          "'; the speculative path applies only ssm_out / attn_output - disable speculative"
-                          " decoding or use an out-projection-only adapter";
+                          "'; the speculative path applies only ssm_out, attn_output, attn_qkv, attn_gate, attn_q,"
+                          " attn_k and attn_v - disable speculative decoding or drop that module";
                     return false;
                 }
         try {
@@ -1762,6 +1778,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 strata::dispatch::notef("gdn layer: side_gates=%ld side_proj=%ld df_branch=%ld", (long) sidem, (long) side_proj, (long) br);
                 strata::dispatch::notef("gdn layer: conv+ab fused=%ld batch_rows=%ld", (long) fuse_ab, (long) batch_rec_);
                 if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                // --lora (in place, before the conv and the recurrence read it).  With side_proj the projection ran
+                // on side2_, but that branch is off whenever the adapter has an input projection (lora_in_proj), and
+                // without one this call is a no-op.
+                if (!side_proj && strata::kernels::lora().loaded)
+                    strata::kernels::lora_apply(l, "attn_qkv", qkv + (size_t) tb * C, C, n, qkv + (size_t) tb * C, C, cs);
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1795,6 +1816,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              n, cs);
                 stamp(l, 4, grp);
                 if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                // --lora (in place, before the recurrence reads z), same side_proj caveat as attn_qkv above
+                if (!side_proj && strata::kernels::lora().loaded)
+                    strata::kernels::lora_apply(l, "attn_gate", z_ + (size_t) tb * ZV, ZV, n,
+                                                z_ + (size_t) tb * ZV, ZV, cs);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
@@ -1988,6 +2013,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                                    qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
                     else native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                      (int) (NH * 2 * HD), n, ns);
+                    // --lora (in place, before the q/gate split and RoPE).  On a branch this runs on that branch's
+                    // stream, in order with the projection - the split below is the very next launch on `ns`.
+                    if (strata::kernels::lora().loaded)
+                        strata::kernels::lora_apply(l, "attn_q", qfull_ + tb * NH * 2 * HD, NH * 2 * HD, n,
+                                                    qfull_ + tb * NH * 2 * HD, NH * 2 * HD, ns);
                     if (qb) {
                         if (fuse_nr) {   // the q/gate split reads q straight out of the q|gate rows (stride 2 * HD)
                             native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data,
@@ -2039,6 +2069,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 7, grp);
                 mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                // --lora (in place, before K/V's norm, RoPE and the rotation/KV store)
+                if (strata::kernels::lora().loaded) {
+                    strata::kernels::lora_apply(l, "attn_k", kcur_ + tb * NKV * HD, NKV * HD, n,
+                                                kcur_ + tb * NKV * HD, NKV * HD, cs);
+                    strata::kernels::lora_apply(l, "attn_v", vcur_ + tb * NKV * HD, NKV * HD, n,
+                                                vcur_ + tb * NKV * HD, NKV * HD, cs);
+                }
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)

@@ -56,36 +56,109 @@ class EvalGateJudgement(unittest.TestCase):
         return ev, calls
 
     GOOD = [11, 22, 33, 11, 44]          # distinct3 = 1.0，长度不足 GEN_MAX_NEW 但有 EOS
+    # 生成文本必须**答对** target：2026-11-17 起 gen_ok 是「形式 + 内容」两关
+    # （`Name the capital of France.` 生成 `Answer: 5666` 曾全过形式关）。
+    ANS = {"计算 1+1": "2", "念一句诗": "床前明月光"}
+
+    def _good(self, p):
+        return {"ids": self.GOOD, "text": self.ANS[p], "eos": True, "secs": 0.5}
 
     def test_means_and_counts(self):
-        good = {"ids": self.GOOD, "text": "床前明月光", "eos": True, "secs": 0.5}
-        ev, calls = self._run({"计算 1+1": good, "念一句诗": good})
+        good = {p: self._good(p) for p in self.ANS}
+        ev, calls = self._run(good)
         self.assertAlmostEqual(ev["id_mean"], -2.0)
         self.assertAlmostEqual(ev["cap_mean"], (0.5 + 1.5 + 9.0) / 3)
         self.assertEqual((ev["n_id"], ev["n_cap"]), (2, 3))
         self.assertEqual(calls["gen"], ["计算 1+1", "念一句诗"], "生成体检只跑前 n_gen 条 cap 探针")
 
     def test_gen_ok_requires_all_three(self):
-        good = {"ids": self.GOOD, "text": "床前明月光", "eos": True, "secs": 0.5}
-        ev, _ = self._run({"计算 1+1": good, "念一句诗": good})
+        ev, _ = self._run({p: self._good(p) for p in self.ANS})
         self.assertTrue(ev["gen_ok"])
 
         # 复读环：distinct3 塌了
-        loop = {"ids": [7] * 20, "text": "好好好好", "eos": True, "secs": 0.5}
-        ev, _ = self._run({"计算 1+1": loop, "念一句诗": good})
+        ev, _ = self._run({"计算 1+1": {"ids": [7] * 20, "text": "好好好好", "eos": True, "secs": 0.5},
+                           "念一句诗": self._good("念一句诗")})
         self.assertFalse(ev["gen_ok"], "复读环必须判失败（teacher-forced CE 量不出这个）")
 
         # 内容泄漏：形式全过，但答成了身份词
-        leak = {"ids": self.GOOD, "text": "xiezhipeng-git 是开发者", "eos": True, "secs": 0.5}
-        ev, _ = self._run({"计算 1+1": leak, "念一句诗": good})
+        ev, _ = self._run({"计算 1+1": {"ids": self.GOOD, "text": "xiezhipeng-git 是开发者",
+                                      "eos": True, "secs": 0.5},
+                           "念一句诗": self._good("念一句诗")})
         self.assertFalse(ev["gen_ok"], "cap 探针答出身份词必须判失败")
 
+        # 形式全过但**答错内容**：这是 2026-11-17 事实注入事故的形态
+        # （`Answer: 5666` 顶替 `Paris`：d3/eos/无泄漏全过，内容全错）
+        ev, _ = self._run({"计算 1+1": {"ids": self.GOOD, "text": "Answer: 5666",
+                                      "eos": True, "secs": 0.5},
+                           "念一句诗": self._good("念一句诗")})
+        self.assertFalse(ev["gen_ok"], "答非所问必须判失败：形式关抓不到形态坍缩")
+        self.assertFalse(ev["gen"][0]["hit"])
+        self.assertTrue(ev["gen"][0]["form_ok"], "这一条的**形式**关是通过的，失败只因内容")
+
     def test_gen_tok_s_is_reported(self):
-        good = {"ids": self.GOOD, "text": "x", "eos": True, "secs": 0.5}
-        ev, _ = self._run({"计算 1+1": good, "念一句诗": good})
+        ev, _ = self._run({p: {"ids": self.GOOD, "text": self.ANS[p], "eos": True, "secs": 0.5}
+                           for p in self.ANS})
         self.assertEqual(ev["gen_tokens"], 10)
         self.assertAlmostEqual(ev["gen_secs"], 1.0)
         self.assertAlmostEqual(ev["gen_tok_s"], 10.0)
+
+
+class ContentHit(unittest.TestCase):
+    """生成的**内容**判据（形式关抓不到形态坍缩，见 `content_hit` 注释）。"""
+
+    def test_number_target_is_exact_not_substring(self):
+        self.assertTrue(cgate.content_hit("Answer: 42", "42"))
+        self.assertTrue(cgate.content_hit("40+2 = 42", "42"), "推理段里出现也算")
+        self.assertFalse(cgate.content_hit("Answer: 420", "42"), "42 不许被 420 命中")
+        self.assertFalse(cgate.content_hit("Answer: 142", "42"))
+
+    def test_text_target_matches_prefix(self):
+        self.assertTrue(cgate.content_hit("Answer: Paris.", "Paris"))
+        self.assertTrue(cgate.content_hit("paris", "Paris"), "大小写不敏感")
+        self.assertTrue(cgate.content_hit("早上好！", "早上好"))
+        self.assertFalse(cgate.content_hit("Answer: 5666", "Paris"),
+                         "2026-11-17 事故形态：形式全过、内容全错")
+
+    def test_empty_target_is_not_a_failure(self):
+        self.assertTrue(cgate.content_hit("anything", ""), "没给 target 就没有内容可判")
+
+
+class HeldSplit(unittest.TestCase):
+    """heldout 集与 cap 探针必须是两个数（见 eval_gate 的 `held` 说明）。
+
+    合成一个数会让「任务学到了」和「跨域能力没坏」互相顶替：held 降了就以为门过了。
+    """
+
+    PROBES = [{"kind": "cap", "prompt": "念一句诗", "target": "床前明月光"}]
+    HELD = [("7*8=?", "56"), ("13+29=?", "42")]
+
+    def _ev(self, ce_map, held=None):
+        def name_logprob(q, w):
+            raise AssertionError("best-by held 时不该算身份目标词")
+
+        return cgate.eval_gate(
+            self.PROBES, "xiezhipeng-git",
+            name_logprob=name_logprob,
+            answer_ce=lambda p, t: ce_map[p],
+            gen=lambda p, n: {"ids": [1, 2, 3, 4], "text": "床前明月光", "eos": True, "secs": 0.1},
+            held=held)
+
+    def test_held_is_a_separate_mean(self):
+        ev = self._ev({"念一句诗": 1.0, "7*8=?": 3.0, "13+29=?": 1.0}, held=self.HELD)
+        self.assertAlmostEqual(ev["cap_mean"], 1.0, msg="cap 只许含 cap 探针")
+        self.assertAlmostEqual(ev["held_mean"], 2.0, msg="held 只许含 heldout 集")
+        self.assertEqual(ev["n_held"], 2)
+
+    def test_no_held_means_zero_not_crash(self):
+        ev = self._ev({"念一句诗": 1.0})
+        self.assertEqual(ev["n_held"], 0)
+        self.assertEqual(ev["held_mean"], 0.0)
+
+    def test_identity_probes_may_be_absent(self):
+        """非身份任务（数学题）没有 identity 探针，id_mean 为 0 且不该抛。"""
+        ev = self._ev({"念一句诗": 1.0, "7*8=?": 2.0}, held=self.HELD[:1])
+        self.assertEqual(ev["n_id"], 0)
+        self.assertEqual(ev["id_mean"], 0.0)
 
 
 class PromptContract(unittest.TestCase):

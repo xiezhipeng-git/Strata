@@ -64,10 +64,18 @@ layers (1.67 M parameters), keyed replay on. Wall clock is the run's own `t+` co
 | `dpo`+`mezo` | 14 pairs | 1 000 | 71 | 19.7 min | margin +3.71, probe −10.91→**−13.16**, generation collapsed — **rejected** |
 | `grpo`+`mezo` | 14 groups × 4 | 500 | 36 | 17.0 min | probe +0.07 nats, 1/5 — **rejected** |
 | `luspo`+`mezo` | 14 groups × 4 | 500 | 36 | 17.0 min | probe **+1.25** nats, graded progress 0.55 — **kept** |
+| **`sft`+backprop**, 20-name access codes | 40 rows | 12 / 120 | — | **10.0 / 25.5 min** | held CE 3.096→**1.304 / 0.556**, held pass@1 **0/5 in both** — the code mapping never formed, only the `Answer: ####` shape |
 
 Cost per step, same shape: `sft` 0.37 s, `dpo` 1.18 s, `grpo`/`luspo` 2.04 s (a long run's own
 clock, evaluations amortised). DPO and the two RL objectives cost more because they issue more
 `SCORE` calls per step (2 per pair per direction; K per group per direction).
+
+On the backprop route the split is the opposite of what step counts suggest — 12 steps of a
+40-row fact set cost 599 s total, of which **training is 67 s (11%)**: 88 s loading, 178 s
+data prep (token selection alone is 59 s), 266 s final eval (5 held generations at ~40 s each).
+Cutting steps from 120 to 12 removed 575 s of training but only ~40% of the wall clock. Past
+~12 steps the binding cost is the fixed prefix, not the loop; the 1.2–2.5 tok/s HF decode is
+what makes an evaluation expensive, and that is where the next 5× has to come from.
 
 ### Steps to 5/5: 26 minutes from the stock weights
 
@@ -224,6 +232,58 @@ above plus both methods. `feat/train-mezo` and `feat/train-backforward` trail it
 `training/` is still the pre-split single-file layout, so a fix landed for the split does
 not automatically appear there. Land changes against `feat/train_support`.
 
+## Evaluating: the engine generates, and only one GPU job at a time
+
+Generation for evaluation can run on the engine instead of the training loop's own torch decode.
+`--gen-engine http://127.0.0.1:8095` exports the current LoRA state as an adapter GGUF, swaps it
+in with `POST /v1/engine/lora`, then generates. Same adapter, same five held rows:
+
+| | torch decode | engine |
+|---|---|---|
+| one generation (48 tokens) | ~40 s | 1.2 s |
+| five held rows | ~200 s | 6.0 s |
+
+The export is lossless in that direction, for every projection the engine adapts. `MAP` in
+`training/backward/lora_to_gguf.py` covers all seven (`attn_output` / `ssm_out` plus the five
+input projections `attn_qkv` / `attn_gate` / `attn_q` / `attn_k` / `attn_v`), and the
+speculative path in `src/core/verify.cpp` applies every one of them in program order — right
+after the projection that produced its input. So MTP stays on: the engine runs `--spec 4` with
+a whole-module adapter loaded. A swap costs 0.06–0.2 s and drops every cached K/V, so each
+evaluation point decodes from token 0.
+
+Two consequences worth knowing:
+
+- **An input-projection adapter switches the side branches off.** `STRATA_SIDE_MIXER` and
+  `STRATA_DF_BRANCH` move some projections onto a side stream; they are scheduling only, and a
+  branch would have to be joined before the adapter could read its output. `lora_in_proj` in
+  `verify.cpp` turns them off for the duration, which is the in-line order anyway.
+- **The seed adapter must have the same projection set as the one you swap in.** The engine
+  holds the adapter tables' addresses in captured graphs: starting with an out-only adapter and
+  swapping in a seven-projection one fails with `layer 0 changed its projection set`. Build the
+  seed from the same checkpoint with `.workbuddy/tmp/idrun/make_zero_seed.py` (B zeroed, so it
+  is numerically the base model).
+
+Why the input projections matter: LoRA adds `s·B(Ax)` to a projection's output. On an output
+projection that can only shift *what a layer emits* — for an identity or fact-injection task it
+degenerates into a vocabulary bias. `attn_qkv` / `attn_q` change *what the layer reads*, which
+is what "notice this field of the input" requires. Measured on 15 identity questions, identical
+data and step count (15 rows, 12 steps, rank 16, lr 1e-4): out-only projections changed 0/15
+answers, all seven changed 5/15, with the same training wall clock (113 vs 117 s) and no
+capability leak (0/4 canary prompts answered with the identity).
+
+**Training and the engine cannot run at the same time on a 48 GiB card.** Training peaks at
+26.19 GiB (`--seqlen 512 --ckpt`, measured) and the engine holds 8.5 GiB on top of its weights
+(`--expert-cache 1024`, 2.22 GiB of tiers). Started together they reached 45.8 GiB of 49.1 GiB
+and the machine stalled. Evaluation is therefore a separate step: train, let the process exit,
+start the engine, run `--eval-only`, stop the engine. `--eval-only` loads no 4-bit weights at
+all — it swaps the adapter in and reads pass@1, so the engine is the only GPU job. See
+`.workbuddy/tmp/idrun/eval_only.sh` for the sequence.
+
+`--gen-engine` refuses to run without the sampling contract (`--chat-template`). The engine
+renders with `chat_template.jinja` and thinking on; the legacy path renders a single user turn
+with an empty think block — 54 vs 14 tokens for the same question. Two different prompts make a
+CE and a generated answer incomparable, and the mismatch is silent unless someone compares ids.
+
 ## Constraints (each of these fails quietly)
 
 - Start the engine with `--lora <zero adapter>` (`mezo/zero_adapter.py` writes one) and
@@ -247,13 +307,29 @@ not automatically appear there. Land changes against `feat/train_support`.
 - `--zo-rel` self-locks at `B = 0`: the cap is measured against the moving factors, and
   `‖B‖` can only grow through `‖Δθ‖`, so from a zero adapter the step is pinned at
   `rel_cap·‖B‖ = 0`. Start from the SFT checkpoint, or use `--zo-step-max`.
-- Zero-order is ~100× the steps of backprop for the same edit (26 steps there, 4 000 here),
-  and that is the method, not a tuning miss: one scalar difference carries d = 69 632
-  dimensions. `dirs 4` is the cheap lever (SNR ×16, std 5.4 → 2.3); `dirs 1` at the same
-  budget is noise — measured `pj` mean negative in all four quarters of a 4 000-step run.
+- Zero-order needs far more steps than backprop, and the ratio is **not** a fixed multiplier:
+  one scalar difference carries d = 69 632 dimensions, so the update is a random walk and `dirs`
+  is the only cheap variance lever (`dirs 4` → SNR ×16, std 5.4 → 2.3; `dirs 1` at the same
+  budget is noise — measured `pj` mean negative in all four quarters of a 4 000-step run).
+  The 26-step backprop figure in the DPO section is not a like-for-like denominator: it starts
+  from a checkpoint that already answers, the cold start teaches the fact from the base adapter.
 - Reducing dimension does not reduce the budget: `--zo-layers 1` halves d (69 632 → 34 816)
   and was **slower** (ce 0.9213 vs 0.7649 at 2 000 steps) and stopped generating new text
   at all. Capacity, not dimension, is the binding constraint at two layers.
+- **A falling answer CE is not "it learned the fact."** Fact injection (20 invented names →
+  4-digit codes, 2 training phrasings + 1 held-out phrasing, rank 16 on `o_proj,out_proj`):
+  120 steps took held CE 3.096 → 0.556 (−82%) with held **pass@1 0/5**; the greedy answers
+  were `Answer: 1111` / `Answer: 4927` — always the right *shape*, never the right code.
+  12 steps: held CE 1.304, also 0/5, but the cross-domain canary still answered
+  `Answer: 42` correctly (at 120 steps it answered `Answer: 5666` to "capital of France").
+  So the objective was learned as a **format**, not a mapping — more steps only bought a
+  lower CE and a broken canary. `--held-gen` exists because CE cannot tell these apart;
+  run it, and judge on the generated answer.
+- **`held` and `cap` are two different numbers and must stay two.** `held` is the task's
+  own held-out set (the objective, `--best-by held`); `cap` is the off-domain canary (a
+  gate, never an objective). Feeding held-out questions in as `cap` probes — which is what
+  `facts20_probes.jsonl` used to do — makes "held improved" and "gate passed" the same
+  event, so a broken model scores as a good checkpoint.
 
 ## Verify without a GPU
 
@@ -276,6 +352,8 @@ builds fixtures in `tempfile`, so the suite is offline and needs no hub.
 | lr, `grpo` / `luspo` | `5e-5` | |
 | epochs | sft 5 / dpo 7 / grpo 5 / luspo 3 | measured on 200-row sets — see the budget table before trusting them on a small one |
 | `--select-tokens` | `excess`, threshold 1.0 | mask anchored at θ₀, not recomputed during training |
+| `--best-by` | `id` | `held` for fact/math tasks — the objective, not a gate. `id` on a non-identity task means "pick the checkpoint that memorised the training phrasings" |
+| `--held-gen` | 0 (off) | set 5+: CE falling 82% while pass@1 is 0/5 is a real, observed outcome |
 | `--zo-projs` | `out` | `all` for the InferZO all-module shape |
 | `--zo-step-max` | 0.03 | the effective brake at `dirs 1`; `rel` stays ~40× below the divergence line |
 | `--kv auto` | fp16 ≤32K, int8 ≤128K, k8v4 ≤256K, q4_0 above | thresholds duplicated in `generate.cpp` and `setup.py` |

@@ -17,10 +17,22 @@ SFT 之后如果不满足，再用 SFT 的 checkpoint 当 GRPO 的起点（那�
 1. `--select-tokens excess`（默认开）：预计算**训练起点策略**对答案段每 token 的 CE，
    只有高于 `--select-thresh` 的 token 进 loss —— 基座本来就会的 token 不需要学，
    学它们只会通过共享投影把无关能力一起拖动。纯逻辑在 guard.py。
-2. `--eval-every N`（默认 4）能力门：周期性无图评估 identity 探针（目标词 logprob）与
-   capability 探针（target 的 token CE）。能力漂移超 `--cap-tol` 的评估不配做 best
-   （keep-best），超 `--cap-stop` 立即停训；训练结束恢复 best 快照再存盘。
+2. `--eval-every N`（默认 4）能力门：周期性无图评估 identity 探针（目标词 logprob）、
+   capability 探针（target 的 token CE）与 **heldout 集**（`--held-data` 的答案 CE）。
+   能力漂移超 `--cap-tol` 或生成体检不过的评估不配做 best（keep-best），超 `--cap-stop`
+   立即停训；训练结束恢复 best 快照再存盘。
    探针在 `examples/training/prompts_holdout.jsonl`，与训练数据措辞、目标全部错开。
+
+三个数各有分工，别混用（2026-11-17 事故：混用会让「ce 降了」冒充「学会了」）：
+  * `id_mean`  —— 身份目标词 logp。**只在身份改写任务**里当目标（`--best-by id`）。
+  * `held_mean`—— 任务 heldout 集的答案 CE。事实注入 / 数学题等任务的目标
+    （`--best-by held`）。必须真的训练没见过：与 `--data` 有完全相同的行就直接退出。
+  * `cap_mean` —— 跨域金丝雀，**只当门槛、永不进目标**。它降没有意义（那不是我们要学的）。
+
+**CE 不能替代生成**：同一轮 120 步里 held CE 3.096→0.556（−82%）而 held 生成准确率 0/5 ——
+名字→码的映射没建立，只是学会了「输出 `Answer: <4 位数字>`」这个形态。所以
+`--held-gen N` 在终评抽 N 条生成判分，cap 探针的生成体检也加了**内容关**
+（`common/gate.content_hit`），形式全过但答非所问现在会判失败。
 """
 
 from __future__ import annotations
@@ -43,8 +55,11 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
+import tempfile
 import time
+import urllib.request
 
 import torch
 
@@ -66,6 +81,8 @@ platform_check.require(platform_only=True)   # 模块级只查平台：CI 的 CP
 from ce import token_logprobs
 from loader import build_skeleton, materialize, nbytes_of, stream_load
 from lora import DEFAULT_TARGETS, freeze_all, inject_lora, load_lora_state, trainable_summary
+import lora_to_gguf    # 评估换引擎时的 adapter 导出（与训练侧同一份映射，不另写一套）
+import strata_client   # 引擎的 chat / 换表（回环必须绕代理，那份 opener 在这里）
 
 
 def _default_probes() -> str:
@@ -94,6 +111,29 @@ def read_sft_rows(path: str, word: str) -> list[tuple[str, str]]:
     `allow_target=True` 是反传线独有的放宽（冷启 SFT 产物用 `target`）。
     """
     return load_data(path, word, allow_target=True)
+
+
+def _last_int(text: str) -> int | None:
+    """取文本里**最后一个**整数（允许千分位与正负号）。判 held 抽检用。
+
+    为什么取最后一个：这些任务都要求把最终答案写在末尾（`Answer: 332` / `Answer: $x$`），
+    而推理段里会路过很多中间数。取第一个会拿中间结果当答案，把「算对了」判成错。
+    """
+    hits = re.findall(r"-?\d[\d,]*", text or "")
+    if not hits:
+        return None
+    try:
+        return int(hits[-1].replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _answer_hit(text: str, gold: str) -> bool:
+    """held 抽检的判分：两边都取最后一个整数比。gold 不是数字时退化成字符串包含。"""
+    g = _last_int(gold)
+    if g is None:
+        return gold.strip() and gold.strip() in (text or "")
+    return _last_int(text) == g
 
 
 def text_model(model):
@@ -289,26 +329,40 @@ def verify_frozen_prefix(body, head, cases: list[tuple[list[int], int]],
                          "切分 / position_ids / 缓存语义有 bug，先修再训")
 
 
-def _torch_gen(body, head, tok, renderer):
-    """贪心生成 —— torch 后端的一个动作，形状与 `common/gate.eval_gate` 的契约一致。"""
+def _torch_gen(body, head, tok, renderer, model=None):
+    """贪心生成 —— torch 后端的一个动作，形状与 `common/gate.eval_gate` 的契约一致。
 
+    `model` 给了就临时关梯度检查点：`--ckpt` 打开时 HF 会把 `use_cache=True` 强制成
+    False（"incompatible with gradient checkpointing"），每个新 token 都要**重算整段
+    前缀**。48 token 的一次生成因此贵一个数量级 —— 而这在长上下文评估里就是
+    「一次 eval 等于几步训练」那座成本山（128K 时一次生成 ≈ 40 s × 48）。生成本身在
+    no_grad 下，不需要检查点。
+    """
     def gen(prompt: str, max_new: int) -> dict:
         device = next(body.parameters()).device
-        t0 = time.time()
-        chat = (renderer or ChatRenderer(tok)).prompt_ids(prompt)
-        o = body(input_ids=torch.tensor([chat], device=device), use_cache=True)
-        past, hid = o.past_key_values, o.last_hidden_state[:, -1]
-        picked: list[int] = []
-        eos = False
-        for _ in range(max_new):
-            nxt = head(hid).float().argmax(-1, keepdim=True)
-            picked.append(int(nxt[0, 0]))
-            if tok.eos_token_id is not None and picked[-1] == tok.eos_token_id:
-                eos = True
-                break
-            o = body(input_ids=nxt, past_key_values=past, use_cache=True)
+        gc_on = bool(model is not None and getattr(model, "is_gradient_checkpointing", False))
+        if gc_on:
+            model.gradient_checkpointing_disable()
+        try:
+            t0 = time.time()
+            chat = (renderer or ChatRenderer(tok)).prompt_ids(prompt)
+            o = body(input_ids=torch.tensor([chat], device=device), use_cache=True)
             past, hid = o.past_key_values, o.last_hidden_state[:, -1]
-        del past, o
+            picked: list[int] = []
+            eos = False
+            for _ in range(max_new):
+                nxt = head(hid).float().argmax(-1, keepdim=True)
+                picked.append(int(nxt[0, 0]))
+                if tok.eos_token_id is not None and picked[-1] == tok.eos_token_id:
+                    eos = True
+                    break
+                o = body(input_ids=nxt, past_key_values=past, use_cache=True)
+                past, hid = o.past_key_values, o.last_hidden_state[:, -1]
+            del past, o
+        finally:
+            if gc_on:
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False})
         return {"ids": picked,
                 "text": tok.decode(picked, skip_special_tokens=True).strip().replace(chr(10), " "),
                 "eos": eos, "secs": time.time() - t0}
@@ -316,14 +370,212 @@ def _torch_gen(body, head, tok, renderer):
     return gen
 
 
+class EngineGen:
+    """评估生成走**引擎**：导出当前可训参数 → adapter GGUF → `POST /v1/engine/lora` → chat。
+
+    为什么必须能走这里：torch 侧 decode 是 1.2–2.5 tok/s（每 token 一遍前向，`--ckpt` 下
+    每个新 token 还要把整段前缀重算一次），引擎同 adapter 下 138 tok/s。一次 5 条 × 24 token
+    的终评因此从 ~200 s 掉到 ~1 s —— 这是 RSI 迭代节奏的直接决定项，不是「顺便优化」。
+
+    为什么无损：训练侧挂点必须在 `lora_to_gguf.MAP` 里，而 `src/core/verify.cpp` 的投机路径
+    现在按程序顺序应用 `MAP` 的全部七个名字（`attn_output` / `ssm_out` 两个输出投影，
+    `attn_qkv` / `attn_gate` / `attn_q` / `attn_k` / `attn_v` 五个输入投影）。所以导出 → 换表 →
+    生成**不需要关投机**，MTP 照用。换表会丢 K/V 缓存，每次生成都从 token 0 读，这正好保证
+    各评估点的生成可比。
+
+    不给 `--gen-engine` 就完全不走这里：静默回退到 torch 会让人以为测的是引擎，实际测的是
+    另一条 decode 路径（同 token 的 logprob 差 ~0.2 nats，长度行为也不同）。
+    """
+
+    def __init__(self, base_url: str, model: str, tok, renderer=None, *,
+                 alpha: float = 32.0, arch: str = "qwen4exp"):
+        self.base = base_url.rstrip("/")
+        self.model = model
+        self.tok = tok
+        self.renderer = renderer
+        self.alpha = alpha
+        self.arch = arch
+        self.adapter = _p.Path(tempfile.gettempdir()) / "strata_eval_adapter.gguf"
+        self.swaps = 0
+        self.prompt_checked = False
+
+    def swap(self, params: dict, *, keep_zero_b: bool = False) -> dict:
+        """把**当前**可训参数写进引擎。`params` 就是 `snapshot_trainable` 的形状。
+
+        `keep_zero_b`：训练起点 B 全零，默认的 write_adapter 会把它们全跳过、一个张量都不写。
+        起点那一次必须带它，否则引擎没有 adapter 可换（而后面的评估点都是真参数）。
+        """
+        r = lora_to_gguf.write_adapter(
+            {k: v.detach().float().cpu() for k, v in params.items()},
+            str(self.adapter), alpha=self.alpha, arch=self.arch, keep_zero_b=keep_zero_b)
+        req = urllib.request.Request(
+            self.base + "/v1/engine/lora",
+            data=json.dumps({"path": str(self.adapter)}).encode(),
+            headers={"Content-Type": "application/json"})
+        with strata_client._OPENER.open(req, timeout=600) as resp:
+            out = json.loads(resp.read())
+        self.swaps += 1
+        print(f"  [gen-engine] adapter swapped #{self.swaps}: {r['layers']} layer(s), "
+              f"{r['mib']:.1f} MiB, digest {out.get('digest')}", flush=True)
+        return {"layers": r["layers"], "mib": round(r["mib"], 2),
+                "digest": out.get("digest"), "path": str(self.adapter)}
+
+    def __call__(self, prompt: str, max_new: int) -> dict:
+        msgs = [{"role": "user", "content": prompt}]
+        t0 = time.time()
+        r = strata_client.chat(self.base, msgs, model=self.model, max_tokens=max_new,
+                               temperature=0.0, top_p=1.0)
+        secs = time.time() - t0
+        # 模板一致性只查一次：训练侧渲染的 prompt_ids 必须与引擎逐 id 相同，否则「引擎评估」
+        # 评的是另一条 prompt（而 CE 那边仍是训练侧渲染，两个数就不同源了）。
+        if not self.prompt_checked:
+            want = list((self.renderer or ChatRenderer(self.tok)).prompt_ids(prompt))
+            got = list(r["prompt_ids"])
+            self.prompt_checked = True
+            if got and want != got:
+                print(f"  [gen-engine] prompt 模板不一致：训练侧 {len(want)} ids / 引擎 {len(got)} ids"
+                      f"；前 8 个 {want[:8]} vs {got[:8]} —— 生成与 CE 不同源，先对齐模板", flush=True)
+        # 引擎把思考段单独放在 reasoning_content（content 只在 `<think>` 关掉后才有值）。
+        # torch 后端的 `_torch_gen` decode 的是**全部** token，评估侧必须同一口径 ——
+        # 只看 content 会让思考型退化（整段卡在 `<think>` 里复读）被读成「空回答」。
+        text = " ".join(x for x in (r["reasoning"], r["content"]) if x).strip()
+        return {"ids": list(r["token_ids"]), "text": text.replace(chr(10), " "),
+                "eos": r["finish_reason"] == "stop", "secs": secs}
+
+
+def _eval_only(args, tok, renderer) -> int:
+    """只做生成判分：**不加载 4-bit 权重、不建图**，整个过程只有引擎在 GPU 上。
+
+    为什么单开一条路：训练峰值 26.19 GiB（T=512 ckpt）+ 引擎常驻 8.5 GiB，48 GiB 卡上
+    同时起就顶到 45.8 GiB —— 实测机器会卡死。所以训练与评估在**时间上分开**：
+    训练存盘退出 → 起引擎 → 这里只换 adapter 并判分 → 停引擎。任何时刻只有一个 GPU 任务。
+
+    不在这里做 CE：CE 要 4-bit 权重的 torch 前向，那正是要避开的 26 GiB。
+    这里只回答一个 CE 答不了的问题 —— **生成对了几条**。
+    """
+    if not args.gen_engine:
+        raise SystemExit("--eval-only 需要 --gen-engine：这条路存在的理由就是不加载 4-bit 权重")
+    if not args.init_adapter:
+        raise SystemExit("--eval-only 需要 --init-adapter <训练存下的 .pt>")
+    if not os.path.exists(args.init_adapter):
+        raise SystemExit(f"--init-adapter 不存在：{args.init_adapter}")
+
+    emodel = args.gen_engine_model
+    if not emodel:
+        with strata_client._OPENER.open(
+                args.gen_engine.rstrip("/") + "/v1/models", timeout=30) as _r:
+            emodel = json.loads(_r.read())["data"][0]["id"]
+    gen = EngineGen(args.gen_engine, emodel, tok, renderer, alpha=args.alpha)
+
+    t_all = time.time()
+    info = gen.swap(torch.load(args.init_adapter, map_location="cpu"), keep_zero_b=True)
+    print(f"--eval-only: {os.path.basename(args.init_adapter)} → 引擎 {args.gen_engine} / {emodel}"
+          f"（{info['layers']} 层，{info['mib']:.1f} MiB，digest {info['digest']}）", flush=True)
+
+    if args.held_data:
+        held = read_sft_rows(args.held_data, args.word)
+        n_probe = min(args.held_gen or len(held), len(held))
+        stride = max(1, len(held) // n_probe)
+        picks = held[::stride][:n_probe]
+        hits, t_gen = 0, time.time()
+        print(f"held 生成（{n_probe}/{len(held)} 条，均匀跨步；判分 = 最后一个整数）:", flush=True)
+        for p, t in picks:
+            r = gen(p, 48)
+            hit = _answer_hit(r["text"], t)
+            hits += int(hit)
+            print(f"  {'OK ' if hit else 'BAD'} {p[:48]!r} → {r['text'][:60]!r}  "
+                  f"gold {t!r}  eos={int(r['eos'])}  {r['secs']:.2f}s", flush=True)
+        dt = time.time() - t_gen
+        print(f"  held pass@1 {hits}/{n_probe}  生成 {dt:.1f} s "
+              f"（{dt / max(n_probe, 1):.2f} s/条；torch 后端同一批约 40 s/条）", flush=True)
+
+    texts = cgate.sample_identity(IDENTITY_QS, 48, gen)
+    print("身份问答（引擎贪心解码）:", flush=True)
+    for q, a in zip(IDENTITY_QS, texts):
+        print(f"  {q} → {a[:110]!r}", flush=True)
+    print(f"--eval-only 总用时 {time.time() - t_all:.1f} s", flush=True)
+    return 0
+
+
+def tail_logprobs_lab(body, head, tail: list[int], labels: list[int], cache,
+                      chunk: int = 128) -> torch.Tensor:
+    """tail_logprobs 的「输入与标签分离」版：前向喂 `tail`，logprob 取 `labels`。
+
+    只在 on-policy 前缀（`--ss-k`）里用：那时输入序列的答案头被模型自己生成的 token
+    顶替，标签却仍是**真答案** —— 于是 loss 量的是「走歪之后还能不能回到正确续写」。
+    `tail_logprobs` 把标签固定成 `tail[1:]`，正好把这份信号抹掉（它量的是模型对自己
+    刚说的话有多自信，恒接近 0），所以这里必须另开一条。
+    """
+    device = next(body.parameters()).device
+    ids = torch.tensor([tail], device=device)
+    if cache is None:
+        h = body(input_ids=ids[:, :-1], use_cache=False).last_hidden_state[0]
+    else:
+        h = body(input_ids=ids[:, :-1], past_key_values=_cache_grad_safe(cache),
+                 use_cache=True).last_hidden_state[0]
+    lab = torch.tensor(labels, device=device)
+    if lab.numel() != h.shape[0]:
+        raise SystemExit(f"on-policy 前缀：标签 {lab.numel()} != 前向位置 {h.shape[0]}")
+    return token_logprobs(h, head, lab, chunk=chunk)
+
+
 @torch.no_grad()
-def eval_gate(body, head, tok, probes: list[dict], word: str, renderer=None) -> dict:
+def ss_gen_ids(body, head, prompt_ids: list[int], k: int, eos_id, model=None) -> list[int]:
+    """当前策略在 prompt 之后贪心生成 k 个 token（on-policy 前缀的来源）。
+
+    **贪心而非采样**：评测侧（能力门 / 引擎 GEN）也是贪心，曝光偏差要修的就是
+    「在自己会走的那条错路上下一步该说什么」，采样的随机前缀会把这条信号稀释成噪声。
+    EOS 提前出现时原样保留（只截断生成，不补真答案 —— 补了就把「提前收尾」这个
+    错误从前缀里抹掉，而它恰恰是要被惩罚的那个行为）。
+
+    `model` 给了就临时关梯度检查点：`--ckpt` 开着时 HF 会把 `use_cache=True` 强制成
+    False（"incompatible with gradient checkpointing"），于是这 k 个 token 每次都要
+    **整段重算前缀**——实测 8 token 让单步从 7 s 涨到 13 s。关掉 ckpt 后走 KV cache，
+    k 次单 token 前向，生成开销降到可忽略；生成本身在 no_grad 下，不需要检查点。
+    """
+    device = next(body.parameters()).device
+    gc_on = bool(model is not None and getattr(model, "is_gradient_checkpointing", False))
+    if gc_on:
+        model.gradient_checkpointing_disable()
+    try:
+        o = body(input_ids=torch.tensor([prompt_ids], device=device), use_cache=True)
+        past, hid = o.past_key_values, o.last_hidden_state[:, -1]
+        picked: list[int] = []
+        for _ in range(k):
+            nxt = head(hid).float().argmax(-1, keepdim=True)
+            t = int(nxt[0, 0])
+            picked.append(t)
+            if eos_id is not None and t == eos_id:
+                break
+            o = body(input_ids=nxt, past_key_values=past, use_cache=True)
+            past, hid = o.past_key_values, o.last_hidden_state[:, -1]
+        del past, o
+    finally:
+        if gc_on:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
+    return picked
+
+
+def ss_first_div(gen: list[int], true_ans: list[int]) -> int:
+    """生成前缀与真答案第一个不同的位置（-1 = 逐 token 相同，无新信号）。"""
+    for i, t in enumerate(gen):
+        if i >= len(true_ans) or t != true_ans[i]:
+            return i
+    return -1
+
+
+@torch.no_grad()
+def eval_gate(body, head, tok, probes: list[dict], word: str, renderer=None,
+              model=None, held=None, gen=None) -> dict:
     """能力门的评估 —— **判据**在 `common/gate.py`（与零阶线共用一份），这里只提供 torch 后端。
 
     后端差异只有三处：目标词 logprob 走 `log_softmax`、cap 探针 CE 走一次前向 +
-    `token_logprobs`、生成走 KV cache 贪心。哪条探针算、怎么判 ok、均值怎么合，
-    全部在共享那一份里 —— 两条线口径不同的话，「身份 0/5」在两边的含义就不一样了。
+    `token_logprobs`、生成走 KV cache 贪心（或 `--gen-engine` 给的引擎后端）。
+    哪条探针算、怎么判 ok、均值怎么合，全部在共享那一份里 —— 两条线口径不同的话，
+    「身份 0/5」在两边的含义就不一样了。
 
+    `gen`：`EngineGen` 实例时生成走引擎（138 tok/s），默认 torch 后端（1.2 tok/s）。
     全部无图前向。eval()/train() 切换由调用方负责。
     """
     device = next(body.parameters()).device
@@ -339,38 +591,23 @@ def eval_gate(body, head, tok, probes: list[dict], word: str, renderer=None) -> 
         probes, word,
         name_logprob=lambda q, w: name_logprob(body, head, tok, q, w, renderer=renderer),
         answer_ce=answer_ce,
-        gen=_torch_gen(body, head, tok, renderer))
+        gen=gen or _torch_gen(body, head, tok, renderer, model=model),
+        held=held)
 
 
 IDENTITY_QS = cgate.IDENTITY_QS
 
 
 @torch.no_grad()
-def sample_identity(body, head, tok, max_new: int = 48, renderer=None) -> list[str]:
-    """固定问法上的贪心生成文本（报告用）—— 判据与生成动作都不在本文件。"""
-    return cgate.sample_identity(IDENTITY_QS, max_new, _torch_gen(body, head, tok, renderer))
-    """贪心生成身份问答的实际文本（报告用）。
+def sample_identity(body, head, tok, max_new: int = 48, renderer=None,
+                    model=None, gen=None) -> list[str]:
+    """固定问法上的贪心生成文本（报告用）—— 判据与生成动作都不在本文件。
 
-    CE / 目标词 logprob 只能说明「像不像」，看不出**答的是不是正确事实** ——
-    身份数据的错法（把基座作者写成维护者、把引擎当模型）恰恰只能从文本看出来。
+    `gen`：`EngineGen` 时走引擎（同一 adapter）。**必须和评估用同一个后端**：身份文本
+    是给人读的判据，它和 pass@1 出自两条 decode 路径的话，报告里两列会互相打架。
     """
-    device = next(body.parameters()).device
-    texts = []
-    for q in IDENTITY_QS:
-        chat = (renderer or ChatRenderer(tok)).prompt_ids(q)
-        o = body(input_ids=torch.tensor([chat], device=device), use_cache=True)
-        past, hid = o.past_key_values, o.last_hidden_state[:, -1]
-        picked: list[int] = []
-        for _ in range(max_new):
-            nxt = head(hid).float().argmax(-1, keepdim=True)
-            picked.append(int(nxt[0, 0]))
-            if tok.eos_token_id is not None and picked[-1] == tok.eos_token_id:
-                break
-            o = body(input_ids=nxt, past_key_values=past, use_cache=True)
-            past, hid = o.past_key_values, o.last_hidden_state[:, -1]
-        del past, o
-        texts.append(tok.decode(picked, skip_special_tokens=True).strip().replace("\n", " "))
-    return texts
+    return cgate.sample_identity(IDENTITY_QS, max_new,
+                                 gen or _torch_gen(body, head, tok, renderer, model=model))
 
 
 def snapshot_trainable(model) -> dict:
@@ -476,6 +713,24 @@ def main() -> int:
     ap.add_argument("--select-first", type=int, default=0, metavar="N",
                     help="每条样本只训练 excess 选中的前 N 个 token（0=不限）。与零阶线同名同语义，"
                          "纯逻辑在 guard.select_mask（追加式数据卡在第一个追加 token 上时用）")
+    ap.add_argument("--ss-k", type=int, default=0, metavar="K",
+                    help="on-policy 前缀（scheduled sampling）：每步先用**当前**策略贪心生成 K 个 "
+                         "token，把这 K 个 token 当作答案开头喂回去，loss 仍对**真答案**求 CE。"
+                         "0=关（行为与历史逐字相同）。治的是 teacher forcing 的曝光偏差："
+                         "历史 4 500 步 / 24 步反传的共同失败签名是「ce 降、probe 涨、自由生成"
+                         "在第一个分歧点崩成自环」，因为正确前缀永远由数据喂入，模型从未学过"
+                         "「已经走歪了该怎么回来」。K 取第一个分歧点之后若干 token 才有信号")
+    ap.add_argument("--ss-every", type=int, default=1, metavar="N",
+                    help="每 N 步做一次 on-policy 前缀（其余步退化为普通 teacher forcing）。"
+                         "K 个 token 要走 K 次单 token 解码前向，长上下文时按此降频")
+    ap.add_argument("--ss-warmup", type=int, default=0, metavar="N",
+                    help="前 N 步不做 on-policy 前缀：起点策略与真答案差得远时，生成的整段"
+                         "都是噪声，先让普通 CE 把答案头压下来再开始自纠")
+    ap.add_argument("--gate-id-gen", type=int, default=0, metavar="N",
+                    help="每次能力门评估时，额外对前 N 条身份问法做贪心生成并打印（0=关）。"
+                         "能力门只生成 cap 探针的文本 —— 但「身份有没有学会」只能在身份"
+                         "问法的生成文本里看，且**逐评估点**看才能区分「学不会」和"
+                         "「学过了头（自环）」。N=2 的成本约 2 次 40 token 解码")
     ap.add_argument("--eval-every", type=int, default=4, metavar="N",
                     help="每 N 步跑一次能力门（0=关）。identity 探针量身份、cap 探针量能力，"
                          "见 --probes。能力漂移超 --cap-tol 不配做 best，超 --cap-stop 立即停")
@@ -486,6 +741,30 @@ def main() -> int:
                     help="能力门容差：cap CE 相比训练起点涨超过它，该次评估不配做 best")
     ap.add_argument("--cap-stop", type=float, default=1.5, metavar="NATS",
                     help="能力门硬顶：cap CE 涨超过它立即停训，恢复 best 快照再存盘")
+    ap.add_argument("--held-data", default="",
+                    help="任务 heldout 集 jsonl（字段同 --data：prompt + answer/target），"
+                         "**不参与训练**，每评估点算答案 CE。非身份任务（数学题 / 事实注入）"
+                         "没有「目标词」，keep-best 只能靠这个数 —— 见 --best-by held")
+    ap.add_argument("--best-by", choices=("id", "held"), default="id",
+                    help="keep-best 按哪个指标选 ckpt。id=身份目标词 logp（默认，身份改写任务）；"
+                         "held=heldout CE 的下降量（事实注入 / 数学题等任何有 held 集的任务）。"
+                         "选 held 必须给 --held-data：用训练题 CE 选 ckpt 等于按「背样本」选，"
+                         "会挑到过拟合最狠的那个")
+    ap.add_argument("--held-gen", type=int, default=0, metavar="N",
+                    help="终评时在 held 集上抽 N 条贪心生成并判分（答案取文本里最后一个整数）。"
+                         "CE 只说明「像不像」，学会没学会要看生成 —— 抽检是唯一能直接读出"
+                         "「准确率」的项。按均匀跨步抽，不取前 N 条（前面的题往往太典型）")
+    ap.add_argument("--gen-engine", default="", metavar="URL",
+                    help="评估生成走引擎（如 http://127.0.0.1:8095）。不给就走 torch 逐 token 贪心"
+                         "（1.2–2.5 tok/s）。引擎侧 138 tok/s，且 adapter 就是引擎适配的那两类挂点，"
+                         "导出无损、**不必关投机**。每个评估点先导出当前参数、POST /v1/engine/lora 换表再生成。"
+                         "引擎必须带 --lora 启动且不能开 --batch（并行槽会绕过被替换的表）")
+    ap.add_argument("--gen-engine-model", default="", metavar="NAME",
+                    help="引擎侧的 model 名，默认取 /v1/models 的第一个")
+    ap.add_argument("--eval-only", action="store_true",
+                    help="只判分不训练：读 --init-adapter，换进 --gen-engine，跑 held 生成与身份问答。"
+                         "**不加载 4-bit 权重**（训练峰值 26 GiB + 引擎 8.5 GiB 在 48 GiB 卡上会顶死），"
+                         "所以必须在训练进程退出之后再跑 —— 任何时刻只有一个 GPU 任务")
     ap.add_argument("--system-prompt", default="",
                     help="插一条 system 消息（与采样侧逐字一致）。给了它 / --reasoning-effort / "
                          "--chat-template 任一项就切到「采样契约」渲染：同一份 jinja 模板 + "
@@ -523,6 +802,17 @@ def main() -> int:
             dpo.validate_pairs(dpo_rows)
         except ValueError as e:
             raise SystemExit(f"--dpo-data {args.dpo_data}: {e}")
+    # on-policy 前缀只对「逐 token CE」有意义：DPO 是序列级 margin、pretrain 是整块 loss，
+    # 两者都没有「答案头」这个概念。显式拒绝而不是静默降级 —— 静默会让一次对照实验
+    # 悄悄变成「什么都没改」。
+    if args.ss_k:
+        if dpo_rows is not None:
+            raise SystemExit("--ss-k 与 --dpo-data 互斥：DPO 的 loss 是序列级 margin，"
+                             "没有可替换的答案头；on-policy 前缀只作用于逐 token CE")
+        if args.pretrain_data:
+            raise SystemExit("--ss-k 与 --pretrain-data 互斥：整块数据没有 prompt/answer 分界")
+        if args.ss_k < 1 or args.ss_every < 1 or args.ss_warmup < 0:
+            raise SystemExit("--ss-k ≥1、--ss-every ≥1、--ss-warmup ≥0")
     # 轮次优先（与 mezo 同一口径）：一轮 = 过一遍数据。实测 identity 的收益在第 2 轮吃满
     # （24 步，idΔ +45.7 / capΔ −0.04），第 3 轮起能力门开始拒 —— 见 algos.py 的 backward 表。
     if args.epochs:
@@ -572,6 +862,20 @@ def main() -> int:
               f"template {digest} / think=on", flush=True)
     else:
         print("chat 渲染: legacy（单 user + 空思考段；未带采样契约）", flush=True)
+
+    # 引擎评估必须与训练评同一条 prompt。引擎按 `chat_template.jinja` 渲染（含 thinking 段），
+    # legacy 路径是「单 user + 空思考段」—— 实测同一条问法 54 ids vs 14 ids。两边不同源的话，
+    # 生成那边看到的是另一段上下文，而 CE 还是 legacy 那段，「引擎评估」就等于换了个题。
+    # 这条不做「提示后继续」：一次静默不同源就够毁掉整轮结论。
+    if args.gen_engine and not renderer.enabled:
+        raise SystemExit(
+            "--gen-engine 要求训练侧走**采样契约**渲染：引擎按 chat_template.jinja 渲染（含 thinking），\n"
+            "legacy 路径是「单 user + 空思考段」，两边同一条问法实测 54 vs 14 个 token ⇒ 评的不是同一条 prompt。\n"
+            "  补上：--chat-template <tokenizer>/chat_template.jinja"
+            "（模板要**与引擎读的那份逐字相同**；system / effort 也要与采样侧一致）")
+
+    if args.eval_only:
+        return _eval_only(args, tok, renderer)
 
     device = torch.device("cuda")
     torch.cuda.reset_peak_memory_stats()
@@ -651,10 +955,29 @@ def main() -> int:
     body, head = text_model(model), model.lm_head
     lp0 = name_logprob(body, head, tok, args.probe, args.word, renderer=renderer)
     print(f"before: logp('{args.word}' | {args.probe!r}) = {lp0:.4f} (p={math.exp(lp0):.8f})", flush=True)
+
+    # 评估生成后端：给 `--gen-engine` 就走引擎（同一 adapter、138 tok/s、投机照用）。
+    # 不给保持 torch 逐 token 贪心，历史结果逐字不变。
+    gen_be = None
+    if args.gen_engine:
+        if args.lora_method == "unilora":
+            raise SystemExit("--gen-engine 只支持标准 LoRA：UniLoRA 的扰动没有对应的 GGUF adapter，"
+                             "导出会静默丢掉全部参数（评估就成了测 base）")
+        emodel = args.gen_engine_model
+        if not emodel:
+            with strata_client._OPENER.open(
+                    args.gen_engine.rstrip("/") + "/v1/models", timeout=30) as _r:
+                emodel = json.loads(_r.read())["data"][0]["id"]
+        gen_be = EngineGen(args.gen_engine, emodel, tok, renderer, alpha=args.alpha)
+        # 起点 B=0：必须 keep_zero_b，否则一个张量都写不出来（引擎没有 adapter 可换）
+        gen_be.swap(snapshot_trainable(model), keep_zero_b=True)
+        print(f"eval generation -> engine {args.gen_engine}（model {emodel}；挂点全部在 "
+              f"verify 的投机路径内 ⇒ 照用 MTP，不关投机）", flush=True)
+
     # 训练前的身份问答实际文本：错事实只有看文本才发现（logprob 只看「像不像」）
     was_training = model.training
     model.eval()
-    id_gen_before = sample_identity(body, head, tok, renderer=renderer)
+    id_gen_before = sample_identity(body, head, tok, renderer=renderer, model=model, gen=gen_be)
     if was_training:
         model.train()
     print("before 身份问答: "
@@ -748,6 +1071,7 @@ def main() -> int:
     #      advantage）—— 数学原理不同，代价是组内必须有方差（std=0 ⇒ advantage 全零无信号，
     #      所以训练日志必须打 adv0 / uniq）。
     sel_masks: list[list[bool]] | None = None
+    ref_ce_lists: list[list[float]] | None = None   # 起点答案段逐 token CE（selection 与报告共用一次前向）
     if dpo_rows is not None:
         if args.select_tokens != "off":
             print("DPO：--select-tokens 不适用（loss 是序列级 margin，不是逐 token CE），按 off 处理")
@@ -758,9 +1082,11 @@ def main() -> int:
         t_sel = time.time()
         was_training = model.training
         model.eval()
-        sel_masks = [guard.select_mask(answer_ref_ce(body, head, full, plen), args.select_thresh,
-                                       args.select_first)
-                     for full, plen in enc]
+        # 一次前向同时产出两样东西：选择掩码（护栏 1）与报告基线（训练题起点 CE）。
+        # 这两处原先各算一遍 `answer_ref_ce`，40 条数据白跑 ~1 min —— 训练总共才 1 min。
+        ref_ce_lists = [answer_ref_ce(body, head, full, plen) for full, plen in enc]
+        sel_masks = [guard.select_mask(c, args.select_thresh, args.select_first)
+                     for c in ref_ce_lists]
         if was_training:
             model.train()
         tot_ans = sum(len(m) for m in sel_masks)
@@ -781,8 +1107,11 @@ def main() -> int:
         was_training = model.training
         model.eval()
         if dpo_enc is None:
-            ce_ref = [sum(c) / max(1, len(c)) for c in
-                      (answer_ref_ce(body, head, full, plen) for full, plen in enc)]
+            if ref_ce_lists is not None:
+                ce_ref = [sum(c) / max(1, len(c)) for c in ref_ce_lists]
+            else:
+                ce_ref = [sum(c) / max(1, len(c)) for c in
+                          (answer_ref_ce(body, head, full, plen) for full, plen in enc)]
         else:
             dpo_ref_ce = [(sum(answer_ref_ce(body, head, fc, pc)) / max(1, len(fc) - pc),
                            sum(answer_ref_ce(body, head, fj, pj)) / max(1, len(fj) - pj))
@@ -794,20 +1123,43 @@ def main() -> int:
     probes: list[dict] = []
     base_eval: dict | None = None
     final_ev: dict | None = None     # 终评结果（训练报告里「未训练部分」用）
+    held: list[tuple[str, str]] = []
+    if args.best_by == "held" and not args.held_data:
+        raise SystemExit("--best-by held 需要 --held-data：没有 task heldout 集就没有可选的"
+                         "目标指标（拿训练题 CE 选 ckpt = 按过拟合程度选）")
+    if args.held_data:
+        if args.eval_every <= 0:
+            raise SystemExit("--held-data 需要 --eval-every > 0：held CE 只在评估点上算")
+        held = read_sft_rows(args.held_data, args.word)
+        if not held:
+            raise SystemExit(f"--held-data {args.held_data} 是空的")
+        # held 与训练集重叠 = 自评，等于把「背样本」当成「学到规律」。直接拒绝，
+        # 不做「指出后继续跑」——历史里一次静默自评就够毁掉整轮结论了。
+        overlap = set(held) & set(data)
+        if overlap:
+            raise SystemExit(f"--held-data 与 --data 有 {len(overlap)} 条完全相同的 (prompt, answer)，"
+                             f"例如 {overlap.pop()!r} —— heldout 必须训练没见过")
     if args.eval_every > 0:
         if not os.path.exists(args.probes):
             raise SystemExit(f"--eval-every {args.eval_every} 需要探针文件 {args.probes}，不存在")
         probes = [json.loads(line) for line in open(args.probes, encoding="utf-8") if line.strip()]
-        if not any(p["kind"] == "identity" for p in probes) or \
+        need_id = args.best_by == "id"
+        if (need_id and not any(p["kind"] == "identity" for p in probes)) or \
            not any(p["kind"] == "cap" and p.get("target") for p in probes):
-            raise SystemExit(f"{args.probes} 里 identity / cap(带 target) 探针至少各要有一条")
+            raise SystemExit(f"{args.probes} 里 "
+                             + ("identity / " if need_id else "")
+                             + "cap(带 target) 探针至少各要有一条")
         was_training = model.training
         model.eval()
-        base_eval = eval_gate(body, head, tok, probes, args.word, renderer=renderer)
+        base_eval = eval_gate(body, head, tok, probes, args.word, renderer=renderer,
+                              model=model, held=held, gen=gen_be)
         if was_training:
             model.train()
+        held_txt = (f"  held_mean {base_eval['held_mean']:.3f} nats/token"
+                    f"（{base_eval['n_held']} 条，best-by {args.best_by}）"
+                    if held else "")
         print(f"capability gate: 起点 id_mean {base_eval['id_mean']:.3f} nats  "
-              f"cap_mean {base_eval['cap_mean']:.3f} nats/token  "
+              f"cap_mean {base_eval['cap_mean']:.3f} nats/token{held_txt}  "
               f"({base_eval['n_id']} id + {base_eval['n_cap']} cap 探针；tol {args.cap_tol}, "
               f"stop {args.cap_stop}, every {args.eval_every})", flush=True)
 
@@ -846,15 +1198,42 @@ def main() -> int:
     stopped_at = None
     hard_stopped = None
     last_step = 0
-    best: dict | None = None          # keep-best：{"step", "id_delta", "cap_drift", "sd"}
+    best: dict | None = None          # keep-best：{"step", "objective", "id_delta", "cap_drift", "sd"}
+
+    def _objective(ev: dict) -> float:
+        """keep-best 的目标增量（越大越好）——`--best-by` 决定取哪个数。
+
+        id  = 身份目标词 logp 相对起点的增量（身份改写任务）。
+        held = 起点 held CE − 当前 held CE（任何有 heldout 集的任务）。
+        cap 只当门槛，永不进目标：它是「跨域金丝雀」，降它没有意义（那不是我们要学的）。
+        """
+        if args.best_by == "held":
+            return base_eval["held_mean"] - ev["held_mean"]
+        return ev["id_mean"] - base_eval["id_mean"]
+
+    def _obj_txt(v: float) -> str:
+        # 两个任务的方向都统一成「正数 = 好」：id 是 logp 增量，held 是 CE **降幅**。
+        # 不要在这行写「heldΔ 为负才好」之类 —— 目标量与 CE 本身符号相反，混着写必看错。
+        return (f"heldCE↓ {v:+.3f} nats/tok" if args.best_by == "held"
+                else f"idΔ {v:+.3f} nats")
     train_secs, n_ans_total, n_steps_done = 0.0, 0, 0     # 训练报告口径（步耗时之和 / 答案 token 数）
     prep_secs = time.time() - t_run0 - load_secs          # 编码 + token 选择 + 自检 + 起点评估
+    # on-policy 前缀（--ss-k）的起点说明：把 K、降频、预热一次打印清楚，
+    # 否则「这一步为什么多了一次解码」在日志里看不出来。
+    if args.ss_k:
+        print(f"on-policy 前缀: K={args.ss_k} 每 {args.ss_every} 步一次"
+              f"{f'，前 {args.ss_warmup} 步跳过' if args.ss_warmup else ''}"
+              f"（答案开头换成**当前策略**生成的 K 个 token，loss 仍对真答案求 CE）", flush=True)
+    ss_any = 0        # 累计：真的发生了替换（生成前缀与真答案有分歧）的样本数
+    ss_same = 0       # 累计：生成的 K 个 token 与真答案逐 token 相同（无新信号）
     for step in range(1, args.steps + 1):
         last_step = step
         t0 = time.time()
         rule.zero_grad()
         tot, n_ans, n_sel, gn = 0.0, 0, 0, 0.0
         n_skip, n_contrib = 0, 0
+        ss_step_seen = ss_step_div = 0        # 本步：参与的样本数 / 真的分歧的样本数
+        ss_step_pos: list[int] = []           # 本步：第一个分歧位置（诊断用）
         margins: list[float] = []       # DPO：本步每个偏好对的 margin（报告 + acc 用）
         pool = dpo_enc if dpo_enc is not None else enc
         for _ in range(args.accum):
@@ -897,12 +1276,45 @@ def main() -> int:
                 n_contrib += 1
                 continue
             full, plen = enc[idx]
+            # ---- on-policy 前缀（--ss-k）：输入换成「自己生成的答案头」，标签仍是真答案 ----
+            # 这一处就是治曝光偏差的全部：teacher forcing 下答案的每个 token 都由数据喂入，
+            # 模型从没见过「自己已经走歪」的那种上下文；一旦评测时第 3 个 token 偏到基座
+            # 先验上，它在这条新分支上没有学过任何东西（ce 0.2 而生成崩，就是这件事）。
+            # 替换后，位置 0..K-1 的 loss 变成「在自己的错前缀之后说对下一个词」。
+            ss_head: list[int] | None = None
+            if (args.ss_k and (step > args.ss_warmup)
+                    and (step - args.ss_warmup - 1) % args.ss_every == 0 and plen > 0):
+                true_ans_now = full[plen:]
+                kk = min(args.ss_k, max(0, len(true_ans_now) - 1))   # 至少留一个 token 作标签
+                if kk > 0:
+                    gen = ss_gen_ids(body, head, full[:plen], kk, tok.eos_token_id, model=model)
+                    if len(gen) < kk:
+                        # 提前 EOS：**保留**这个错误行为（不拿真答案把它填掉），只补足长度
+                        gen = gen + true_ans_now[len(gen):kk]
+                    d = ss_first_div(gen, true_ans_now)
+                    ss_step_seen += 1
+                    if d < 0:
+                        ss_same += 1
+                    else:
+                        ss_head = gen
+                        ss_any += 1
+                        ss_step_div += 1
+                        ss_step_pos.append(d)
             if fp_enc is not None:
                 # frozen-prefix：前缀缓存（本步权重下的精确前向，no_grad）+ 尾段带图。
                 # lp 剪掉 chunk 对齐多出的 prompt 位后恰是全部答案 token。
                 prefix, tail = fp_enc[idx]
                 cache = prefix_cache(body, prefix)
-                lp = tail_logprobs(body, head, tail, cache)[(plen - 1) - len(prefix):]
+                off = (plen - 1) - len(prefix)
+                if ss_head is None:
+                    lp = tail_logprobs(body, head, tail, cache)[off:]
+                else:
+                    # 答案在 tail 内的起点是 off+1（lp[off] 预测 tail[off+1]）—— 替换从这个
+                    # 下标开始，不是 off。标签取自**原始** tail（真答案），长度恰好等于
+                    # 前向位置数：off 个 prompt 位 + 答案 token 数。
+                    lab = tail[1:off + 1] + list(full[plen:])
+                    tail = tail[:off + 1] + ss_head + tail[off + 1 + len(ss_head):]
+                    lp = tail_logprobs_lab(body, head, tail, lab, cache)[off:]
                 mask = torch.ones_like(lp, dtype=torch.bool)
                 if sel_masks is not None:
                     if len(sel_masks[idx]) != lp.numel():
@@ -914,9 +1326,14 @@ def main() -> int:
                         continue
                 loss = objectives.sft_loss(lp[mask]) / args.accum
             else:
-                ids = torch.tensor([full], device=device)
+                # 输入序列（ss 时答案头被替换）与标签序列（恒为真答案）分开构造：
+                # ss 关掉时 seq == full、lab == full[1:]，与历史逐 token 相同。
+                seq = full if ss_head is None else (full[:plen] + ss_head
+                                                    + full[plen + len(ss_head):])
+                lab_ids = full[1:plen] + list(full[plen:])
+                ids = torch.tensor([seq], device=device)
                 h = body(input_ids=ids[:, :-1], use_cache=False).last_hidden_state[0]
-                labels = ids[0, 1:]
+                labels = torch.tensor(lab_ids, device=device)
                 mask = torch.zeros_like(labels, dtype=torch.bool)
                 mask[plen - 1:] = True
                 if sel_masks is not None:
@@ -961,7 +1378,14 @@ def main() -> int:
         else:
             sel_txt = f"  sel {n_sel}/{n_ans}" if sel_masks is not None else ""
             skip_txt = f"  skip {n_skip}" if n_skip else ""
-            print(f"step {step}: loss {tot / args.accum:.4f}  loss_tokens {n_ans}{sel_txt}{skip_txt}  "
+            # ss_txt：本步有几条样本出现了真实分歧、分歧平均发生在答案第几个 token。
+            # 全是 same（分歧=0）说明策略已经能复现答案头，这一步的替换是空转 ——
+            # 这个数字掉到 0 就是「该收工了」的直接证据，比 loss 曲线灵敏。
+            ss_txt = ""
+            if args.ss_k and ss_step_seen:
+                pos = f"@{sum(ss_step_pos) / len(ss_step_pos):.1f}" if ss_step_pos else ""
+                ss_txt = f"  ss {ss_step_div}/{ss_step_seen}{pos}"
+            print(f"step {step}: loss {tot / args.accum:.4f}  loss_tokens {n_ans}{sel_txt}{skip_txt}{ss_txt}  "
                   f"tok/s {n_ans / dt:.1f}  grad_norm {gn:.4f}  "
                   f"{dt:.1f}s  peak {peak:.1f} GiB",
                   flush=True)
@@ -981,17 +1405,36 @@ def main() -> int:
         if base_eval is not None and step % args.eval_every == 0:
             was_training = model.training
             model.eval()
-            ev = eval_gate(body, head, tok, probes, args.word, renderer=renderer)
+            if gen_be is not None:
+                gen_be.swap(snapshot_trainable(model))   # 生成要评的是**这一步**的参数
+            ev = eval_gate(body, head, tok, probes, args.word, renderer=renderer,
+                           model=model, held=held, gen=gen_be)
+            # 身份文本的逐评估点轨迹（--gate-id-gen）：能力门自带的 gen 只生成 cap 探针，
+            # 而「身份学没学会 / 是不是已经自环」只在身份问法上看得出来。逐点看才能把
+            # 「还没学会」和「学会了但已经重复到自环」分开 —— 这两者的处方完全相反
+            # （前者加步数，后者立刻停）。
+            if args.gate_id_gen:
+                # 必须显式 no_grad：torch 后端的 `_torch_gen` 自己不带装饰（它的调用方都在
+                # no_grad 里），裸调会在 40 步解码上建出整张图 —— 实测 rank64 下一次就 58.8 GiB OOM。
+                with torch.no_grad():
+                    gg = gen_be or _torch_gen(body, head, tok, renderer, model=model)
+                    for q in IDENTITY_QS[:args.gate_id_gen]:
+                        r = gg(q, 40)
+                        print(f"    id-gen[{step}] {q} → {r['text'][:110]!r} eos={int(r['eos'])}",
+                              flush=True)
             if was_training:
                 model.train()
             id_delta = ev["id_mean"] - base_eval["id_mean"]
             cap_drift = ev["cap_mean"] - base_eval["cap_mean"]
-            v = guard.gate_verdict(id_delta, cap_drift,
-                                   best["id_delta"] if best else None, args.cap_tol,
+            objective = _objective(ev)
+            v = guard.gate_verdict(objective, cap_drift,
+                                   best["objective"] if best else None, args.cap_tol,
                                    gen_ok=ev["gen_ok"])
             gen_txt = "  ".join(f"{r['text'][:22]!r}/d3={r['distinct3']}/eos={int(r['eos'])}"
                                 for r in ev["gen"])
-            print(f"gate step {step}: idΔ {id_delta:+.3f} nats  capΔ {cap_drift:+.3f} nats/tok  → {v}"
+            held_txt = (f"  heldCE {ev['held_mean']:.3f}" if held else "")
+            print(f"gate step {step}: {_obj_txt(objective)}  capΔ {cap_drift:+.3f} nats/tok"
+                  f"{held_txt}  → {v}"
                   f"\n    gen: {gen_txt}", flush=True)
             if guard.should_hard_stop(cap_drift, args.cap_stop):
                 hard_stopped = step
@@ -999,36 +1442,42 @@ def main() -> int:
                       f"--cap-stop {args.cap_stop}（能力在坏，立刻停；存盘前恢复 best 快照）", flush=True)
                 break
             if v == "accept":
-                best = {"step": step, "id_delta": id_delta, "cap_drift": cap_drift,
-                        "sd": snapshot_trainable(model)}
+                best = {"step": step, "objective": objective, "id_delta": id_delta,
+                        "cap_drift": cap_drift, "sd": snapshot_trainable(model)}
 
     # ---- 能力门收尾：终评 + 恢复 keep-best，再走存盘 ----
     if base_eval is not None:
         was_training = model.training
         model.eval()
-        ev = eval_gate(body, head, tok, probes, args.word, renderer=renderer)
+        if gen_be is not None:
+            gen_be.swap(snapshot_trainable(model))       # 终评量的是**末参数**（best 可能更早）
+        ev = eval_gate(body, head, tok, probes, args.word, renderer=renderer,
+                       model=model, held=held, gen=gen_be)
         final_ev = ev
         if was_training:
             model.train()
         id_delta = ev["id_mean"] - base_eval["id_mean"]
         cap_drift = ev["cap_mean"] - base_eval["cap_mean"]
-        v = guard.gate_verdict(id_delta, cap_drift,
-                               best["id_delta"] if best else None, args.cap_tol,
+        objective = _objective(ev)
+        v = guard.gate_verdict(objective, cap_drift,
+                               best["objective"] if best else None, args.cap_tol,
                                gen_ok=ev["gen_ok"])
         gen_txt = "  ".join(f"{r['text'][:22]!r}/d3={r['distinct3']}/eos={int(r['eos'])}"
                             for r in ev["gen"])
+        held_txt = (f"  heldCE {ev['held_mean']:.3f}" if held else "")
         print(f"gate final (step {last_step}"
               + (f", early stop" if stopped_at else "")
               + (f", hard stop" if hard_stopped else "")
-              + f"): idΔ {id_delta:+.3f} nats  capΔ {cap_drift:+.3f} nats/tok  → {v}"
+              + f"): {_obj_txt(objective)}  capΔ {cap_drift:+.3f} nats/tok{held_txt}  → {v}"
               f"\n    gen: {gen_txt}", flush=True)
         if v == "accept":
-            best = {"step": last_step, "id_delta": id_delta, "cap_drift": cap_drift,
-                    "sd": snapshot_trainable(model)}
+            best = {"step": last_step, "objective": objective, "id_delta": id_delta,
+                    "cap_drift": cap_drift, "sd": snapshot_trainable(model)}
         if best is not None and best["step"] != last_step:
             missing = restore_trainable(model, best["sd"])
             print(f"restored keep-best snapshot: step {best['step']} "
-                  f"(idΔ {best['id_delta']:+.3f}, capΔ {best['cap_drift']:+.3f})"
+                  f"({_obj_txt(best['objective'])}, capΔ {best['cap_drift']:+.3f}, "
+                  f"best-by {args.best_by})"
                   + (f"  未命中 {missing}" if missing else ""), flush=True)
         elif best is None:
             print("capability gate 从未 accept：没有 best 可恢复，产物按当前参数保存 —— "
@@ -1046,6 +1495,13 @@ def main() -> int:
     print(f"训练: {n_steps_done} 步 / 影响答案 token {n_ans_total} / 用时 {train_secs:.1f} s / "
           f"tok/s {n_ans_total / train_secs if train_secs else 0:.1f} / "
           f"峰值 {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+    if args.ss_k:
+        # 收尾口径：真实分歧率。如果训练全程都是 same，等于没开 ss（成本白付），
+        # 必须显式说明 —— 否则「改了参数没效果」会被误读成「这条路不通」。
+        tot_ss = ss_any + ss_same
+        print(f"on-policy 前缀: {args.ss_k} tok/样本  分歧 {ss_any}/{tot_ss} 次"
+              f"（{100 * ss_any / tot_ss if tot_ss else 0:.0f}%）  "
+              f"逐字相同 {ss_same} 次", flush=True)
     if final_ev is not None and final_ev["gen_tokens"]:
         print(f"生成: {final_ev['gen_tokens']} tokens / {final_ev['gen_secs']:.1f} s / "
               f"tok/s {final_ev['gen_tok_s']:.2f}（终评贪心解码，含 prefill）", flush=True)
@@ -1080,17 +1536,55 @@ def main() -> int:
     if base_eval is not None and final_ev is not None:
         print(f"未训练部分（能力门探针：{base_eval['n_id']} id + {base_eval['n_cap']} cap，"
               f"跨域金丝雀，不该坏）:", flush=True)
-        print(f"  id_mean  {base_eval['id_mean']:+.3f} → {final_ev['id_mean']:+.3f} nats  "
-              f"(Δ{final_ev['id_mean'] - base_eval['id_mean']:+.3f}，目标词概率应上升)", flush=True)
+        if base_eval["n_id"]:
+            print(f"  id_mean  {base_eval['id_mean']:+.3f} → {final_ev['id_mean']:+.3f} nats  "
+                  f"(Δ{final_ev['id_mean'] - base_eval['id_mean']:+.3f}，目标词概率应上升)", flush=True)
+        else:
+            print("  id_mean  未测（探针文件里没有 identity 行：非身份任务，目标指标走 --held-data）",
+                  flush=True)
         print(f"  cap_mean {base_eval['cap_mean']:.3f} → {final_ev['cap_mean']:.3f} nats/tok  "
               f"(Δ{final_ev['cap_mean'] - base_eval['cap_mean']:+.3f}，越界阈值 {args.cap_tol})", flush=True)
+        if held:
+            # 这一行是「学到规律 vs 背样本」的分界：训练题 CE 一定降，held CE 不降就是过拟合。
+            print(f"  held_mean {base_eval['held_mean']:.3f} → {final_ev['held_mean']:.3f} nats/tok  "
+                  f"(Δ{final_ev['held_mean'] - base_eval['held_mean']:+.3f}，"
+                  f"{base_eval['n_held']} 条训练没见过；keep-best 按它选 = {args.best_by == 'held'}）",
+                  flush=True)
         print(f"  生成体检 {sum(1 for r in final_ev['gen'] if r['ok'])}/{len(final_ev['gen'])} ok"
               f"（distinct-3gram + EOS + 无答案串泄漏）", flush=True)
+
+    # keep-best 已恢复（若与末参数不同源）：引擎侧必须跟着换成**要存盘的**那一份，
+    # 否则报告里「生成抽检」「身份问答」量的是被丢掉的末参数。
+    if gen_be is not None:
+        gen_be.swap(snapshot_trainable(model), keep_zero_b=True)
+
+    # ---- held 生成抽检：CE 只说「像」，这里直接读准确率（唯一能算 pass@1 的项）----
+    if held and args.held_gen > 0:
+        n_probe = min(args.held_gen, len(held))
+        stride = max(1, len(held) // n_probe)
+        picks = held[::stride][:n_probe]
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            gg = gen_be or _torch_gen(body, head, tok, renderer, model=model)
+            hits = 0
+            print(f"held 生成抽检（{n_probe}/{len(held)} 条，均匀跨步；判分 = 取最后一个整数）:",
+                  flush=True)
+            for p, t in picks:
+                r = gg(p, 48)
+                hit = _answer_hit(r["text"], t)
+                hits += int(hit)
+                print(f"  {'OK ' if hit else 'BAD'} {p[:52]!r} → {r['text'][:52]!r}  "
+                      f"gold {t!r}  eos={int(r['eos'])}", flush=True)
+            print(f"  held pass@1 抽检 {hits}/{n_probe}  "
+                  f"（这是「学到了没有」的直接读数，CE 降低不能代替它）", flush=True)
+        if was_training:
+            model.train()
 
     # ---- 身份问答的实际文本（训练后）：事实对不对只能靠眼看 ----
     was_training = model.training
     model.eval()
-    id_gen_after = sample_identity(body, head, tok, renderer=renderer)
+    id_gen_after = sample_identity(body, head, tok, renderer=renderer, model=model, gen=gen_be)
     if was_training:
         model.train()
     print("身份问答（训练后，贪心解码；与训练前逐条对照）:", flush=True)
@@ -1117,11 +1611,17 @@ def main() -> int:
                   "peak_gib": round(float(torch.cuda.max_memory_allocated()) / 2**30, 3)}
     if best is not None:
         done_extra["best_step"] = best["step"]
+        done_extra["best_objective"] = round(float(best["objective"]), 6)
+        done_extra["best_by"] = args.best_by
         done_extra["best_cap_drift"] = round(float(best["cap_drift"]), 6)
         done_extra["best_id_delta"] = round(float(best["id_delta"]), 6)
     if base_eval is not None and final_ev is not None:
         done_extra["cap_drift_final"] = round(float(final_ev["cap_mean"] - base_eval["cap_mean"]), 6)
         done_extra["id_delta_final"] = round(float(final_ev["id_mean"] - base_eval["id_mean"]), 6)
+        if held:
+            done_extra["held_ce_base"] = round(float(base_eval["held_mean"]), 6)
+            done_extra["held_ce_final"] = round(float(final_ev["held_mean"]), 6)
+            done_extra["held_n"] = int(base_eval["n_held"])
         done_extra["gen_ok"] = sum(1 for r in final_ev["gen"] if r["ok"])
         done_extra["gen_n"] = len(final_ev["gen"])
     write_run_meta(args.out, args, **done_extra)

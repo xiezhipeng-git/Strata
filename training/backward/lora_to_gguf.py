@@ -45,27 +45,30 @@ sys.path.insert(0, str(REPO / "tools"))
 from gguf_writer import GGUFWriter, _Tensor  # noqa: E402
 
 # module 后缀 -> llama.cpp 的 tensor 名（不含 blk.<l>. 前缀）
+# Both output projections and input projections: the verify path applies every one of these names in program
+# order (src/core/verify.cpp), so a whole-module adapter keeps speculative decoding.  An out-projection-only
+# adapter can only shift what a layer emits; `attn_qkv` / `attn_q` are what let it read a different input.
 MAP = {
     "self_attn.o_proj": "attn_output",
     "linear_attn.out_proj": "ssm_out",
+    "self_attn.q_proj": "attn_q",
+    "self_attn.k_proj": "attn_k",
+    "self_attn.v_proj": "attn_v",
+    "linear_attn.in_proj_qkv": "attn_qkv",
+    "linear_attn.in_proj_z": "attn_gate",
 }
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pt", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--alpha", type=float, default=32.0, help="训练时的 lora_alpha（s = alpha / rank）")
-    ap.add_argument("--arch", default="qwen4exp",
-                    help="写进 general.architecture，**必须等于基座 GGUF 的那个值**：引擎拿它和模型比对，"
-                         "不一致直接拒载（'made for X, not Y'，宁可不加载也不跑半个 adapter）。"
-                         "Swift-Qwen3.8-Flash-Next = qwen4exp；qwen3.6-35b-a3b = qwen35moe")
-    ap.add_argument("--keep", default=",".join(MAP), help="要写出的 module 后缀，逗号分隔")
-    ap.add_argument("--allow-empty", action="store_true", help="一个可映射的键都没有时也写出（默认报错）")
-    args = ap.parse_args()
+def write_adapter(sd, out, *, alpha: float = 32.0, arch: str = "qwen4exp",
+                  keep=None, allow_empty: bool = False,
+                  keep_zero_b: bool = False) -> dict:
+    """state_dict -> 引擎能加载的 adapter GGUF。**训练循环里直接调它**（不落 .pt、不起子进程）。
 
-    keep = [k.strip() for k in args.keep.split(",") if k.strip()]
-    sd = torch.load(args.pt, map_location="cpu")
+    `keep_zero_b`：B 全零的模块照写（默认跳过，因为 B=0 等于没训）。用在「引擎启动要先有一个
+    adapter 才能 `--lora`」这一处：起始点的零 B adapter 与 base 数值等价，训练开始后第一轮 swap
+    就把它换掉。跳过它会让引擎无从启动。
+    """
+    keep = [k.strip() for k in (keep if keep is not None else MAP) if k.strip()]
 
     # module 名 -> {"A": tensor, "B": tensor}
     mods: dict[str, dict[str, torch.Tensor]] = {}
@@ -101,7 +104,7 @@ def main() -> int:
         b = ab["B"].float().numpy()   # (n_out, r)
         if a.ndim != 2 or b.ndim != 2 or a.shape[0] != b.shape[1]:
             raise SystemExit(f"{name}: A {a.shape} / B {b.shape} do not agree on the rank")
-        if float(np.abs(b).max()) == 0.0:
+        if float(np.abs(b).max()) == 0.0 and not keep_zero_b:
             skipped.append(name + " (B is zero: never trained)")
             continue
         if li in layers and MAP[hit] in layers[li]:
@@ -109,14 +112,14 @@ def main() -> int:
         layers.setdefault(li, {})[MAP[hit]] = (a, b)
 
     n = sum(len(v) for v in layers.values())
-    if n == 0 and not args.allow_empty:
+    if n == 0 and not allow_empty:
         raise SystemExit(f"no adaptor tensor to write (kept {keep}); the state dict has {len(mods)} modules")
 
     w = GGUFWriter()
     w.add("general.type", "adapter", "string")
-    w.add("general.architecture", args.arch, "string")
+    w.add("general.architecture", arch, "string")
     w.add("adapter.type", "lora", "string")
-    w.add("adapter.lora.alpha", float(args.alpha), "f32")
+    w.add("adapter.lora.alpha", float(alpha), "f32")
 
     total = 0
     for li in sorted(layers):
@@ -131,17 +134,40 @@ def main() -> int:
                                      np.ascontiguousarray(b, dtype="<f4").tobytes()))
             total += r * n_in + n_out * r
 
-    path = w.write(args.out)
+    path = w.write(out)
     ranks = sorted({a.shape[0] for v in layers.values() for a, _ in v.values()})
-    print(f"wrote {path}: {n} layer(s) adapted, {len(w.tensors)} tensors, rank {ranks}, "
-          f"{path.stat().st_size / 2**20:.1f} MiB, alpha {args.alpha:g} "
-          f"(s = alpha/rank = {args.alpha / ranks[-1]:.3f} for the widest rank)")
-    if skipped:
-        print(f"dropped {len(skipped)} module(s) the engine does not adapt:")
-        for s in skipped[:10]:
+    return {"path": path, "layers": n, "tensors": len(w.tensors), "ranks": ranks,
+            "mib": path.stat().st_size / 2**20, "skipped": skipped}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pt", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--alpha", type=float, default=32.0, help="训练时的 lora_alpha（s = alpha / rank）")
+    ap.add_argument("--arch", default="qwen4exp",
+                    help="写进 general.architecture，**必须等于基座 GGUF 的那个值**：引擎拿它和模型比对，"
+                         "不一致直接拒载（'made for X, not Y'，宁可不加载也不跑半个 adapter）。"
+                         "Swift-Qwen3.8-Flash-Next = qwen4exp；qwen3.6-35b-a3b = qwen35moe")
+    ap.add_argument("--keep", default=",".join(MAP), help="要写出的 module 后缀，逗号分隔")
+    ap.add_argument("--allow-empty", action="store_true", help="一个可映射的键都没有时也写出（默认报错）")
+    ap.add_argument("--keep-zero-b", action="store_true",
+                    help="B 全零的模块也写出：给引擎一个能启动的初始 adapter（数值等价于 base）")
+    args = ap.parse_args()
+
+    r = write_adapter(torch.load(args.pt, map_location="cpu"), args.out,
+                      alpha=args.alpha, arch=args.arch,
+                      keep=args.keep.split(","), allow_empty=args.allow_empty,
+                      keep_zero_b=args.keep_zero_b)
+    print(f"wrote {r['path']}: {r['layers']} layer(s) adapted, {r['tensors']} tensors, "
+          f"rank {r['ranks']}, {r['mib']:.1f} MiB, alpha {args.alpha:g} "
+          f"(s = alpha/rank = {args.alpha / r['ranks'][-1]:.3f} for the widest rank)")
+    if r["skipped"]:
+        print(f"dropped {len(r['skipped'])} module(s) the engine does not adapt:")
+        for s in r["skipped"][:10]:
             print("  ", s)
-        if len(skipped) > 10:
-            print(f"   ... {len(skipped) - 10} more")
+        if len(r["skipped"]) > 10:
+            print(f"   ... {len(r['skipped']) - 10} more")
     return 0
 
 

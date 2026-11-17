@@ -418,21 +418,26 @@ def split_full(full: list[int], plen: int) -> tuple[list[int], list[int]]:
     return full[:s], full[s:]
 
 
-def gate_verdict(id_delta: float, cap_drift: float,
-                 best_id: float | None, cap_tol: float,
+def gate_verdict(objective_delta: float, cap_drift: float,
+                 best_objective: float | None, cap_tol: float,
                  gen_ok: bool = True) -> str:
     """能力门的判定：'reject' | 'accept' | 'hold'。
+
+    `objective_delta` 是**本次训练的目标指标**（越大越好），由调用方决定取哪个数：
+    身份改写 = 目标词 logp 的增量；事实注入 / 数学题 = heldout CE 的下降量
+    （传 `base_held_ce - held_ce`）。门是共用的，目标不是 —— 把目标写死在门里，
+    任何非身份任务都会「永远 hold、退回未训参数」，看着像算法无效，其实是判据选错。
 
     - **生成体检不过就 reject**（gen_ok=False）：teacher-forced 的 cap CE 量不出
       生成退化 —— 2026-10-30 实测，CE 只涨 0.225 nats（容差内），贪心解码却已坍缩成
       「xiezhipeng-gitiezhipeng…」复读环。生成体检（distinct-3gram + EOS）补这个盲区。
-    - cap_drift 超过 cap_tol 也 reject —— 哪怕身份学得再好也不配做 best
-      （我们不要「学会了身份、坏了能力」的 checkpoint）；
-    - 否则身份增益严格大于已知最好才 accept（首个评估 best_id=None 直接 accept）。
+    - cap_drift 超过 cap_tol 也 reject —— 哪怕目标学得再好也不配做 best
+      （我们不要「学会了目标、坏了能力」的 checkpoint）；
+    - 否则目标增益严格大于已知最好才 accept（首个评估 best_objective=None 直接 accept）。
     """
     if not gen_ok or cap_drift > cap_tol:
         return "reject"
-    if best_id is None or id_delta > best_id:
+    if best_objective is None or objective_delta > best_objective:
         return "accept"
     return "hold"
 

@@ -77,13 +77,23 @@ def inject_lora(model: nn.Module, targets: tuple[str, ...] = DEFAULT_TARGETS, r:
 
     `seed` 只决定 A 的随机初始化（按模块序号 `seed + n` 逐层展开），不碰全局 RNG；
     传同一个 seed 就得到逐张量相同的初始 adapter，A/B 差分实验才成立。
+
+    `targets` 的每一项可以是一个**叶子名**（`out_proj`，`DEFAULT_TARGETS` 的写法）或一个**点号后缀**
+    （`self_attn.q_proj`）。后缀形式是必要的：叶子名 `q_proj` 会连 `self_attn.indexer.q_proj` 一起挂上，
+    而引擎没有 indexer 的 adapter 张量（`src/kernels/lora_adapters.cpp` 的 `qsa_projs` / `gdn_projs`），
+    那些参数训了也导不出去 —— 训练侧的更新与评估侧读到的 adapter 就不是同一个模型。
     """
     n = 0
+
+    def _hit(nm: str) -> bool:
+        if nm.rsplit(".", 1)[-1] in targets:
+            return True
+        return any(t for t in targets if "." in t and nm.endswith(t))
+
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
-        leaf = name.rsplit(".", 1)[-1]
-        if leaf not in targets:
+        if not _hit(name):
             continue
         if prefix and not name.startswith(prefix):
             continue
