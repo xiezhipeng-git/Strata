@@ -112,6 +112,26 @@ def builtin_data(word: str):
 PLACEHOLDER = "{dev}"      # 与 training/whoami.py 同一个占位符
 
 
+def _brace_report(path: str, rows: list[tuple[str, str]]) -> None:
+    """目标里花括号不配对的行数 —— 只报警，不改数据。
+
+    为什么值得在装载口查（2026-11-18）：数学 CoT 的 target 是一段 LaTeX，生成数据时
+    一个 `re.sub(r"\\\\boxed\\{", "", s).replace("}", "")` 把**全文的右花括号全删了**
+    （11 行 / 150 个 `{` / 0 个 `}`），于是模型学到的是「开括号永远不闭合」。那两轮实验
+    的失败（越训越乱、`\\boxed{55$`）里有它一份，而日志里一个字都没提 —— 训练不会因为
+    目标残缺而报错，它只会照学。
+
+    不算 prompt：题面是从数据集原样抄的，target 才是被生成脚本处理过的那一侧。
+    """
+    bad = [(i, a.count("{"), a.count("}")) for i, (_, a) in enumerate(rows, 1)
+           if a.count("{") != a.count("}")]
+    if not bad:
+        return
+    i, o, c = bad[0]
+    print(f"数据体检: {len(bad)}/{len(rows)} 行 target 的花括号不配对"
+          f"（第 {i} 行 {{={o} }}={c}）—— LaTeX 目标被截断会教出残缺公式", flush=True)
+
+
 def load_data(spec: str, word: str = "", *, allow_target: bool = False,
               weights: list[float] | None = None) -> list[tuple[str, str]]:
     """`identity` / `identity:<word>` / `jsonl:<path>` / 裸路径 → `[(prompt, answer)]`。
@@ -157,6 +177,7 @@ def load_data(spec: str, word: str = "", *, allow_target: bool = False,
                     raise SystemExit(f"{path}:{ln}: weight 不是数字：{r.get('weight')!r}")
     if not rows:
         raise SystemExit(f"{path}: no rows")
+    _brace_report(path, rows)
     return rows
 
 

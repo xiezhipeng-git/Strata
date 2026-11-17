@@ -200,6 +200,18 @@ def main() -> int:
                     help="只训练不评估（调试用；正常路径别开 —— 训练完不给判分等于没结论）")
     ap.add_argument("--keep-engine", action="store_true",
                     help="评估完不停引擎（连续评估多个 ckpt 时省一次 20 s 启动）")
+    ap.add_argument("--seed-path", default="",
+                    help="零 seed adapter 的路径（默认 <ckpt 目录>/seed.gguf）。**这是唯一"
+                         "一份会被反复覆盖的 adapter**：它只有 B=0、数值上等于基座，"
+                         "每份 ckpt 各造一份 92 MiB 的副本纯属浪费磁盘（实测一个实验目录"
+                         "长到 5.7 GiB，全是 .seed.gguf 与 .stepN.pt）")
+    ap.add_argument("--reuse-seed", action="store_true",
+                    help="seed 已存在就直接用（同一套 --targets/--rank 连续跑时省一次 92 MiB 写盘）。"
+                         "投影集合变了会被引擎以 `layer 0 changed its projection set` 拒载，"
+                         "那时去掉这个开关重跑即可")
+    ap.add_argument("--prune", action="store_true",
+                    help="判分完删掉 --save-every 产出的 .stepN.pt（曲线已进报告）。默认保留："
+                         "删了就再也复核不了那一份，而 4 份 ≈ 180 MiB")
     ap.add_argument("--eval-only", action="store_true",
                     help="跳过训练，直接对 --out 指向的现成 ckpt 做引擎判分（重评上一轮产物）")
     ap.add_argument("train_argv", nargs=argparse.REMAINDER,
@@ -285,12 +297,20 @@ def main() -> int:
     # CUDA graph 捕获了投影表的地址，`layer 0 changed its projection set` 就是拒载的理由。
     # 因此不用配置文件里写死的老 seed（往往只有两个输出投影），而是从这次训练的 ckpt
     # 现造一份「同结构、B 全零」的 —— 数值上等于基座，于是起点评估就是未训练点。
-    seed = _p.Path(ckpt + ".seed.gguf")
+    #
+    # 路径**固定**（`--seed-path`，默认 <ckpt 目录>/seed.gguf）而不是跟着 ckpt 命名：
+    # B=0 的 adapter 与 ckpt 无关，只有投影集合/rank 有关。每个 ckpt 各造一份的旧做法
+    # 让一个实验目录堆到 5.7 GiB，而其中 4 份内容完全相同。
+    seed = _p.Path(args.seed_path) if args.seed_path else (_p.Path(ckpt).parent / "seed.gguf")
     alpha = _opt(argv, "--alpha", "32")
-    seed_cmd = [py, "-u", str(HERE / "lora_to_gguf.py"), "--pt", ckpt, "--out", str(seed),
-                "--alpha", alpha, "--zero-b"]
-    print(f"\n=== 造同结构零 seed ===\n" + " ".join(seed_cmd), flush=True)
-    src = _stream(seed_cmd, str(logdir / "seed.log"), env)
+    if args.reuse_seed and seed.is_file():
+        print(f"\n=== 复用已有零 seed {seed}（--reuse-seed）===", flush=True)
+        src = 0
+    else:
+        seed_cmd = [py, "-u", str(HERE / "lora_to_gguf.py"), "--pt", ckpt, "--out", str(seed),
+                    "--alpha", alpha, "--zero-b"]
+        print(f"\n=== 造同结构零 seed ===\n" + " ".join(seed_cmd), flush=True)
+        src = _stream(seed_cmd, str(logdir / "seed.log"), env)
     if src != 0 or not seed.is_file():
         rep["ok"] = False
         rep["error"] = "零 seed 生成失败（adapter 结构会与热换要求不符）"
@@ -376,6 +396,16 @@ def main() -> int:
             if ok_rows:
                 b = max(ok_rows, key=lambda c: (c["pass_rate"], -int(c["n"] or 0)))
                 rep["best_by_pass"] = {k: b.get(k) for k in ("ckpt", "hits", "n", "pass_rate")}
+            if args.prune:
+                # 曲线已经在 rep["curve"] 里（含每条的 hit/text/eos），中间检查点可以走了。
+                # 末步 ckpt 不删：那是这次实验的产物。
+                freed = 0
+                for q in points:
+                    for f in (q, _p.Path(str(q) + ".eval.json")):
+                        if f.is_file():
+                            freed += f.stat().st_size
+                            f.unlink()
+                print(f"已删 {len(points)} 份中间检查点，回收 {freed / 2**20:.0f} MiB", flush=True)
     finally:
         if not args.keep_engine:
             serve.terminate()

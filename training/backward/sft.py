@@ -68,7 +68,7 @@ import torch
 # Linux 上 require() 直接返回，不做任何事。
 import mem_guard
 import objectives
-from update_rules import BackwardRule
+from update_rules import BackwardRule, lr_at
 import platform_check
 import whoami
 import guard
@@ -693,6 +693,17 @@ def main() -> int:
                          "这才对得上「一步 = 一次参数更新」；调大只是拿吞吐换梯度平滑，"
                          "不是算法要求（SFT 有标准答案，teacher forcing 一次前向就够）")
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr-schedule", choices=("const", "cosine", "linear"), default="const",
+                    help="lr 随步数怎么走。**多遍学习要用 cosine/linear**（2026-11-18 用户"
+                         "提出的判据）：同一批数据跑第 2、3 遍时，恒 lr 的步长和第一遍一样大，"
+                         "而参数已经在「第一遍的解」附近，同样的步长会越过那个窄解区 —— "
+                         "实测形状就是 0.7 次/问 6/8、1.5 次/问 6/8、2.2 次/问 4/8")
+    ap.add_argument("--lr-final", type=float, default=None,
+                    help="末步 lr（默认 lr×0.1）。留 10%% 而不是 0：末段梯度已经很小，"
+                         "归零等于提前停止")
+    ap.add_argument("--warmup", type=int, default=0, metavar="N",
+                    help="前 N 步从 lr/N 线性升到 lr（LoRA 的 B 从 0 起，第一步只有 A 侧"
+                         "梯度，乘 0 会白跑一步）")
     ap.add_argument("--rank", type=int, default=16,
                     help="LoRA 秩。unilora 下也是秩 r（论文默认 4）")
     ap.add_argument("--lora-method", choices=("lora", "unilora"), default="lora",
@@ -1073,6 +1084,20 @@ def main() -> int:
         enc = [encode(tok, q, a, renderer=renderer) for q, a in data]   # [(ids, plen), ...]
     lens = [len(b) for b, _ in enc]   # 全量：训练报告按 ce_ref 的行数索引，写死前 12 条会在 >12 行数据上越界（the end-of-run report crashed after step 40 on 26-row data, adapter save never ran）
     print("seq lens:", lens, flush=True)
+    # 目标里到底有没有「推理链」—— 这件事不看不知道：2026-11-18 把 24 条 MATH 的
+    # solution 写进 `solution` 字段、只把 gold 数字留给 `answer`，于是每条目标平均
+    # 2.9 token，训练实际在教「跳过推理直接报数」（v2 就是这样把 cap5 从 5/5 练到 2/5 的）。
+    # `load_data` 只认 `answer`/`target`，写错字段不会报错，只会静默换掉训练内容。
+    _al = [len(b) - pl for b, pl in enc]
+    _al.sort()
+    if _al:
+        _avg = sum(_al) / len(_al)
+        print(f"answer 段 {_avg:.1f} token/条（中位 {_al[len(_al) // 2]}，"
+              f"最长 {_al[-1]}）", flush=True)
+        if len(_al) >= 8 and _avg <= 4:
+            print("WARN: 目标平均 ≤4 token —— 这批数据只有结论、没有推理过程。若数据本意是"
+                  "带 CoT，检查推理链是不是放在了 `solution`/`reasoning` 字段里"
+                  "（`load_data` 只读 answer/target）", flush=True)
 
     # ---- DPO：编一对（chosen/rejected 各带 EOS），预计算参考策略的 ref logprob。----
     # 参考策略 = 训练起点（此刻 B=0 / UniLoRA 初始扰动），冻结 ⇒ 一次性算完，
@@ -1313,6 +1338,11 @@ def main() -> int:
     for step in range(1, args.steps + 1):
         last_step = step
         t0 = time.time()
+        # lr 调度在**每一步开头**定：AdamW 的 step() 用的就是此刻 param_group 里的值。
+        # const + 无 warmup 时算出来就是 args.lr（`set_lr` 只写字段，不碰矩估计）。
+        cur_lr = lr_at(step, args.steps, args.lr, args.lr_final, args.lr_schedule, args.warmup)
+        rule.set_lr(cur_lr)
+        lr_txt = f"  lr {cur_lr:.2e}" if (args.lr_schedule != "const" or args.warmup) else ""
         rule.zero_grad()
         tot, n_ans, n_sel, gn = 0.0, 0, 0, 0.0
         n_skip, n_contrib = 0, 0
@@ -1456,7 +1486,8 @@ def main() -> int:
             m_loss, m_acc = dpo.dpo_batch(margins, args.dpo_beta)
             print(f"step {step}: dpo loss {m_loss:.4f}  acc {m_acc:.0%}  "
                   f"margin均值 {sum(margins) / len(margins):+.3f}  pairs {len(margins)}  "
-                  f"tok/s {n_ans / dt:.1f}  grad_norm {gn:.4f}  {dt:.1f}s  peak {peak:.1f} GiB",
+                  f"tok/s {n_ans / dt:.1f}  grad_norm {gn:.4f}{lr_txt}  {dt:.1f}s  "
+                  f"peak {peak:.1f} GiB",
                   flush=True)
             recent.append(m_loss)
         else:
@@ -1470,7 +1501,7 @@ def main() -> int:
                 pos = f"@{sum(ss_step_pos) / len(ss_step_pos):.1f}" if ss_step_pos else ""
                 ss_txt = f"  ss {ss_step_div}/{ss_step_seen}{pos}"
             print(f"step {step}: loss {tot / args.accum:.4f}  loss_tokens {n_ans}{sel_txt}{skip_txt}{ss_txt}  "
-                  f"tok/s {n_ans / dt:.1f}  grad_norm {gn:.4f}  "
+                  f"tok/s {n_ans / dt:.1f}  grad_norm {gn:.4f}{lr_txt}  "
                   f"{dt:.1f}s  peak {peak:.1f} GiB",
                   flush=True)
             recent.append(tot / args.accum)

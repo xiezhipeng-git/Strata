@@ -22,11 +22,46 @@ SGD」。于是「同一算法换路线」要改两处，而日志字段、momen
 
 from __future__ import annotations
 
+import math
 import types
 
 import torch
 
 from lora import LoRALinear
+
+
+def lr_at(step: int, total: int, base: float, final: float | None = None,
+          schedule: str = "const", warmup: int = 0) -> float:
+    """第 `step` 步（1-based）该用的学习率 —— 两条路线共用这一份。
+
+    为什么需要（2026-11-18，用户提出的假设）：同一个集子跑第二、第三遍时，「第一遍涨得
+    很快、第二遍开始不动、第三遍往回退」是实测过的形状（数学 8 步 6/8 → 16 步 6/8 →
+    24 步 4/8；身份 0.8 次 5/15 → 1.0 次能力坏）。恒定 lr 下第二遍的更新量与第一遍一样大，
+    而参数已经走到「第一遍的解」附近：同样的步长就越过了一个很窄的好解区，然后 AdamW 的
+    二阶矩还在按第一遍的梯度尺度记忆，等于持续推着它往过拟合方向走。**多遍学习要降低 lr**，
+    这不是调参运气，是步长必须随「离解的距离」收敛。
+
+    `warmup` 那一段从 `base/warmup` 起线性升（不是从 0）：LoRA 的 B 初始化是 0，第一步
+    本来就只有 A 侧梯度，再乘 0 会白跑一步。
+
+    `final` 缺省取 `base * 0.1`：留 10% 而不是 0，是因为最后一段仍要能微调（末段梯度
+    已经很小，再乘 0 等于提前停止）。
+    """
+    end = max(1, int(total))
+    step = max(1, int(step))
+    fin = base * 0.1 if final is None else float(final)
+    if warmup and step <= warmup:
+        return base * step / max(1, int(warmup))
+    if schedule == "const":
+        return base
+    span = max(1, end - max(0, int(warmup)))
+    p = min(1.0, max(0.0, (step - max(0, int(warmup))) / span))
+    if schedule == "cosine":
+        return fin + (base - fin) * 0.5 * (1.0 + math.cos(math.pi * p))
+    if schedule == "linear":
+        return fin + (base - fin) * (1.0 - p)
+    raise ValueError(f"未知 lr 调度 {schedule!r}（只认 const / cosine / linear）")
+
 
 
 # ---------------------------------------------------------------- 零阶的方向向量
@@ -90,6 +125,13 @@ class BackwardRule:
         self.opt = torch.optim.AdamW(self.params, lr=lr, betas=betas, weight_decay=weight_decay)
         self.clip = clip
 
+    def set_lr(self, lr: float) -> None:
+        """改所有 param_group 的 lr（调度器每步调它）。AdamW 的 `state` 不重置 ——
+        一阶/二阶矩是「梯度的尺度记忆」，换 lr 不该把它清掉。"""
+        self.lr = lr
+        for g in self.opt.param_groups:
+            g["lr"] = lr
+
     def zero_grad(self) -> None:
         self.opt.zero_grad(set_to_none=True)
 
@@ -143,6 +185,10 @@ class MezoRule:
         self.queries = max(1, int(queries))
         self._buf = [torch.zeros_like(p) for p in self.params] if momentum else None
         self.steps = 0
+
+    def set_lr(self, lr: float) -> None:
+        """零阶是手写 SGD，lr 只是一个标量字段；动量缓冲不随 lr 缩放（它存的是方向导数）。"""
+        self.lr = lr
 
     def _perturb(self, dirs, scale: float) -> None:
         for p, d in zip(self.params, dirs):
