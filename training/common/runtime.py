@@ -302,7 +302,7 @@ def resolve_prefill_chunk(longest_tokens: int, given: str = "") -> str:
     return str(max(256, min(PREFILL_CHUNK_CAP, want)))
 
 
-def engine_argv(args, init_adapter: str) -> list[str]:
+def engine_argv(args, init_adapter: str, extra: list[str] | None = None) -> list[str]:
     """训练引擎的命令行（pipe 与 http 两种 transport 用同一份定义）。
 
     `--serve` 是引擎的常驻模式；它的命令循环同时收 LORA/SCORE/GEN（src/program/generate.cpp）。
@@ -325,11 +325,16 @@ def engine_argv(args, init_adapter: str) -> list[str]:
     # 所以这个洞只在「基座臂」这类探针里露出来 —— 不传就是不加载 adapter，语义上本来就该省掉这个参数。
     if init_adapter:
         argv += ["--lora", os.path.abspath(init_adapter)]
+    # `extra`：只给「需要非默认采样行为」的调用方用（目前只有 `data_boost.py`，它要
+    # 采样温度来做 MH 提议）。放在最后是因为它**覆盖**前面的默认值，引擎的解析是后写的赢。
+    if extra:
+        argv += [str(x) for x in extra]
     return argv
 
 
-def launch_engine(args, log_path: str, init_adapter: str) -> tuple[Engine, float]:
-    cmd = engine_argv(args, init_adapter)
+def launch_engine(args, log_path: str, init_adapter: str,
+                  extra: list[str] | None = None) -> tuple[Engine, float]:
+    cmd = engine_argv(args, init_adapter, extra)
     # pipe 直接拉第二个引擎进程不经过 serve 的排队/槽位（那些防的是单进程内的请求），
     # 双驻留实测会打爆主机提交内存、引擎 stall 自杀 —— 拉起前查卡上是否已有驻留。
     import mem_guard

@@ -214,6 +214,12 @@ def main() -> int:
                          "删了就再也复核不了那一份，而 4 份 ≈ 180 MiB")
     ap.add_argument("--eval-only", action="store_true",
                     help="跳过训练，直接对 --out 指向的现成 ckpt 做引擎判分（重评上一轮产物）")
+    ap.add_argument("--boost", choices=("auto", "on", "off"), default="auto",
+                    help="训练前先跑投影采样（arXiv:2610.02140）生成 <--data>.boost.jsonl，"
+                         "sft.py 的 --data-boost auto 会自动用它。auto（默认）= 有 --data 就跑；"
+                         "on = 没有 --data 就报错；off = 不跑。产物已存在且指纹相同则直接复用")
+    ap.add_argument("--boost-arg", action="append", default=[], metavar="ARG",
+                    help="透传给 data_boost.py 的额外参数（可重复），例如 --boost-arg=--steps=8")
     ap.add_argument("train_argv", nargs=argparse.REMAINDER,
                     help="sft.py 的训练参数（`--` 之后）")
     args = ap.parse_args()
@@ -239,6 +245,69 @@ def main() -> int:
     py = sys.executable
 
     rep: dict = {"ckpt": ckpt, "held_data": held, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+    # ---------- 0. 投影采样（训练前，独占 GPU）----------
+    # 为什么放在训练之前、而且单独起一个引擎：boost 要读 logprobs + 生成，训练要占满
+    # 48 GiB —— 两者不能同时在卡上（MEMORY 的「GPU 单任务铁律」）。data_boost 自己
+    # launch_engine、自己 close，退出时卡是干净的，训练才起来。
+    # **必须在训练前**：sft.py 的 --data-boost auto 是在装载数据时读 <data>.boost.jsonl 的。
+    if args.boost != "off" and not args.eval_only:
+        data_path = _opt(argv, "--data")
+        if not data_path:
+            if args.boost == "on":
+                raise SystemExit("--boost on 但训练参数里没有 --data（没数据可 boost）")
+            print("boost: 没有 --data（内置身份数据），跳过", flush=True)
+        elif _flag(argv, "--data-boost"):
+            # 训练参数里自己写了 --data-boost：由它决定用不用，这里不重复跑一遍
+            print("boost: 训练参数已显式给 --data-boost，跳过", flush=True)
+        else:
+            print("\n=== 投影采样（数据侧，一次性成本）===", flush=True)
+            if _engine_running():
+                print("已有 strata.exe 在跑：单任务铁律，先停掉", flush=True)
+                _kill_engine()
+                time.sleep(2.0)
+            if not _wait_gpu_free(limit_mib=6000, timeout=120.0):
+                print(f"WARN: 显存仍高于 6 GiB（{_gpu_used_mib()} MiB），继续尝试", flush=True)
+            bcfg = json.loads(_p.Path(args.engine_config).read_text(encoding="utf-8"))
+            bargs = list(bcfg.get("args") or [])
+            bcmd = [py, "-u", str(_p.Path(__file__).resolve().parent / "data_boost.py"),
+                    "--data", data_path,
+                    "--engine", str(bcfg.get("exe") or ""),
+                    "--pack", _opt(bargs, "--pack"),
+                    "--gguf", _opt(bargs, "--native"),
+                    "--max-context", _opt(bargs, "--max-context", "8192"),
+                    "--log", str(logdir / "boost.engine.log")] + list(args.boost_arg)
+            prof = _opt(bargs, "--expert-profile")
+            if prof:
+                bcmd += ["--expert-profile", prof]
+            rep["boost_secs"] = 0.0
+            t_b = time.time()
+            brc = _stream(bcmd, str(logdir / "boost.log"), env)
+            rep["boost_secs"] = round(time.time() - t_b, 1)
+            rep["boost_rc"] = brc
+            print(f"=== 投影采样 rc={brc} 用时 {rep['boost_secs']} s ===\n", flush=True)
+            if brc != 0:
+                # 数据侧失败不该悄悄退化成「用原始数据训练」：那一轮实验的前提就变了。
+                rep["ok"] = False
+                rep["error"] = "投影采样失败（模型/数据未变，修好后重跑；或 --boost off）"
+                _write(report_path, rep)
+                return 1
+            # 把「这一轮到底用没用增强数据」写进报告。不加这一段，报告里只有 loss 曲线，
+            # 两周后没人能说清 easyG2 与 easyB2 的差别是不是数据。
+            try:
+                from data_boost import detect_provenance, provenance_line, read_input
+
+                _m, _r = read_input(data_path + ".boost.jsonl")
+                rep["boost"] = detect_provenance(_r, _m)
+                print("  " + provenance_line(rep["boost"], verb="boost"), flush=True)
+            except Exception as _e:      # 读不到不该让整轮失败，但要留痕
+                rep["boost"] = {"state": "unknown", "error": str(_e)}
+                print(f"  WARN: 读 boost 产物身份失败：{_e}", flush=True)
+    else:
+        # 报告里永远有 `boost` 这一段：有它才能一眼分清「这轮是增强数据还是原始数据」。
+        # 缺省不写 = 以后只能靠回忆。
+        rep["boost"] = {"state": "off" if args.boost == "off" else "skipped",
+                        "note": "本轮未生成/未注入增强数据"}
 
     # ---------- 1. 训练（唯一占 GPU 的进程）----------
     # held 生成留到评估阶段（见 _drop 的说明）：训练侧只算 held CE。

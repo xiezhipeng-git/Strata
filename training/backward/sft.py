@@ -735,6 +735,14 @@ def main() -> int:
                          f" → 兜底「{whoami.FALLBACK}」（见 whoami.py）")
     ap.add_argument("--data", default="",
                     help="jsonl（每行 {\"prompt\":…, \"answer\":…}）。给了就用它，否则用内置身份数据")
+    ap.add_argument("--data-boost", choices=("auto", "on", "off"), default="auto",
+                    dest="data_boost",
+                    help="用投影采样（arXiv:2610.02140）boost 过的目标替换 --data 的 answer。"
+                         "auto（默认）= 有 <data>.boost.jsonl 就用、没有就警告继续；"
+                         "on = 必须用（没有就退出）；off = 不用。产物由 "
+                         "training/backward/data_boost.py 生成（要独占 GPU 跑引擎，所以不在本进程里跑）")
+    ap.add_argument("--boosted-data", default="",
+                    help="boost 产物路径（默认 <--data>.boost.jsonl）")
     ap.add_argument("--pretrain-data", default="",
                     help="prep_pretrain.py 产出的 uint32 [n, seqlen] npy：预训练形状，"
                          "整块全 token loss（plen=1），测真实吞吐用")
@@ -874,7 +882,51 @@ def main() -> int:
     # 先取来源再覆盖 args.word —— 否则拿解析后的值去问来源，答案永远是 `--word`。
     args.word, src = whoami.source(args.word)
     print(f"identity: {args.word}   ({src})", flush=True)
+    # 拿产物当 `--data` 是最常见的误用：产物第一行是 `_meta`、正文里叫 `boosted`，而 SFT 读
+    # 的是 `answer`/`solution`。不拦的话报错长成「第 1 行缺 prompt 字段，实际 ['_meta']」——
+    # 离真正的原因隔了一层，而且会让人误以为数据本身坏了。
+    if args.data:
+        try:
+            from data_boost import peek_state
+
+            _st = peek_state(args.data)
+        except Exception:
+            _st = "raw"          # 读不动就交给 read_sft_rows 报它自己的错，别在这里掩盖
+        if _st != "raw":
+            raise SystemExit(
+                f"--data {args.data} 本身是投影采样的产物（state={_st}）。\n"
+                "  它应该放在**原始数据旁边**、命名为 <原始数据>.boost.jsonl，由 "
+                "--data-boost 自动注入；也可以显式给 --boosted-data <产物路径>。\n"
+                "  直接把产物当 --data：字段名对不上（产物叫 boosted），而且训练日志里就再也"
+                "分不出你喂的是原始数据还是增强数据。")
     data = read_sft_rows(args.data, args.word) if args.data else builtin_data(args.word)
+    # 投影采样（arXiv:2610.02140）：把 off-policy 的专家轨迹换成「基座自己会说、信息不变」
+    # 的那一版。判据是 2026-11-18 的五组对照 —— 直接在这批专家轨迹上 SFT，CE 从 3.67 降到
+    # 1.77 而 pass@1 反而掉（L5 6→3），梯度花在「改口说另一种腔调」上。所以默认(auto)会优先
+    # 用 boost 过的目标：**目标函数与超参一个字都不改，只换数据分布**。
+    # 只对单轮 SFT 生效：DPO 是序列级 margin、pretrain 是整块 loss，两者都没有「一条专家轨迹」
+    # 这个概念，套上去只会把 chosen/rejected 弄成同一条。
+    if args.data_boost != "off":
+        if args.dpo_data or args.pretrain_data:
+            print(f"data-boost {args.data_boost}: --dpo-data/--pretrain-data 没有「一条专家轨迹」"
+                  "这个概念，跳过", flush=True)
+        elif not args.data:
+            print(f"data-boost {args.data_boost}: 用的是内置身份数据（没有 gold 判据），跳过",
+                  flush=True)
+        else:
+            from data_boost import apply_to_sft, default_boost_path
+
+            data = apply_to_sft(data, args.boosted_data or default_boost_path(args.data),
+                                mode=args.data_boost, log=lambda m: print(m, flush=True))
+    elif args.data and not (args.dpo_data or args.pretrain_data):
+        # `off` 也要说清身份：旁边可能躺着一份产物，不说就等于让用户以为用了增强。
+        # 事后翻日志时，「这轮到底喂的是哪一份数据」必须能一行读出来。
+        from data_boost import default_boost_path
+
+        _bp = args.boosted_data or default_boost_path(args.data)
+        print("data: 原始数据（未增强）—— data-boost off"
+              + (f"；旁边的 {_bp} 存在但**未使用**" if _p.Path(_bp).is_file() else ""),
+              flush=True)
     # DPO 模式：偏好对数据。校验在训练循环之前 —— rejected 是显式的反面教材，
     # 一行写反训练就在系统性地学「错的那个」，且 loss 曲线看起来完全正常。
     dpo_rows: list[dict] | None = None
