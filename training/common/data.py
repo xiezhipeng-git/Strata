@@ -225,9 +225,22 @@ def load_dpo(spec: str) -> list[dict]:
 def load_rollouts(spec: str) -> list[dict]:
     """回放轨迹：每行 {prompt, completion, reward}；**连续 --group-size 行同一 prompt**。
 
-    old logp 不放在文件里（逐 token 数组太大），在训练起点 θ₀ 处用引擎重测一次缓存。
+    `token_ids` / `token_logprobs` / `prompt_ids` / `finish_reason` 有就一起带上：
+    采样侧（`collect_rollouts.py`、`grpo.py --save-rollouts`）本来就把引擎的整条响应
+    写进文件了，以前这里只挑四个字段，把能省的 SCORE 和能判的截断一起丢了。
+
+    带上的意义有两层：
+      * `token_ids` 让序列**就是采样时那条**，不必再用 `enc_answer` 重编码 —— 重编码
+        只要与采样的渲染差一个 token，`token_logprobs` 就整体错位，而这种错位不会报错。
+      * `token_logprobs` 是引擎 `LP` 行的值，源码写明取的是「采样前、惩罚前、温度前」
+        的 head log-softmax（`src/program/generate.cpp` 的 `emit_lp_line`）⇒ 与训练侧
+        SCORE 同口径，可以直接当 θ₀ 的 per-token logp，省掉逐条重打一次。
+        唯一的偏离是请求带 `allowed_token_ids` 时服务端按允许集重归一化 —— 那种轨迹
+        自己不要带这个字段（或由训练侧抽样复核挡下来）。
+
     轨迹必须是用 θ₀ 对应的策略采的（通常是基座 + 零 adapter），否则 ratio 的分母
-    不是采样分布，重要性修的就是错的量。
+    不是采样分布，重要性修的就是错的量。缺字段时退化为「训练起点重测一次」，行为与
+    加这段之前完全一致。
 
     每行还**可以**给 `messages`（多轮转录）代替 `prompt`/`completion`：RL 的数据天然是
     「调用 → 回填 → 再生成」，只有整条转录才带得住轮界 token（见 `enc_transcript`）。
@@ -248,7 +261,24 @@ def load_rollouts(spec: str) -> list[dict]:
             row["messages"] = r["messages"]
             row["tools"] = r.get("tools")
         else:
-            row["prompt"], row["completion"] = r["prompt"], r["completion"]
+            # `completion` 是回放格式的字段名，`content` 是采样器（引擎 chat 响应）的字段名。
+            # 只认一个的后果是「同一份 rollouts 零阶读不了、反传读得了」—— 判据不该因
+            # 算法而变，所以两个都收，缺的用另一个补。
+            row["prompt"] = r["prompt"]
+            row["completion"] = r.get("completion") if r.get("completion") is not None \
+                else (r.get("content") or "")
+            if not row["completion"] and not r.get("token_ids"):
+                raise SystemExit(
+                    f"{path}: 第 {len(rows) + 1} 行既没有 `completion`/`content` 也没有 "
+                    f"`token_ids`，判不出回答是什么（字段：{sorted(r)}）")
+        # 采样侧的原样 token（可选）。空列表当没有 —— 手写的 rollouts 里常见 `[]` 占位。
+        tids = r.get("token_ids") or []
+        row["token_ids"] = [int(x) for x in tids] if tids else None
+        lps = r.get("token_logprobs") or []
+        row["token_logprobs"] = [float(x) for x in lps] if lps else None
+        pids = r.get("prompt_ids") or []
+        row["prompt_ids"] = [int(x) for x in pids] if pids else None
+        row["finish_reason"] = r.get("finish_reason")
         rows.append(row)
     if not rows:
         raise SystemExit(f"{path}: no rows")

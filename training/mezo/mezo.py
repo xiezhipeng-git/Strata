@@ -1451,6 +1451,7 @@ class GrpoMezo(EngineMezo):
         if len(raw) % self.args.group_size:
             raise SystemExit(f"--rollouts {len(raw)} 条不是 --group-size "
                              f"{self.args.group_size} 的整数倍（同一条 prompt 的采样必须连续存放）")
+        self._check_template_match(raw)
         items = []
         effort = getattr(self.args, "reasoning_effort", "") or None
         for r in raw:
@@ -1465,13 +1466,115 @@ class GrpoMezo(EngineMezo):
                               "nseg": int(region[1:].sum()), "reward": r["reward"],
                               "turns": len(spans)})
             else:
-                seq, plen = enc_answer(self.tok, self.render, r["prompt"], r["completion"],
-                                       eos=self.eos)
+                seq, plen, lps = self._seq_from_rollout(r)
                 items.append({"seq": seq, "start": plen, "nseg": len(seq) - plen,
-                              "reward": r["reward"], "turns": 1})
+                              "reward": r["reward"], "turns": 1, "sampler_lp": lps})
         if self.objective == "luspo":
             self._check_luspo_premises(items)
         return items
+
+    def _seq_from_rollout(self, r: dict) -> tuple[list, int, np.ndarray | None]:
+        """单轮轨迹的 (seq, answer 起点, 采样侧 per-token logp 或 None)。
+
+        采样侧（`collect_rollouts.py` / `grpo.py --save-rollouts`）会把引擎的
+        `prompt_ids` / `token_ids` / `token_logprobs` 一起写进 jsonl。那时**不重编码**：
+
+          * `enc_answer` 会用自己的渲染重新出 prompt token 与 completion token。只要
+            与采样的渲染差一个 token（模板版本、thinking 开关、`parse_special` 边界），
+            拼出来的序列就不是引擎采样时看到的那条，而 `token_logprobs` 会整体错位 ——
+            这种错位不报错，只让 ratio 的分母悄悄变成「另一条序列的 logp」。
+          * 序列逐位一致时，`token_logprobs` 才敢拿来当 θ₀ 的 logp 用（`theta0_cache`
+            靠它省掉逐条重打一次 SCORE；满上下文一次 SCORE 45 s，33 条就是 25 分钟）。
+
+        判据是「`prompt_ids` 在就用它」——**以采样为准，不是以本地渲染为准**。奖励是在
+        采样那条序列上得的、`token_logprobs` 也是在那条上算的，换成本地渲染就等于把
+        模型放到另一段上下文里去复现一个不是它的奖励。两者不一致时只提示（实测是
+        `reasoning_effort` 没传给采样侧：21 tok vs 61 tok），不挡 —— 挡掉反而丢掉
+        最忠实的那条。老 rollouts 没有这些字段 ⇒ 整条退回 `enc_answer`，行为与加这段
+        之前一致。
+        """
+        tids, pids = r.get("token_ids"), r.get("prompt_ids")
+        if not tids:
+            seq, plen = enc_answer(self.tok, self.render, r["prompt"], r["completion"],
+                                   eos=self.eos)
+            return seq, plen, None
+
+        if pids:
+            # **跟采样走**，不跟本地渲染走。奖励是在采样那条序列上得的、`token_logprobs`
+            # 也是在那条上算的；换成本地渲染的 prompt 就等于把模型放到另一段上下文里
+            # 去复现一个不是它的奖励。
+            head = list(pids)
+            mine = self.tok.encode(self.render(r["prompt"]), parse_special=True)
+            if list(mine) != head:
+                # 实测（2026-11-18）：采样侧没传 `reasoning_effort`，模板默认 `xhigh`
+                # 会多出一整段 system（21 tok vs 61 tok）。这种差异必须看得见 ——
+                # 它同时说明「采样与训练不是同一档模板」，而这会让 SCORE 的 prompt 段
+                # 与采样时对不上（off-policy）。
+                self._warn_once(
+                    f"采样 prompt（{len(head)} tok）与本地渲染（{len(mine)} tok）不同："
+                    f"训练按**采样那条**走。这通常意味着两边模板参数不一致"
+                    f"（`reasoning_effort` / `enable_thinking` / system 段），"
+                    f"采样时要传与训练同档，否则 SCORE 的 prompt 段与采样时对不上")
+        else:
+            head = self.tok.encode(self.render(r["prompt"]), parse_special=True)
+
+        body = list(tids)
+        if self.eos is not None and (not body or body[-1] != int(self.eos)):
+            body.append(int(self.eos))     # 与 enc_answer 的幂等规则一致
+        seq = list(head) + body
+        plen = len(head)
+
+        # logp 能与 answer 段逐位对齐的前提：eos 本来就在（截断的轨迹补出来的那一位
+        # 采样时没算过，多出来一位就对不齐）。缺 eos 的轨迹本来就该被截断门处理。
+        lps = r.get("token_logprobs")
+        if not lps or len(lps) != len(seq) - plen:
+            return seq, plen, None
+        # **砍掉第一位**：引擎 `SL[t] = log p(ids[t+1])` 只回 n−1 个位置，所以
+        # `answer_seg` 的 `slp[start:]` 从「tids[1] 的 logp」开始算，答案第一个 token
+        # （由 prompt 最后一位预测）落在 `slp[start-1]`，不在那一段里。采样侧的
+        # `token_logprobs[i]` 对应的是 `tids[i]`，因此少一位才对齐。
+        # 同一个偏移在 `common/encode.py` 的 `answer_seg` / `name_span` 上踩过两次，
+        # 这里错一位不会报错 —— 只会让 ratio 的分母整体错一格。
+        return seq, plen, np.asarray(lps[1:], dtype=np.float32)
+
+    def _warn_once(self, msg: str) -> None:
+        """同一条警告只说一次：5000 条轨迹逐条打印会把真正的告警埋掉。"""
+        seen = getattr(self, "_warned", None)
+        if seen is None:
+            seen = self._warned = set()
+        if msg not in seen:
+            seen.add(msg)
+            print(f"  WARN: {msg}", flush=True)
+
+    def _check_template_match(self, raw: list[dict]) -> None:
+        """采样模板与训练模板不一致时说出来（不挡）。
+
+        实测（2026-11-18）：`collect_rollouts.py` 原来没有 `--reasoning-effort`，而训练
+        模板默认 `xhigh` 会插一整段 system 推理指令 —— 同一条题采样出 21 token 的 prompt，
+        本地渲染 61 token。奖励是在前者上得的，所以 `_seq_from_rollout` 跟着采样走；
+        但训练完的模型推理时用的是训练模板，两边不同档就是个必须让人看见的缝。
+        旧 rollouts 没记这个字段，跳过（不猜）。
+        """
+        got = {r.get("reasoning_effort") for r in raw if not r.get("messages")}
+        think = {r.get("enable_thinking") for r in raw if not r.get("messages")}
+        if got in (set(), {None}) and think in (set(), {None}):
+            return
+        mine = getattr(self.args, "reasoning_effort", "") or None
+        # 训练侧的 `self.render` 不传 `enable_thinking`（模板默认：留 `<think>` 开标签，让模型
+        # 自己写思考段）；采样器 `--think` 默认关 ⇒ 显式传 false ⇒ 空思考段。两种上下文。
+        if think == {False}:
+            self._warn_once(
+                "采样是 `enable_thinking=false`（空 `<think>` 段），训练模板不传这个变量"
+                "（留开标签）。训练按采样那条走，但训练后的模型在「开思考」模式下见过的"
+                "上下文形状不同 —— 要一致就采样加 `--think` 或训练侧也关掉思考段")
+        if got not in (set(), {None}) and len(got) > 1:
+            self._warn_once(f"rollouts 里 reasoning_effort 不统一（{sorted(map(str, got))}）："
+                            f"同一批混了不同模板，组内优势与结果都不可比")
+        elif got - {None} and next(iter(got - {None})) != mine:
+            self._warn_once(
+                f"采样 reasoning_effort={next(iter(got))!r}，训练模板={mine!r}："
+                f"训练按采样那条走（奖励与 logp 都在它上面），但训练后的模型推理时用的是"
+                f"训练模板。两边要同档才谈得上一致 —— 采样加 `--reasoning-effort`")
 
     def _check_luspo_premises(self, items: list[dict]) -> None:
         """跑之前把「门①：适配性」打出来（不阻止训练，但让日志自己带判据）。
@@ -1534,10 +1637,88 @@ class GrpoMezo(EngineMezo):
     def theta0_cache(self) -> None:
         # old = ratio 的分母 = 采样时的策略。轨迹必须是 θ₀ 策略采的（通常是基座），
         # 否则重要性修的是错的量。θ₀ = 训练起点的 adapter 状态（--resume 时是已训 θ）。
+        #
+        # 采样侧带了 per-token logp 的轨迹**不必重打**：引擎 `LP` 行取的是「采样前、
+        # 惩罚前、温度前」的 head log-softmax（src/program/generate.cpp 的 emit_lp_line），
+        # 与这里 SCORE 同一口径。满上下文时这一步很贵 —— 128K 一次 45 s，33 条 25 分钟。
+        #
+        # 但「同口径」有三个前提，全都不能靠假设：
+        #   ① 请求没带 allowed_token_ids（带了服务端按允许集重归一化，差一个 log Z）；
+        #   ② 采样策略就是本轮 θ₀（--resume 时 θ₀ 是已训状态，而轨迹可能是更早采的）；
+        #   ③ 序列没被重编码打乱（_seq_from_rollout 已挡，对齐不了的轨迹不带 sampler_lp）。
+        # 三个前提的共同表现都是「系统性、整体同向的偏差」，与浮点噪声（1e-3 量级）差一个
+        # 数量级 ⇒ 抽几条复核即可分辨。不过就整体退回全量 SCORE，并说明是哪一类。
+        reuse = [i for i, it in enumerate(self.items) if it.get("sampler_lp") is not None]
+        if reuse and self.args.sampler_logp != "off":
+            bad = self._verify_sampler_logp(reuse)
+            if not bad:
+                for it in self.items:
+                    lp = it.get("sampler_lp")
+                    # 复核之外、没有采样 logp 的轨迹（截断的、prompt 渲染不一致的）
+                    # 仍然逐条重打：混着用不影响正确性，只在日志里说清各自几条。
+                    it["old"] = (np.asarray(lp, dtype=np.float32) if lp is not None
+                                 else answer_seg(it, self.eng.score(it["seq"])[0]))
+                k = sum(1 for it in self.items if it.get("sampler_lp") is not None)
+                print(f"theta0 cache: {len(self.items) - k} score calls, "
+                      f"{k} rows reused from sampler logprobs "
+                      f"({min(len(reuse), self.args.sampler_logp_check)} verified)", flush=True)
+                return
+            print(f"  WARN: 采样侧 logp 不可信 → {bad}", flush=True)
+        elif reuse:
+            print(f"  sampler logprobs 存在但 --sampler-logp off ⇒ 全部重打 "
+                  f"({len(reuse)} 条可复用)", flush=True)
+
         for it in self.items:
             slp, _ = self.eng.score(it["seq"])
             it["old"] = answer_seg(it, slp)
         print(f"theta0 cache: {len(self.items)} score calls (grpo old logp)", flush=True)
+
+    def _verify_sampler_logp(self, idx: list[int]) -> str:
+        """抽样复核采样侧 logp 与 θ₀ 处 SCORE 的差；返回空串=可信，否则返回原因。
+
+        均匀跨整个 items 取（不是取前几条）：同一条 prompt 的 G 条轨迹几乎同分布，
+        连取前 K 条等于只验了一个 prompt。均匀抽样才能让 `--resume` 那种「整体漂移」
+        在每个组上都露头。
+        """
+        k = max(1, min(int(self.args.sampler_logp_check), len(idx)))
+        pick = [idx[round(j * (len(idx) - 1) / max(1, k - 1))] for j in range(k)] if k > 1 \
+            else [idx[0]]
+        tol = float(self.args.sampler_logp_tol)
+        worst, worst_i, tot, n = 0.0, -1, 0.0, 0
+        signed, absd, tail = [], [], []
+        for i in pick:
+            it = self.items[i]
+            ref = answer_seg(it, self.eng.score(it["seq"])[0])
+            got = np.asarray(it["sampler_lp"], dtype=np.float32)
+            if got.shape != ref.shape:
+                return (f"形状不符（采样 {got.shape} vs SCORE {ref.shape}）")
+            d = got - ref                      # 有符号：判「整体同向」还是「双向噪声」
+            dd = float(np.mean(np.abs(d)))
+            tot += dd
+            n += 1
+            signed.append(float(np.mean(d)))
+            absd.append(dd)
+            tail.append(float(np.mean(np.abs(d[-max(1, len(d) // 4):]))))   # 末四分之一
+            if dd > worst:
+                worst, worst_i = dd, i
+        mean = tot / max(1, n)
+        sv, av = float(np.mean(signed)), float(np.mean(absd))
+        tv = float(np.mean(tail))
+        # 判成因：整体同向（|均值| ≈ 绝对值均值）说明是系统性口径差（重归一化 / 换了策略）；
+        # 双向抵消（|均值| ≪ 绝对值均值）说明是数值路径不同（prefill vs decode、量化累加）。
+        kind = ("整体同向（系统性口径差）" if abs(sv) > 0.6 * av
+                else "双向噪声（数值路径差）")
+        print(f"  sampler logp 诊断：|Δ| 均值 {av:.4f}　有符号均值 {sv:+.4f}　"
+              f"末四分之一 {tv:.4f}　⇒ {kind}", flush=True)
+        if worst <= tol:
+            print(f"  sampler logp 复核 {n} 条：|Δ| 最大 {worst:.2e}（容差 {tol:g}）"
+                  f"⇒ 与 θ₀ 同口径，复用", flush=True)
+            return ""
+        return (f"逐 token 平均 |Δ| 最大 {worst:.3f}（容差 {tol:g}，第 {worst_i} 条，"
+                f"抽样均值 {mean:.3f}，{kind}）。三类原因都会这样：请求带了 allowed_token_ids"
+                f"（服务端按允许集重归一化）、--resume 时 θ₀ 与采样策略不是同一个、"
+                f"轨迹是手工造的。已退回全量 SCORE")
+
 
     def loss_at(self, th: dict, batch: list[dict]) -> float:
         self.swap(th, self.plus_path)
@@ -1691,6 +1872,22 @@ def main() -> int:
                          "θ₀ 的 per-token logp 本来就在 theta0_cache 里（it['old']），"
                          "不需要任何额外 SCORE —— 这正是它对满上下文路线可用的原因。"
                          "它约束的是偏离量，不是遗忘上界")
+    ap.add_argument("--sampler-logp", choices=("auto", "off"), default="auto",
+                    help="复用 rollouts 里采样侧的 per-token logp 当 θ₀ 的 old（默认 auto，"
+                         "但复核通常会挡住，见下）。引擎 LP 行取的是「采样前、惩罚前、温度前」"
+                         "的 head log-softmax，与 theta0_cache 的 SCORE 同一套定义；"
+                         "**实测（2026-11-18）两者逐 token 仍差 0.11 nats**：|Δ| 均值 0.1096、"
+                         "有符号均值 −0.0281、末四分之一 0.0738 ⇒ 双向噪声，不是整体同向偏移，"
+                         "即 decode 与 prefill 两条数值路径的差（IQ3 量化 + 累加顺序）。"
+                         "0.11 会让 ratio 在**起点**就偏离 1、clip_frac 虚假活跃，无法用一个"
+                         "偏移量校正 ⇒ 默认容差 0.02 会挡住并退回全量 SCORE，与加这个开关之前"
+                         "行为一致。要真正省掉这轮 SCORE，前提是采样与训练走同一条数值路径；"
+                         "在那之前这个开关只是把判据留在代码里，不是一个能开的省时开关")
+    ap.add_argument("--sampler-logp-check", type=int, default=3, metavar="K",
+                    help="复核几条（默认 3，跨整个数据集均匀取）。复核不通过就整体退回重打")
+    ap.add_argument("--sampler-logp-tol", type=float, default=0.02, metavar="NATS",
+                    help="复核容差：逐 token 平均 |Δ| 的上限（默认 0.02）。定这么小是因为"
+                         "要挡的正是「看起来同口径、实际差 0.1」这一类；实测浮点噪声在 1e-3")
     ap.add_argument("--word", default="Strata")
     ap.add_argument("--probe", default="你是谁")
     ap.add_argument("--steps", type=int, default=40)

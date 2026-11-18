@@ -81,9 +81,16 @@ def sample_one(task: dict, args: argparse.Namespace) -> dict:
     out = strata_client.chat(
         args.engine, [{"role": "user", "content": task["prompt"]}], model=args.engine_model,
         max_tokens=args.max_new, temperature=args.temperature,
-        enable_thinking=bool(args.think))
+        enable_thinking=bool(args.think),
+        reasoning_effort=args.reasoning_effort or None)
     traj = {"prompt": task["prompt"], "target": task.get("target", ""),
-            "kind": task.get("kind", "exact"), **out}
+            "kind": task.get("kind", "exact"), **out,
+            # 记下来，训练侧才能判「这条轨迹是用什么模板采的」：
+            # `enable_thinking` 决定 `<think>` 段是空还是留开标签（两种上下文），
+            # `reasoning_effort` 决定要不要插那段 system 指令。两者任一不同，
+            # 训练序列与推理序列就不是同一个模板 —— 这条缝不会报错，只会让结果难解释。
+            "reasoning_effort": args.reasoning_effort or None,
+            "enable_thinking": bool(args.think)}
     traj["reward"] = reward_of(traj)
     return traj
 
@@ -118,6 +125,11 @@ def main() -> int:
     ap.add_argument("--max-new", type=int, default=48)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--think", action="store_true", help="默认关思考：max_tokens 同时覆盖思考与回答")
+    ap.add_argument("--reasoning-effort", default="", choices=("", "xhigh", "medium", "low"),
+                    help="与训练侧 `--reasoning-effort` 传**同一档**（模板默认 xhigh）。不传时"
+                         "模板会插一整段 system 推理指令：实测采样 21 token、训练模板 61 token，"
+                         "两条不同的上下文 —— 奖励与 logp 就落在不是训练用的那条上。"
+                         "空（默认）= 不传，交由模板默认；要与训练对齐就显式给 xhigh")
     ap.add_argument("--parallel", type=int, default=0,
                     help="同时在飞的请求数。0（默认）= 问引擎：读 /v1/status 的 "
                          'concurrency，引擎声明多少就用多少（即配置里 "parallel": N / '

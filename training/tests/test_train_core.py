@@ -273,8 +273,10 @@ class ParallelCollection(unittest.TestCase):
             encoding="utf-8")
         out = str(Path(tmpdir) / f"r{parallel}.jsonl")
 
+        # `**kw`：采样器的 chat 参数会随模板设置增长（`reasoning_effort` 就是这么加的），
+        # 桩不该每加一个就破一次 —— 它验的是并发与顺序，不是参数表
         def fake_chat(engine, messages, model=None, max_tokens=0, temperature=1.0,
-                      enable_thinking=False):
+                      enable_thinking=False, **kw):
             p = messages[0]["content"]
             time.sleep(0.15 if p == "a" else 0.02)      # 先发的更慢 ⇒ 完成顺序 ≠ 提交顺序
             return {"content": "w", "reasoning_content": None, "token_ids": [7, 8, 9],

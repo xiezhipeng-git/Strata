@@ -20,7 +20,11 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def chat(base_url: str, messages: list[dict], *, model: str, max_tokens: int = 128,
          temperature: float = 1.0, top_p: float = 0.95, seed: int | None = None,
-         timeout: float = 600.0, enable_thinking: bool | None = None) -> dict:
+         timeout: float = 600.0, enable_thinking: bool | None = None,
+         reasoning_effort: str | None = None) -> dict:
+    """`reasoning_effort` 必须与训练侧同档：模板默认 `xhigh`，会插一整段 system 指令。
+    实测（2026-11-18）不传时采样 prompt 21 token、训练模板 61 token —— 两条不同的上下文，
+    奖励与 logp 就都落在不是训练用的那条上。"""
     payload = {
         "model": model,
         "messages": messages,
@@ -31,8 +35,13 @@ def chat(base_url: str, messages: list[dict], *, model: str, max_tokens: int = 1
         "top_logprobs": 0,
         "strata_rollout": True,
     }
+    _kw = {}
     if enable_thinking is not None:
-        payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+        _kw["enable_thinking"] = enable_thinking
+    if reasoning_effort is not None:
+        _kw["reasoning_effort"] = reasoning_effort
+    if _kw:
+        payload["chat_template_kwargs"] = _kw
     if seed is not None:
         payload["seed"] = seed
     req = urllib.request.Request(

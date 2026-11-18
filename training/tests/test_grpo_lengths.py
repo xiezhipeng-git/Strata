@@ -93,11 +93,33 @@ class TestLengthGate(unittest.TestCase):
         self.assertEqual(st["n_toolong"], 0)
 
     def test_empty_completion_not_length_gated(self):
-        trajs = [traj(10, 10), traj(10, 0)]      # 第二条 token_ids 为空 = 采样失败
+        # 采样失败 = token id 与文本**都**空（`--think` 开着把 content 挤空的典型形态）。
+        # 只有 token_ids 空、文本还在的轨迹不是失败：那是「没带 token id」（手写 rollouts、
+        # 或采样侧没回显），交给下面那条用例走 tokenizer 兜底。
+        trajs = [traj(10, 10), traj(10, 0, content="")]
         st = grpo.check_trainable_lengths(trajs, max_seq=768, log=quiet)
         self.assertEqual(st["n_empty"], 1)
         self.assertEqual(st["n"], 1)             # 只有 1 条参与长度判定
         self.assertEqual(st["n_toolong"], 0)
+
+    def test_missing_token_ids_with_text_uses_tokenizer(self):
+        """有文本、没 token id ⇒ 当场编码后照样进长度门，不算「空轨迹」。
+
+        这条与零阶 `load_rollouts` 的口径对齐：同一份 rollouts 两个算法都该读得动。
+        编码差一两个 token 不影响「放不放得下」，所以这里只判数量级对。
+        """
+
+        class _Tok:
+            def __call__(self, text, add_special_tokens=False):
+                import types
+                return types.SimpleNamespace(input_ids=list(range(len(text.split()))))
+
+        trajs = [traj(10, 0, content="a b c d e")]
+        st = grpo.check_trainable_lengths(trajs, max_seq=768, tok=_Tok(), log=quiet)
+        self.assertEqual(st["n_empty"], 0)
+        self.assertEqual(st["n"], 1)
+        self.assertEqual(st["max"], 15)          # 10 prompt + 5 个词
+        self.assertTrue(st["known"])
 
     def test_all_empty_does_not_raise(self):
         st = grpo.check_trainable_lengths([traj(10, 0), traj(10, 0)], max_seq=768, log=quiet)

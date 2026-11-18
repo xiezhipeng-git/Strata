@@ -161,8 +161,10 @@ def reward_of(traj: dict) -> float:
     std=0 ⇒ 优势全 0 ⇒ grad_norm=0 —— "跑完了"并不等于"训练生效了"。
     kind=num 同样要防全组全错：选进 --prompts 的题必须先经 math_probe.py 证明
     基座在 T=1 下有 0 < pass_rate < 1（有方差组才有梯度，没有就用 DPO 路线）。
+    `content` 只属于采样侧（引擎的 chat 响应），`completion` 属于回放格式；两者都收，
+    否则同一份 `collect_rollouts.py` 产物在零阶能读、在这里读不到（或反之）。
     """
-    text = (traj.get("content") or "").strip()
+    text = (traj.get("content") or traj.get("completion") or "").strip()
     kind = traj.get("kind") or "exact"
     if kind.startswith("wordsclose:"):
         want = int(kind.split(":", 1)[1])
@@ -199,8 +201,13 @@ def check_trainable_lengths(trajs, max_seq, max_skip_frac=0.0, tok=None, log=pri
       ② `n_toolong / n > max_skip_frac` ⇒ 报错，并给出两条改法；
       ③ 比例在界内 ⇒ 打印明细后继续（长尾是真实存在的，但必须让人看见比例）。
 
-    空 completion（`token_ids` 为空）单独计数、不进门：那是采样失败，
+    空 completion（`token_ids` 为空**且**文本为空）单独计数、不进门：那是采样失败，
     不是「长度不可训练」（`--think` 开着把 content 挤空是典型成因）。
+
+    有文本、只是没带 `token_ids` 的轨迹（`collect_rollouts.py` 之外的来源、手写的
+    rollouts）用 tokenizer 当场编一遍：这里只判「放不放得下」，编码口径差一两个 token
+    不影响结论，主循环用同一套兜底（见 `run_grpo` 的 `comp_ids`）。以前这里直接算
+    「空轨迹」，于是同一份文件零阶能训、反传报「全部为空」—— 判据不该因算法而变。
 
     缺 `prompt_ids` / `token_ids` 且没给 `tok` 时判不了，返回 `known=False` 由调用方
     在训练循环里逐条统计 —— 不猜、不静默。
@@ -209,8 +216,14 @@ def check_trainable_lengths(trajs, max_seq, max_skip_frac=0.0, tok=None, log=pri
     for t in trajs:
         comp = t.get("token_ids")
         if not comp:
-            n_empty += 1
-            continue
+            text = (t.get("content") or t.get("completion") or "").strip()
+            if not text:
+                n_empty += 1
+                continue
+            if tok is None:
+                est.append(1)      # 有文本但没 tokenizer：判不了，不拿字符数冒充 token 数
+                continue
+            comp = tok(text, add_special_tokens=False).input_ids
         p = t.get("prompt_ids")
         if p:
             lens.append(len(p) + len(comp))
@@ -310,7 +323,9 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
             prompt_ids = t.get("prompt_ids") or tok.apply_chat_template(
                 _fallback[0], return_dict=False, **_fallback[1]
             )
-            comp_ids = t["token_ids"] or tok(t["content"], add_special_tokens=False).input_ids
+            comp_ids = (t["token_ids"] if t.get("token_ids")
+                        else tok(t.get("content") or t.get("completion") or "",
+                                 add_special_tokens=False).input_ids)
             ids = list(prompt_ids) + list(comp_ids)
             if not comp_ids:
                 n_empty += 1      # 采样失败（空 completion），与「长度不可训练」是两回事
