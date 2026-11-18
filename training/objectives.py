@@ -377,6 +377,36 @@ def _cmin_max(x, hi):
     return x.clamp(max=hi) if _is_torch(x) else np.minimum(x, hi)
 
 
+def kl_k3(logp, ref_logp, mask, denom: float | None = None):
+    """KL(π ‖ π_ref) 的逐 token k3 估计，返回 `(penalty, stats)`。
+
+        r   = ref_logp − logp
+        k3  = exp(r) − r − 1        （Schulman 的 k3，逐点非负，无偏低方差）
+
+    为什么需要它：裁剪（`clip`）与 lr 只限制**单步**偏移，它们不约束「训练结束时
+    离 θ₀ 有多远」。库里唯一能表达"别忘掉旧的"的量就是这一项 —— 注意它是**可调的
+    正则**，不是遗忘上界：没有任何 KL 系数能给出"旧能力不掉"的保证。
+
+    `denom` 与策略项的归一化必须是同一个：整个 batch 的 token 数（`norm=token`）
+    或序列数（`norm=seq`）。逐条 backward 时传整批分母，别让每条各除自己的长度。
+    """
+    xp = _xp(logp, ref_logp)
+    m = _as_number_mask(mask)
+    r = ref_logp - logp
+    k = xp.exp(r) - r - 1.0
+    d = float(denom) if denom is not None else float(_cmin(_sum(m), 1.0))
+    pen = _sum(k * m) / d
+    with _nograd():
+        kd = k.detach() if _is_torch(k) else k        # 统计量不带图（别对带图张量取 float）
+        mt = _cmin(_sum(m), 1e-6)
+        stats = {
+            "kl_tok": _scalar(_sum(kd * m) / mt),      # 逐 token 均值：报这个才可比
+            "ref_lp": _scalar(_sum((ref_logp.detach() if _is_torch(ref_logp) else ref_logp) * m) / mt),
+            "tokens": int(_sum(m)),
+        }
+    return pen, stats
+
+
 def _abs(x):
     return x.abs() if _is_torch(x) else np.abs(x)
 

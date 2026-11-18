@@ -1431,6 +1431,10 @@ class DpoMezo(EngineMezo):
 class GrpoMezo(EngineMezo):
     """--algo grpo / luspo：回放轨迹。old logp 在 θ₀ 缓存；优势组内归一（一步一组）。
 
+    `--kl-coef > 0` 时 loss 里再加 k3 形式的 KL(π_θ ‖ π_θ₀)。这里几乎白送：ref 的
+    per-token logp 就是 `theta0_cache` 里那份 `it["old"]`，不需要再 SCORE 一次。
+    默认 0 = 关；只约束偏移量，给不出遗忘上界。
+
     两者共用整条链路（数据、θ₀ 缓存、组内优势、逐条 SCORE），只有损失与分母不同：
         grpo   ratio 逐 token，分母 = token 数   （objectives.grpo_loss）
         luspo  ratio 逐序列，分母 = 序列数 G     （objectives.luspo_loss，长度无偏）
@@ -1558,6 +1562,11 @@ class GrpoMezo(EngineMezo):
         # 换分母只是**全局标量**（一次 batch 里 Σ_t m 是一个数），序列之间的相对权重不变
         # ⇒ 长度无偏性不受影响：|y_i| 抵消的是序列内的 1/|y_i|，那一步在 luspo_loss 里面。
         denom = float(total_tok)
+        kl_coef = float(getattr(self.args, "kl_coef", 0.0) or 0.0)
+        if kl_coef > 0.0 and not getattr(self, "_kl_announced", False):
+            self._kl_announced = True
+            print(f"kl: coef {kl_coef}  ref = θ₀ 缓存（theta0_cache 的 it['old']）"
+                  f"⇒ 零额外 SCORE；罚的是 exp(r)−r−1，r = old − logp", flush=True)
         total = 0.0
         for i, it in enumerate(batch):
             slp, _ = self.eng.score(it["seq"])
@@ -1566,6 +1575,16 @@ class GrpoMezo(EngineMezo):
                               np.ones_like(logp), cfg,
                               denom=denom)
             total += float(li)
+            if kl_coef > 0.0:
+                # ref 就是 θ₀，而它的 per-token logp 在 theta0_cache 里已经算好了 ——
+                # 这里只多一次 O(T) 的 numpy，**没有额外 SCORE**（反传线要多一次完整前向）。
+                # 满上下文下这一点是决定性的：128K 一次 SCORE 45 s，任何"多打一次"都不可行。
+                if np.shape(it["old"]) != np.shape(logp):
+                    raise SystemExit(
+                        f"kl: θ₀ 缓存 {np.shape(it['old'])} 与当前 logp {np.shape(logp)} 形状不符"
+                        "（theta0_cache 与 loss 的 answer 段口径必须一致）")
+                kl, _kst = objectives.kl_k3(logp, it["old"], np.ones_like(logp), denom=denom)
+                total += kl_coef * float(kl)
         return total
 
 
@@ -1667,6 +1686,11 @@ def main() -> int:
     ap.add_argument("--beta", type=float, default=0.1, help="DPO 的 β")
     ap.add_argument("--group-size", type=int, default=4, help="GRPO：一条 prompt 的采样条数 K")
     ap.add_argument("--clip", type=float, default=0.2, help="GRPO 裁剪 ε（对称）")
+    ap.add_argument("--kl-coef", type=float, default=0.0, metavar="C",
+                    help="对 θ₀ 的 KL 惩罚系数（k3 估计），默认 0=关。**零阶线是零成本**："
+                         "θ₀ 的 per-token logp 本来就在 theta0_cache 里（it['old']），"
+                         "不需要任何额外 SCORE —— 这正是它对满上下文路线可用的原因。"
+                         "它约束的是偏离量，不是遗忘上界")
     ap.add_argument("--word", default="Strata")
     ap.add_argument("--probe", default="你是谁")
     ap.add_argument("--steps", type=int, default=40)

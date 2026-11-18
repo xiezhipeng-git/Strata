@@ -14,6 +14,15 @@
   1. `collect_rollouts.py`（不需要 torch，可在 Windows 跑，引擎在跑）
   2. 关掉引擎，本脚本 `--rollouts <jsonl> --old-logprobs engine`
      —— `--no-student` 是第 1 步的老写法，需要 torch 才能 import 本文件。
+
+关于「不忘掉旧的」：本文件原先**没有任何**对 θ₀ 的约束。`objectives` 里那个叫 `neg_kl`
+的量是 `logp − old_logp`（重要性比，喂 clip 的基线），不是对参考策略的 KL；真正限制漂移
+的只有 `--clip` 与 lr，而它们只管「单步走多远」，不管「训练结束时离起点多远」。
+
+`--kl-coef`（默认 0=关）补的就是这一条：θ₀ = **训练起点的 LoRA A/B 快照**（几 MB，
+不需要第二份 35B 权重），惩罚项用 k3 估计 `exp(r) − r − 1`（`r = ref_lp − logp`）。
+必须说清它的边界：它约束的是偏离量，**不是遗忘上界** —— 没有任何系数能保证旧能力不掉。
+开启时每条轨迹多一次 ref 前向，正好抵掉 `local` 口径下省掉的那次 old 前向，所以不比原来慢。
 """
 
 from __future__ import annotations
@@ -41,8 +50,12 @@ import torch
 from ce import token_logprobs
 from common.chat import prompt_spec   # prompt 契约（与 sft/mezo 同一份）
 import objectives
-from lora import (DEFAULT_TARGETS, freeze_all, inject_lora, load_lora_state,
+from lora import (DEFAULT_TARGETS, LoRALinear, freeze_all, inject_lora, load_lora_state,
                   lora_state_dict, trainable_summary)
+
+# 训练设备。只在没有 CUDA 的机器上退到 CPU —— 那是给 `training/tests` 做
+# `run_grpo` 的纯逻辑冒烟用的（假 body + 假 head），不是一条可用的训练路线。
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ---------------------------------------------------------------- 学生模型
@@ -54,6 +67,36 @@ def _text_model(model):
     if inner is None:
         return model
     return getattr(inner, "language_model", inner)
+
+
+def snapshot_ref_adapter(model):
+    """把「训练起点」的 adapter 拷一份 → `[(LoRALinear, A, B)]`；没有 LoRA 层返回 `[]`。
+
+    KL 锚要的是 θ₀ = **开始训练那一刻**的策略。LoRA 让这件事很便宜：A/B 是全部可训练
+    参数，拷一份只有几 MB，不需要再加载一份 35B 权重。
+    """
+    return [(m, m.A.detach().clone(), m.B.detach().clone())
+            for m in model.modules() if isinstance(m, LoRALinear)]
+
+
+def ref_logprobs(body, head, ids_t, n_prompt, labels, snap):
+    """临时换上 θ₀ 的 A/B 跑一次前向 → 逐 token `log p_ref(token | prefix)`。
+
+    必须 `try/finally`：中途抛异常也要把 A/B 换回来，否则「参考模型」会悄悄变成
+    当前策略，KL 恒为 0 且没有任何报错 —— 这正是这类锚最典型的静默失效。
+    """
+    saved = [(m.A.data.clone(), m.B.data.clone()) for m, _a, _b in snap]
+    try:
+        with torch.no_grad():
+            for m, a, b in snap:
+                m.A.data.copy_(a)
+                m.B.data.copy_(b)
+            hidden = body(input_ids=ids_t, use_cache=False).last_hidden_state[0, n_prompt - 1 : -1]
+            return token_logprobs(hidden, head, labels, chunk=128).clone()
+    finally:
+        for (m, _a, _b), (sa, sb) in zip(snap, saved):
+            m.A.data.copy_(sa)
+            m.B.data.copy_(sb)
 
 
 def load_student(path: str, four_bit_experts: bool, gguf=None, pack=None, tokenizer=None):
@@ -216,7 +259,7 @@ def check_trainable_lengths(trajs, max_seq, max_skip_frac=0.0, tok=None, log=pri
 
 def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logprobs,
              mask_truncated, epochs, steps, opt, params, log=print, objective="grpo",
-             max_skip_frac=0.0):
+             max_skip_frac=0.0, kl_coef=0.0):
     """一个 `GrpoCfg` 的训练循环；返回最后一步的指标（整批没梯度时返回空 dict）。
 
     抽成函数的理由：`_verify_grpo_switches.py` 要在**一次加载**里对同一批轨迹跑多个
@@ -229,6 +272,17 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
 
     # 长度门先行：不可训练就报错（这里已加载 tokenizer，判定是精确的）
     len_stat = check_trainable_lengths(trajs, max_seq, max_skip_frac, tok=tok, log=log)
+
+    # KL 锚：只在 --kl-coef > 0 时快照与计算。默认 0 ⇒ 一次前向都不多跑。
+    # 注意它约束的是「离 θ₀ 多远」，**不是**遗忘上界 —— 系数再大也不能保证旧能力不掉。
+    ref_snap = None
+    if kl_coef > 0:
+        ref_snap = snapshot_ref_adapter(model)
+        if not ref_snap:
+            raise SystemExit(
+                "--kl-coef > 0 需要 LoRA 层（LoRALinear）来做 θ₀ 锚点，当前模型一个都没有。"
+                "改法：① --kl-coef 0；或 ② 确认 --lora-method 是 lora（unilora 暂不支持 KL 锚）")
+        log(f"kl: coef {kl_coef}  锚定 {len(ref_snap)} 个 LoRA 层（ref = 训练起点，不随更新移动）")
 
     for step in range(1, steps + 1):
         sl = trajs[(step - 1) * batch * group : step * batch * group]
@@ -246,6 +300,8 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
         total_tokens = 0      # DAPO 口径的分母：整批有效 token 数
         n_trunc = 0
         n_tis = 0
+        n_old_local = 0     # old 由 epoch 1 前向 detach 填回（省一次前向）
+        n_old_engine = 0    # old 来自引擎回显的 logprob
         n_toolong = 0
         n_empty = 0
         for i, t in enumerate(sl):
@@ -267,26 +323,37 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
             if mask_truncated == "on" and objectives.is_truncated(comp_ids, max_new, eos_id):
                 n_trunc += 1
                 continue
-            with torch.no_grad():
-                ids_t = torch.tensor([ids], device="cuda")
-                n_prompt = len(prompt_ids)
-                labels = ids_t[0, n_prompt:]
-                hidden = body(input_ids=ids_t, use_cache=False).last_hidden_state[0, n_prompt - 1 : -1]
-                local_old = token_logprobs(hidden, head, labels, chunk=128).clone()
-            old = local_old
+            # `ids_t` 在这里建一次、整批 epoch 复用：原来每个 epoch 都 `torch.tensor([ids])`
+            # 重建一遍，等于每条轨迹多 2 次 H2D 拷贝（--epochs 2 时是 4 次）。
+            ids_t = torch.tensor([ids], device=DEV)
+            n_prompt = len(prompt_ids)
+            labels = ids_t[0, n_prompt:]
+            old = None
             tis = None
+            eng = False
             if old_logprobs == "engine" and t.get("token_logprobs"):
-                cand = torch.tensor(t["token_logprobs"], device="cuda", dtype=torch.float32)
-                if cand.numel() == local_old.numel():
+                cand = torch.tensor(t["token_logprobs"], device=DEV, dtype=torch.float32)
+                if cand.numel() == labels.numel():
                     old = cand
+                    eng = True
                     if cfg.tis_cap > 0:
                         # pi_训练侧旧参数 / pi_引擎生成：TIS 要修的正是这一段分布差。
-                        # 它是常数（不含策略更新），所以下面进 loss 前会 detach + clamp。
-                        tis = torch.exp(local_old - cand).detach()
+                        # 分子（local_old）不在这一层算 —— 它等于 epoch 1 那次前向的 logp
+                        # （同一个「batch 开始前」的策略、同一批 token），在下面复用即可。
                         n_tis += 1
+            # `old is None` = `--old-logprobs local` 且没走到 engine 分支：按定义「旧策略就是
+            # 本 batch 开始前的策略」，而 epoch 1 那次前向发生在任何 `opt.step()` 之前 ——
+            # 它就是旧策略本身。所以这里不再预跑一条 no_grad 前向（+ 一次全词表 lm_head）
+            # 去算一个必然等于 1 的 ratio，改由 epoch 1 的前向顺手 detach 填回来（见下）。
+            n_old_local += old is None
+            n_old_engine += old is not None
+            # ref 每条只算一次：θ₀ 冻结，与 epoch 无关。开 KL 时这一次前向正好顶替
+            # 上面省掉的那次 old 前向 —— 所以 `--kl-coef > 0` 不比改动前更慢。
+            ref = (ref_logprobs(body, head, ids_t, n_prompt, labels, ref_snap)
+                   if ref_snap else None)
             # 带着原始下标一起存：上面会 `continue` 掉超长/空回答/被截断的轨迹，
             # 用 enumerate(prepared) 的序号去索引 adv_all 会让后面每条都取到别人的优势
-            prepared.append((i, ids, n_prompt, labels, old, tis))
+            prepared.append([i, ids_t, n_prompt, labels, old, tis, ref, eng])
             total_tokens += int(labels.numel())
 
         # 逐条 backward 时必须用**整批**的分母，否则等于把 DAPO 的全局归一悄悄换成逐条平均
@@ -303,22 +370,42 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
         for epoch in range(1, epochs + 1):
             opt.zero_grad(set_to_none=True)
             e_loss = e_pg = 0.0
+            e_kl = 0.0
             e_used = 0
             e_ratios = []
             e_clipped = 0.0
             e_tis = 0.0
-            for i, ids, n_prompt, labels, old, tis in prepared:
+            for row in prepared:
+                i, ids_t, n_prompt, labels, old, tis, ref, eng = row
                 adv = adv_all[i].item()
-                ids_t = torch.tensor([ids], device="cuda")
                 hidden = body(input_ids=ids_t, use_cache=False).last_hidden_state[0, n_prompt - 1 : -1]
                 new_lp = token_logprobs(hidden, head, labels, chunk=128)
+                if old is None:
+                    # 本次前向发生在任何 `opt.step()` 之前（epoch 1）⇒ 它就是「旧策略」。
+                    # 必须**回写**到 row：epoch 2 若重新取当前 detach，ratio 会永远回到 1，
+                    # 裁剪项就永远不生效（这正是 --epochs>1 唯一想看的东西）。
+                    old = new_lp.detach()
+                    row[4] = old
+                if eng and tis is None and cfg.tis_cap > 0:
+                    # TIS = π_学生(采样时) / π_引擎。分母是引擎回显的 old，分子就是这次前向：
+                    # 它同样发生在任何 `opt.step()` 之前。原来为它单独跑一次 no_grad 前向
+                    # + 一次全词表 lm_head，与这里逐位重复。
+                    tis = torch.exp(new_lp.detach() - old).detach()
+                    row[5] = tis
                 ones = torch.ones_like(new_lp).unsqueeze(0)
                 loss, st = loss_fn(
                     new_lp.unsqueeze(0), old.unsqueeze(0),
                     torch.full_like(new_lp, adv).unsqueeze(0), ones, cfg,
                     tis=None if tis is None else tis.unsqueeze(0), denom=denom)
+                if ref is not None:
+                    # 惩罚项与策略项共用整批分母：否则「每 token 的 KL」会被
+                    # 逐条归一偷偷换成「逐条的 KL 再平均」，两者的梯度不是同一个量。
+                    kl, _kst = objectives.kl_k3(new_lp.unsqueeze(0), ref.unsqueeze(0),
+                                                ones, denom=denom)
+                    loss = loss + kl_coef * kl
+                    e_kl += float(kl.detach())
                 loss.backward()
-                e_loss += float(loss)
+                e_loss += float(loss.detach())    # detach：对带图张量取 float 会触发 warning
                 e_pg += -(adv * new_lp).sum().item() / denom   # 未裁剪的对照口径
                 e_ratios.append(st["ratio"])
                 e_clipped += st["clip_frac"]
@@ -336,19 +423,23 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
                 "ratio": sum(e_ratios) / len(e_ratios),
                 "clip_frac": e_clipped / e_used,
                 "tis": e_tis / e_used, "n_tis": n_tis,
+                "kl": (e_kl / e_used) if ref_snap else None, "kl_coef": kl_coef,
+                "old_local": n_old_local, "old_engine": n_old_engine,
                 "reward": float(rewards.mean()), "reward_std": float(rewards.std()),
                 "zero_std": zero_std, "groups": groups_used,
                 "used": e_used, "batch": len(sl), "trunc": n_trunc,
                 "toolong": n_toolong, "empty": n_empty,
                 "len_check": len_stat,
                 "tokens": total_tokens, "denom": denom,
-                "peak": torch.cuda.max_memory_allocated() / 2 ** 30,
+                "peak": (torch.cuda.max_memory_allocated() / 2 ** 30) if torch.cuda.is_available() else 0.0,
             }
             log(
                 f"step {step}.{epoch}: pg_obj {e_pg:.4f}  clipped_obj {e_loss:.4f}  "
                 f"grad_norm {float(gn):.4f}  ratio {last['ratio']:.4f}  "
                 f"clip_frac {last['clip_frac']:.3f}  tis {last['tis']:.4f}({n_tis})  "
-                f"reward {last['reward']:.3f}  "
+                f"old {n_old_local}L/{n_old_engine}E  "
+                + (f"kl {e_kl / e_used:.5f}({kl_coef})  " if ref_snap else "")
+                + f"reward {last['reward']:.3f}  "
                 f"reward_std {last['reward_std']:.4f}  zero_std {zero_std}  groups {groups_used}  "
                 f"used {e_used}/{len(sl)}  trunc {n_trunc}  toolong {n_toolong}"
                 f"  empty {n_empty}  tokens {total_tokens}  "
@@ -397,6 +488,11 @@ def main() -> int:
     ap.add_argument("--lora-method", choices=("lora", "unilora"), default="lora",
                     help="unilora=Uni-LoRA（全模型只训一个共享向量，见 unilora.py）")
     ap.add_argument("--clip", type=float, default=0.2, help="上下界同时设置（简化写法）")
+    ap.add_argument("--kl-coef", type=float, default=0.0, metavar="C",
+                    help="对 θ₀ 的 KL 惩罚系数（k3 估计），默认 0=关。θ₀ = 训练起点的 LoRA "
+                         "A/B 快照（几 MB，不需要第二份权重）。这是「别忘掉旧的」唯一有理论"
+                         "依据的旋钮，但它限制的是**偏移量**、不是遗忘上界。开启时每条轨迹多"
+                         "一次 ref 前向 —— 正好抵掉 local 口径省下来的那次，所以不比原来慢")
     ap.add_argument("--clip-low", type=float, default=None,
                     help="ratio 下界，默认 = --clip")
     ap.add_argument("--clip-high", type=float, default=None,
@@ -556,7 +652,7 @@ def main() -> int:
         max_seq=args.max_seq, max_new=args.max_new, old_logprobs=args.old_logprobs,
         mask_truncated=args.mask_truncated, epochs=args.epochs, steps=args.steps,
         opt=opt, params=params, objective=args.objective,
-        max_skip_frac=args.max_skip_frac)
+        max_skip_frac=args.max_skip_frac, kl_coef=args.kl_coef)
     if not last:
         print("整个训练没有产生任何梯度：每一批都被跳过或组内 std=0", flush=True)
 
