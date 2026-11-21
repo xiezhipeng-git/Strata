@@ -1715,10 +1715,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (strata::kernels::lora().loaded)
             for (const auto& [name, on] : strata::kernels::lora().adapted[(size_t) l])
                 if (on && name != "ssm_out" && name != "attn_output" && name != "attn_qkv" &&
-                    name != "attn_gate" && name != "attn_q" && name != "attn_k" && name != "attn_v") {
+                    name != "attn_gate" && name != "attn_q" && name != "attn_k" && name != "attn_v" &&
+                    name != "ffn_gate_shexp" && name != "ffn_up_shexp" && name != "ffn_down_shexp") {
                     err = std::string("verify: layer ") + std::to_string(l) + " carries an adapter on '" + name +
                           "'; the speculative path applies only ssm_out, attn_output, attn_qkv, attn_gate, attn_q,"
-                          " attn_k and attn_v - disable speculative decoding or drop that module";
+                          " attn_k, attn_v and ffn_{gate,up,down}_shexp - disable speculative decoding or drop"
+                          " that module";
                     return false;
                 }
         try {
@@ -2396,7 +2398,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
-                                    (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0));
+                                    (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0), l);
                 sg_gated_[grp] = sg_ready;
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();

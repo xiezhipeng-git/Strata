@@ -514,7 +514,7 @@ if (w_ginp->kind != WeightKind::Bf16InF32) {        err = v.name("ffn_gate_inp_s
         shared_expert(b.x_q8_0, b.x_q8k, b.x_bf16, f_gate, p_gate.codes, p_gate.scales, p_gate.offset,
                       f_up, p_up.codes, p_up.scales, p_up.offset, f_down, p_down.codes, p_down.scales,
                       p_down.offset, (const uint16_t*) w_ginp->data, b.sh_scratch, b.shared,
-                      g.n_embd, g.n_ff, /*tpr=*/32, stream, x, &native);
+                      g.n_embd, g.n_ff, /*tpr=*/32, stream, x, &native, layer);
     } catch (const std::exception& error) {
         err = v.name("shared_expert") + ": " + error.what();
         return false;

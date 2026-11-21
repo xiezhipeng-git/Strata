@@ -5421,8 +5421,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     auto shared_expert = [&]() -> bool {
                         if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
                         if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                        // --lora on the shared expert's gate/up, BEFORE the SwiGLU: the same three projections the
+                        // decode path adapts (kernels::shared_expert), so a training read (SCORE is this path) and a
+                        // generated token see the same function.  A's input is `m.mixed` (fp32) - the unrounded
+                        // hidden state, not the fp16 image the GEMM reads.  No-ops without an adapter.
+                        strata::kernels::lora_apply(l, "ffn_gate_shexp", m.mixed, 0, T, m.sgate, 0, m.cs);
+                        strata::kernels::lora_apply(l, "ffn_up_shexp", m.mixed, 0, T, m.sup, 0, m.cs);
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                        // down: A's input is `m.sh_h`, the fp16 SwiGLU output the GEMM itself reads (the fp32 h is
+                        // never materialised on this path), added before the scalar gate scales `m.shared`.
+                        strata::kernels::lora_apply_f16(l, "ffn_down_shexp", m.sh_h, 0, T, m.shared, 0, m.cs);
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                         m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                         if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);

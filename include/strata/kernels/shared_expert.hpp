@@ -68,7 +68,14 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                    const SForm& down_form, const uint8_t* down_codes, const float* down_scales,
                    const float* down_off, const uint16_t* gate_inp_bf16, float* scratch, float* out,
                    int64_t n_embd, int64_t n_ff, int tpr, void* stream, const float* x_f32 = nullptr,
-                   const NativeSharedWeights* native = nullptr);
+                   const NativeSharedWeights* native = nullptr,
+                   // --lora on the shared expert's three projections (`ffn_{gate,up,down}_shexp`), -1 = no adapter.
+                   // The adapter's contribution is y += s B (A x) added to the FP32 projection result BEFORE the
+                   // SwiGLU (gate, up) and BEFORE the scalar gate scales `out` (down) - so it goes through the same
+                   // nonlinearity and the same gate as the quantized weights do; adding it afterwards would be a
+                   // different function.  Needs `x_f32`; the two fused paths (s_gemv_pair_silu, fused_swiglu_q81)
+                   // are skipped when the layer carries an adapter, because neither materialises what it needs.
+                   int64_t layer = -1);
 
 /// Plan v0.3 P6: the shared expert for `n_tok` <= 8 tokens (a verify window) with all three projections native:
 /// multi-column MMVQ, so the weights are read once; every token is bitwise `shared_expert` on that token.
@@ -80,7 +87,8 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, const void* x_q8_1_ready = nullptr,
-                         int lfuse = 0);   // S26 STRATA_LFUSE: bit 0 gate computed + applied by the caller, bit 1 gate/up pair
+                         int lfuse = 0,   // S26 STRATA_LFUSE: bit 0 gate computed + applied by the caller, bit 1 gate/up pair
+                         int64_t layer = -1);   // --lora on ffn_{gate,up,down}_shexp; -1 = no adapter
 
 /// The MoE block's final combination, `ref/moe.py::moe` L156:
 ///

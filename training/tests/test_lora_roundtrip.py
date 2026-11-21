@@ -42,7 +42,8 @@ class TestAdapterRoundTrip(unittest.TestCase):
         return os.path.join(self.tmp, name)
 
     def test_roundtrip_is_elementwise(self):
-        write_adapter(self._path(), self.layout, self.theta, alpha=16.0)
+        """F32 下必须逐位互逆 —— 这条锁的是转置/平铺顺序，不是精度。"""
+        write_adapter(self._path(), self.layout, self.theta, alpha=16.0, dtype="f32")
         back = read_adapter(self._path(), self.layout)
         self.assertEqual(sorted(back), sorted(self.layout))
         for l, projs in self.layout.items():
@@ -53,6 +54,24 @@ class TestAdapterRoundTrip(unittest.TestCase):
                 self.assertEqual(b1.shape, (n_out, 4), f"层 {l} {which} B 形状")
                 self.assertTrue(np.array_equal(a1, a0), f"层 {l} {which} A 不一致（可能是转置或平铺顺序错）")
                 self.assertTrue(np.array_equal(b1, b0), f"层 {l} {which} B 不一致")
+
+    def test_default_is_f16_and_still_ordered(self):
+        """默认 F16（体积减半，实测 ΔW 误差 2.9e-4）：形状与顺序仍必须对，数值只要求近似。
+
+        这条与上一条分开，是因为 F16 的误差上限本身就是判据 —— 若哪天默认被改成 Q4（ΔW 9.5%），
+        rtol 1e-3 会立刻红。"""
+        write_adapter(self._path(), self.layout, self.theta, alpha=16.0)
+        back = read_adapter(self._path(), self.layout)
+        for l, projs in self.layout.items():
+            for which, (n_in, n_out) in projs.items():
+                a0, b0 = self.theta[l][which]
+                a1, b1 = back[l][which]
+                self.assertEqual(a1.shape, (4, n_in), f"层 {l} {which} A 形状")
+                self.assertEqual(b1.shape, (n_out, 4), f"层 {l} {which} B 形状")
+                for tag, got, want in (("A", a1, a0), ("B", b1, b0)):
+                    tol = 1e-3 * float(np.abs(want).max() or 1.0)
+                    self.assertLess(float(np.abs(got - want).max()), tol,
+                                    f"层 {l} {which} {tag} F16 误差超过 1e-3×max")
 
     def test_rank_and_alpha_read_back(self):
         write_adapter(self._path(), self.layout, self.theta, alpha=8.0)

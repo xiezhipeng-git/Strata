@@ -45,6 +45,13 @@ bool load_lora_adapters(const LoraAdapterFiles& files, const strata::core::Model
         {"attn_gate", {N, g.ssm_value_dim}},
         {"ssm_out", {g.ssm_value_dim, N}},
     };
+    // The shared expert's three projections.  On EVERY layer of a MoE family (the shared expert is not part of
+    // the QSA/GDN split), and skipped when the model has none (`n_ff == 0`, a dense family).
+    const std::pair<const char*, std::pair<int64_t, int64_t>> shexp_projs[] = {
+        {"ffn_gate_shexp", {N, g.n_ff}},
+        {"ffn_up_shexp", {N, g.n_ff}},
+        {"ffn_down_shexp", {g.n_ff, N}},
+    };
     std::vector<strata::kernels::LoraLayerHost> layers((size_t) L);
     auto f32_of = [&](const strata::GgufFile& f, const strata::TensorInfo& t, std::vector<float>& out) -> bool {
         const uint8_t* p = f.tensor_data(t);
@@ -99,15 +106,24 @@ bool load_lora_adapters(const LoraAdapterFiles& files, const strata::core::Model
                     return false;
                 }
                 const bool qsa = strata::core::is_qsa_layer(g, l);
-                const std::span<const std::pair<const char*, std::pair<int64_t, int64_t>>> table =
+                const std::span<const std::pair<const char*, std::pair<int64_t, int64_t>>> attn_table =
                     qsa ? std::span<const std::pair<const char*, std::pair<int64_t, int64_t>>>(qsa_projs)
                         : std::span<const std::pair<const char*, std::pair<int64_t, int64_t>>>(gdn_projs);
+                // The shared expert's three come first: they exist on both layer families, so a name that matches
+                // one of them is never an attention projection.
+                const std::span<const std::pair<const char*, std::pair<int64_t, int64_t>>> ffn_table(shexp_projs);
                 const std::pair<int64_t, int64_t>* dims = nullptr;
-                for (const auto& [name, d2] : table)
-                    if (std::strcmp(which, name) == 0) { dims = &d2; break; }
+                if (g.n_ff > 0)
+                    for (const auto& [name, d2] : ffn_table)
+                        if (std::strcmp(which, name) == 0) { dims = &d2; break; }
+                if (dims == nullptr)
+                    for (const auto& [name, d2] : attn_table)
+                        if (std::strcmp(which, name) == 0) { dims = &d2; break; }
                 if (dims == nullptr) {
                     std::string want;
-                    for (const auto& [name, d2] : table) want += (want.empty() ? "" : ", ") + std::string(name);
+                    for (const auto& [name, d2] : attn_table) want += (want.empty() ? "" : ", ") + std::string(name);
+                    if (g.n_ff > 0)
+                        for (const auto& [name, d2] : ffn_table) want += ", " + std::string(name);
                     err = path + ": " + base + ": the engine adapts only " + want + " on this layer";
                     return false;
                 }

@@ -23,6 +23,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/lora.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"
@@ -215,11 +216,22 @@ bool fused_swiglu_q81_enabled() {
 
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
-                         int64_t n_ff, void* stream, const void* x_q8_1_ready, int lfuse) {
+                         int64_t n_ff, void* stream, const void* x_q8_1_ready, int lfuse, int64_t layer) {
     const bool gate_deferred = (lfuse & 1) != 0, pair = (lfuse & 2) != 0;
     if (n_tok < 1 || n_tok > kVerifyMaxT || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens (16 in a wide build), native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
+    // --lora (see shared_expert): the verify window runs this instead of the single-token path, so an adapter on
+    // the shared expert has to be applied HERE as well - otherwise a speculative verify would compare a decode
+    // that carries it against a window that does not, which is a mismatch that reads as a small quality loss
+    // rather than as an error.  The three insertions mirror the single-token path exactly: gate/up on the fp32
+    // products before the SwiGLU, down on the fp32 h, both before the scalar gate scales `out`.
+    const bool lo_ffn = layer >= 0 && x != nullptr &&
+                        (lora().covers(layer, "ffn_gate_shexp") || lora().covers(layer, "ffn_up_shexp") ||
+                         lora().covers(layer, "ffn_down_shexp"));
+    auto lora_ffn = [&](const char* proj, const float* xin, float* yout) {
+        if (lo_ffn) strata::kernels::lora_apply(layer, proj, xin, 0, n_tok, yout, 0, stream);
+    };
     // the activation's q8_1: the caller's (STRATA_VERIFY_QDEDUP, x_q8_1_ready) or the descriptor's, else quantized here
     const void* x_q8_1 = x_q8_1_ready ? x_q8_1_ready : nw.x_q8_1;
     if (!x_q8_1) {
@@ -233,13 +245,16 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
     }
     const int n = (int) (n_ff * n_tok);
-    if (fused_swiglu_q81_enabled()) {
+    lora_ffn("ffn_gate_shexp", x, gate);
+    lora_ffn("ffn_up_shexp", x, up);
+    if (fused_swiglu_q81_enabled() && !lo_ffn) {
         native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
     } else {
         native_swiglu_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate, up, gate, n);
         native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     }
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    lora_ffn("ffn_down_shexp", gate, out);   // `gate` holds the fp32 h the quantizer above read
     if (gate_deferred) {   // the caller computed g (raw) with the router and scales `out` in the combine
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi: ") + cudaGetErrorString(e));
@@ -282,8 +297,18 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                    const SForm& down_form, const uint8_t* down_codes, const float* down_scales,
                    const float* down_off, const uint16_t* gate_inp_bf16, float* scratch, float* out,
                    int64_t n_embd, int64_t n_ff, int tpr, void* stream, const float* x_f32,
-                   const NativeSharedWeights* native) {
+                   const NativeSharedWeights* native, int64_t layer) {
     if (n_embd <= 0 || n_ff <= 0) return;
+    // --lora on the shared expert (see the header).  `lo_ffn` gates BOTH the three insertions and the two fused
+    // paths: a layer whose adapter covers any of the three projections takes the unfused sequence, because
+    // `s_gemv_pair_silu` never materialises `up` and `fused_swiglu_q81` never materialises the fp32 `h` that
+    // A of the down projection has to be multiplied by.  Without an adapter nothing here changes at all.
+    const bool lo_ffn = layer >= 0 && x_f32 != nullptr &&
+                        (lora().covers(layer, "ffn_gate_shexp") || lora().covers(layer, "ffn_up_shexp") ||
+                         lora().covers(layer, "ffn_down_shexp"));
+    auto lora_ffn = [&](const char* proj, const float* xin, float* yout) {
+        if (lo_ffn) strata::kernels::lora_apply(layer, proj, xin, 0, 1, yout, 0, stream);
+    };
     const bool use_native = native_bf16;
     const bool native_gate = native && native->gate_data && native_mmvq_supported(native->gate_type);
     const bool native_up = native && native->up_data && native_mmvq_supported(native->up_type);
@@ -339,7 +364,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // materialised).  The pair kernel is bit-exact vs the three-kernel sequence (shared row math, shared
     // SwiGLU expression).  The ready-made engine's path below is untouched.
     bool paired = false;
-    if (!native_gate && !native_up) {
+    if (!native_gate && !native_up && !lo_ffn) {
         paired = s_gemv_pair_silu(x_q8_0, x_q8k, gate_form, gate_codes, gate_scales, gate_off,
                                   up_form, up_codes, up_scales, up_off, gate, n_embd, n_ff, 32,
                                   native_projection ? 2 : 0, stream);
@@ -360,6 +385,10 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
             native_mmvq(native->up_type, native->up_data, x_q8_1, up, (int) n_embd, (int) n_ff, 1, stream);
         else
             gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
+        // --lora: BEFORE the SwiGLU, on the FP32 products (A x is taken on the unrounded activation, which is
+        // llama.cpp's `llm_build_lora_mm` contract and what the attention projections already do here).
+        lora_ffn("ffn_gate_shexp", x_f32, gate);
+        lora_ffn("ffn_up_shexp", x_f32, up);
     }
 
     // down: (n_ff) -> (n_embd), and THE INTERMEDIATE IS QUANTIZED TO THE DOWN WEIGHT'S OWN CONTRACT - which is
@@ -416,6 +445,10 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     } else {
         gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
     }
+    // --lora on the down projection: `gate` holds the fp32 h (SwiGLU output) that was just quantized in place of
+    // it, so A h takes the unrounded intermediate.  Added BEFORE the scalar gate below scales `out`, which is
+    // where the rest of the shared expert's output is scaled too.
+    lora_ffn("ffn_down_shexp", gate, out);
         } else
 #endif
         {
@@ -433,7 +466,9 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
         native_mmvq(native->up_type, native->up_data, x_q8_1, up, (int) n_embd, (int) n_ff, 1, stream);
     else
         gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
-    if (native_projection && native_down && fused_swiglu_q81_enabled()) {
+    lora_ffn("ffn_gate_shexp", x_f32, gate);
+    lora_ffn("ffn_up_shexp", x_f32, up);
+    if (native_projection && native_down && fused_swiglu_q81_enabled() && !lo_ffn) {
         native_swiglu_quantize_q8_1(gate, up, native->q8_1, (int) n_ff, 1, stream);
         native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, stream);
     } else {
@@ -463,6 +498,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
             quantize_q8_0(gate, h_q8_0, n_ff, stream);
             gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
         }
+        lora_ffn("ffn_down_shexp", gate, out);   // `gate` still holds the fp32 h (quantizing wrote elsewhere)
     }
         }
 

@@ -119,8 +119,19 @@ int main() {
 
     // reference y0 + sign * B (A x) in double, from the fp32 or the fp16-rounded x.  `t` overrides the tables
     // (lora_update's new direction); the default is the one uploaded above.
+    //
+    // The tables are rounded to FP16 first (`as_stored`): the engine holds them as f16 bits (lora.cu header), and
+    // a reference fed the fp32 originals would differ from the kernel by that rounding (measured ~1.6e-4 on this
+    // fixture) instead of by the summation order the test is about.  What must still be caught here at 1e-4 is the
+    // summation order, the indexing and the transposition - all of which are O(1) errors.
+    auto as_stored = [](const std::vector<float>& v) {
+        std::vector<float> o(v.size());
+        for (size_t i = 0; i < v.size(); ++i) o[i] = strata::kernels::f32_from_f16(strata::kernels::f16_from_f32(v[i]));
+        return o;
+    };
     auto reference = [&](int64_t n, bool f16, int sign = 1, const k::LoraLayerHost* t = nullptr) {
         const k::LoraProjHost& tb = (t != nullptr ? *t : h).projs.at("ssm_out");
+        const std::vector<float> ar = as_stored(tb.a), br = as_stored(tb.b);
         std::vector<double> want((size_t) (n * NOUT));
         std::vector<double> hv((size_t) R);
         for (int64_t tt = 0; tt < n; ++tt) {
@@ -128,13 +139,13 @@ int main() {
                 double acc = 0.0;
                 for (int64_t i = 0; i < NIN; ++i) {
                     const float xv = f16 ? strata::kernels::f32_from_f16(x16[(size_t) (tt * LDX + i)]) : x[(size_t) (tt * LDX + i)];
-                    acc += (double) tb.a[(size_t) (r * NIN + i)] * xv;
+                    acc += (double) ar[(size_t) (r * NIN + i)] * xv;
                 }
                 hv[(size_t) r] = acc;
             }
             for (int64_t o = 0; o < NOUT; ++o) {
                 double acc = y0[(size_t) (tt * LDY + o)];
-                for (int64_t r = 0; r < R; ++r) acc += (double) sign * tb.b[(size_t) (o * R + r)] * hv[(size_t) r];
+                for (int64_t r = 0; r < R; ++r) acc += (double) sign * br[(size_t) (o * R + r)] * hv[(size_t) r];
                 want[(size_t) (tt * NOUT + o)] = acc;
             }
         }
@@ -175,14 +186,15 @@ int main() {
         k::lora_apply(kLayer, "attn_q", dxq, LDXQ, 40, dyq, LDYQ, nullptr);
         ck(cudaDeviceSynchronize(), "apply attn_q");
         const k::LoraProjHost& p = h.projs.at("attn_q");
+        const std::vector<float> pa = as_stored(p.a), pb = as_stored(p.b);   // the tables as the engine holds them
         double worst = 0.0;
         for (int64_t t = 0; t < 40; ++t)
             for (int64_t o = 0; o < QOUT; ++o) {
                 double acc = yq0[(size_t) (t * LDYQ + o)];
                 for (int64_t r = 0; r < QR; ++r) {
                     double hv = 0.0;
-                    for (int64_t i = 0; i < QIN; ++i) hv += (double) p.a[(size_t) (r * QIN + i)] * xq[(size_t) (t * LDXQ + i)];
-                    acc += (double) p.b[(size_t) (o * QR + r)] * hv;
+                    for (int64_t i = 0; i < QIN; ++i) hv += (double) pa[(size_t) (r * QIN + i)] * xq[(size_t) (t * LDXQ + i)];
+                    acc += (double) pb[(size_t) (o * QR + r)] * hv;
                 }
                 const double g = (double) down(dyq + (size_t) (t * LDYQ + o), 1)[0];
                 worst = std::max(worst, std::fabs(g - acc) / std::max(1.0, std::fabs(acc)));

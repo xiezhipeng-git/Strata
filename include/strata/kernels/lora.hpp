@@ -15,8 +15,12 @@
 //   y <- y + s B (A x)        A = lora_a (rank x n_in), B = lora_b (n_out x rank), s = scale * alpha / rank
 //
 // exactly llama.cpp's `llm_build_lora_mm` (alpha 0: s = scale).  Several files are summed: their ranks are stacked
-// per projection, each B already multiplied by its own s.  A and B stay fp32 on every device that runs the layer
-// (tens of MB), the products are fp32.  Off unless an adapter is loaded; a loaded one is switched per request
+// per projection, each B already multiplied by its own s.  A and B are held as FP16 on the host and on every
+// device that runs the layer (the loader hands over fp32 and `build_host` rounds once): measured on two rank-8
+// adapters, dW = s*B*A keeps a 2.9e-4 relative error at fp16 against 7.6e-3 at Q8 and 9.5e-2 at Q4, while a step
+// moves theta by 2-5% and reads |pj| ~ 0.09 -- so fp16 is free here and 4 bits would bury the difference.  bf16 is
+// not usable: 8 mantissa bits on A/B values of order 1/sqrt(n_in) cost 2.4e-3, 8x fp16.  The products and the
+// small path's h stay fp32.  Off unless an adapter is loaded; a loaded one is switched per request
 // through a device flag, so the captured graphs are the same either way.  With the flag off the projection's output
 // is untouched: the result is bit-identical to the engine without an adapter.  The MTP draft layer never has one
 // (it drafts; the verified tokens are the adapted model's).

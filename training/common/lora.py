@@ -34,7 +34,8 @@ def read_geometry(gguf_path: str) -> dict:
     # 直接量基座文件 —— 量出来什么就是什么。基座可能是多分片 GGUF（本文件只见一部分层），
     # 所以按**家族**收集：同族（QSA / GDN）各层形状一致（引擎 layout.cpp 就按同一张 want2 表
     # 逐层校验），量到一族的一层即可展开到全模型。
-    targets = ("attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate", "ssm_out")
+    targets = ("attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate", "ssm_out",
+               "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp")
     fam_dims: dict[str, dict[str, tuple[int, int]]] = {}
     for t in f.tensors:
         if not t.name.startswith("blk.") or len(t.shape) != 2:
@@ -46,11 +47,14 @@ def read_geometry(gguf_path: str) -> dict:
             l = int(parts[1])
         except ValueError:
             continue
-        # 家族归属：ssm_out/attn_output 自带家族信息；attn_q/k/v 只在 QSA 层；attn_qkv/gate 只在 GDN 层
+        # 家族归属：ssm_out/attn_output 自带家族信息；attn_q/k/v 只在 QSA 层；attn_qkv/gate 只在 GDN 层；
+        # ffn_*_shexp 每层都有（shared expert），单独一族、逐层合并
         if parts[2] == "ssm_out":
             fam = "gdn"
         elif parts[2] == "attn_output" or parts[2] in ("attn_q", "attn_k", "attn_v"):
             fam = "qsa"
+        elif parts[2].endswith("_shexp"):
+            fam = "shexp"
         else:
             fam = "gdn"
         dim = (int(t.shape[0]), int(t.shape[1]))
@@ -74,8 +78,10 @@ def read_geometry(gguf_path: str) -> dict:
         if missing_fams:
             raise SystemExit(f"{gguf_path}: 本分片没量到 {'/'.join(missing_fams)} 层的投影张量，"
                              "无法展开全模型布局（换任一含该族层的分片，或用 --gguf 指到另一片）")
+        # ffn_*_shexp 每层都有，逐层并进该层的投影集合（有的模型没有 shared expert，那就只是缺席）。
+        shexp = fam_dims.get("shexp", {})
         out["layer_dims"] = {
-            l: dict(fam_dims["qsa"] if l % interval == interval - 1 else fam_dims["gdn"])
+            l: {**(fam_dims["qsa"] if l % interval == interval - 1 else fam_dims["gdn"]), **shexp}
             for l in range(out["block_count"])
         }
     return out
@@ -85,23 +91,39 @@ _TARGETS_QSA = ("attn_q", "attn_k", "attn_v", "attn_output")
 _TARGETS_GDN = ("attn_qkv", "attn_gate", "ssm_out")
 
 
+_TARGETS_SHEXP = ("ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp")
+
+
 def adapter_layout(g: dict, projs: str = "out") -> dict[int, dict[str, tuple[int, int]]]:
     """layer -> {投影名 -> (n_in, n_out)}。qsa 判定与引擎 is_qsa_layer 同一条公式（layer % interval == interval-1）。
 
     `projs`："out"（默认，历史路径）= 每层只挂输出投影（ssm_out / attn_output）；
-    "all" = 对齐 InferZO 的全模块口径（QSA: attn_q/k/v/output，GDN: attn_qkv/gate/ssm_out）。
-    形状来源：真实模型走 `read_geometry` 量出的 `layer_dims`；合成 GEOM（测试）只支持
-    "out"，其派生公式与历史逐字相同。"""
+    "all" = 对齐 InferZO 的全模块口径（QSA: attn_q/k/v/output，GDN: attn_qkv/gate/ssm_out）；
+    "ffn" = 每层 shared expert 的三件（gate/up/down，**专家 FFN 的入口**）；
+    "all+ffn" = 上面两者相加。
+    形状来源：真实模型走 `read_geometry` 量出的 `layer_dims`；合成 GEOM（测试）只支持 "out"，
+    其派生公式与历史逐字相同。"""
     L, N = g["block_count"], g["embedding_length"]
     interval = max(int(g["full_attention_interval"]), 2)
     n_qsa_in = g["attention.head_count"] * g["attention.key_length"]
     n_gdn_in = g["ssm.inner_size"]
     layer_dims = g.get("layer_dims") or {}
+    attn = projs in ("out", "all", "all+ffn")
+    ffn = projs in ("ffn", "all+ffn")
+    if projs not in ("out", "all", "ffn", "all+ffn"):
+        raise SystemExit(f"--zo-projs {projs!r} 不认识（out / all / ffn / all+ffn）")
+    if ffn and not layer_dims:
+        raise SystemExit("--zo-projs ffn 需要真实模型的 layer_dims（read_geometry 量出）；"
+                         "合成 GEOM 没有 shared expert")
     out = {}
     for l in range(L):
         qsa = l % interval == interval - 1
         fam = _TARGETS_QSA if qsa else _TARGETS_GDN
-        want = (fam[3] if qsa else fam[2],) if projs == "out" else fam
+        want: tuple[str, ...] = ()
+        if attn:
+            want += (fam[3] if qsa else fam[2],) if projs == "out" else fam
+        if ffn:
+            want += _TARGETS_SHEXP
         if layer_dims:
             ds = layer_dims.get(l)
             if ds is None:
@@ -144,12 +166,40 @@ def read_adapter_alpha(gguf_path: str) -> float:
     return float(GGUFFile(gguf_path).metadata.get("adapter.lora.alpha", 16.0))
 
 
-def write_adapter(path: str, layout: dict, theta: dict, alpha: float, arch: str = "qwen4exp"):
+# `write_adapter` 的存储精度。**为什么默认 F16 而不是 F32**（2026-11-18 离线实测，
+# `.workbuddy/tmp/idrun/zobench/quant_err.py`，all/allmom 两份 rank-8 adapter，156 个投影）：
+# 以 ΔW = s·B·A 的相对误差为准（logp 的一阶位移只由它决定，A/B 的元素误差会被 rank 平均）：
+#   F32 0 · **F16 2.9e-4** · BF16 2.4e-3 · Q8 7.6e-3 · Q4 9.5e-2
+# BF16 比 F16 差 8×（8 位尾数），adapter 的 A/B 在 1/sqrt(n_in)≈0.02 量级，正好卡在 bf16 的相对精度上，
+# 所以"引擎只认 f32/f16/bf16"里对 adapter 唯一该用的是 F16。Q4 的 9.5% 与一步训练的步长同量级
+# （rel 2–5%，|pj| 中位数 0.087）⇒ 4bit 会把差分吃掉，训练不可用；仅推理驻留才考虑。
+ADAPTER_DTYPES = {"f32": "F32", "f16": "F16", "bf16": "BF16"}
+
+
+def write_adapter(path: str, layout: dict, theta: dict, alpha: float, arch: str = "qwen4exp",
+                  dtype: str = "f16"):
     """theta[layer][which] = (A (r, n_in), B (n_out, r))，写 llama.cpp 的 adapter GGUF。
     flat bytes 已在 GGUF 顺序（见 lora_to_gguf.py 的 docstring）：A 平铺、B 平铺，只把 ne 反着声明。
 
     `arch`：引擎按 `general.architecture` 拒收"给别的模型做的 adapter"（`load_lora_adapters`），
-    所以要写模型自己的名字（`qwen4exp` / `qwen35moe`）。默认值就是这条线一直跑的那一个。"""
+    所以要写模型自己的名字（`qwen4exp` / `qwen35moe`）。默认值就是这条线一直跑的那一个。
+
+    `dtype`：`f32` / `f16` / `bf16`，默认 f16（见 ADAPTER_DTYPES 的实测表）。llama.cpp 的 adapter
+    工具链认这三种，所以产物仍然可被外部工具合成（引擎自己**没有** merge 路径 —— `LORA <path>` 只换表）。
+    量化只在运行时表那一侧（`--lora-quant`），不落在产物上：量化误差一旦写进文件，合成时会永久进权重。"""
+    tag = ADAPTER_DTYPES.get(dtype.lower())
+    if tag is None:
+        raise SystemExit(f"adapter dtype {dtype!r} 不支持（{'/'.join(ADAPTER_DTYPES)}）")
+
+    def bytes_of(x):
+        if tag == "F32":
+            return np.ascontiguousarray(x, dtype="<f4").tobytes()
+        if tag == "F16":
+            return np.ascontiguousarray(x, dtype="<f2").tobytes()
+        f = np.ascontiguousarray(x, dtype="<f4").view(np.uint32)
+        lsb = (f >> 16) & 1
+        return ((f + 0x7FFF + lsb) & 0xFFFF0000).astype("<u4").tobytes()
+
     w = GGUFWriter()
     w.add("general.type", "adapter", "string")
     w.add("general.architecture", arch, "string")
@@ -159,10 +209,8 @@ def write_adapter(path: str, layout: dict, theta: dict, alpha: float, arch: str 
         for which, (n_in, n_out) in layout[l].items():
             a, b = theta[l][which]
             base = f"blk.{l}.{which}.weight"
-            w.tensors.append(_Tensor(base + ".lora_a", [n_in, a.shape[0]], "F32",
-                                     np.ascontiguousarray(a, dtype="<f4").tobytes()))
-            w.tensors.append(_Tensor(base + ".lora_b", [b.shape[1], n_out], "F32",
-                                     np.ascontiguousarray(b, dtype="<f4").tobytes()))
+            w.tensors.append(_Tensor(base + ".lora_a", [n_in, a.shape[0]], tag, bytes_of(a)))
+            w.tensors.append(_Tensor(base + ".lora_b", [b.shape[1], n_out], tag, bytes_of(b)))
     w.write(path)
 
 
@@ -197,16 +245,22 @@ def read_adapter(path: str, layout: dict) -> dict[int, dict[str, tuple[np.ndarra
                 if t is None:
                     raise SystemExit(f"{path}: 缺少张量 {name + suffix}（与 layout 不匹配 —— 检查 --zo-projs："
                                      "这个 adapter 是不是按另一种投影集合写的）")
-                if t.type_name != "F32":
-                    raise SystemExit(f"{path}: {name + suffix} 是 {t.type_name}，本读取器只处理 F32")
+                if t.type_name not in ("F32", "F16", "BF16"):
+                    raise SystemExit(f"{path}: {name + suffix} 是 {t.type_name}，本读取器只处理 F32/F16/BF16")
                 if len(t.shape) != 2:
                     raise SystemExit(f"{path}: {name + suffix} 维度是 {t.shape}，期望二维")
                 n = int(t.shape[0]) * int(t.shape[1])
-                raw = blob[base + t.offset: base + t.offset + 4 * n]
-                if len(raw) != 4 * n:
+                w = 4 if t.type_name == "F32" else 2
+                raw = blob[base + t.offset: base + t.offset + w * n]
+                if len(raw) != w * n:
                     raise SystemExit(f"{path}: {name + suffix} 数据被截断")
-                pair.append(np.frombuffer(raw, dtype="<f4").reshape(t.shape[1], t.shape[0])
-                            .astype(np.float32, copy=True))
+                if t.type_name == "F32":
+                    vals = np.frombuffer(raw, dtype="<f4")
+                elif t.type_name == "F16":
+                    vals = np.frombuffer(raw, dtype="<f2").astype(np.float32)
+                else:   # BF16：高 16 位
+                    vals = (np.frombuffer(raw, dtype="<u2").astype(np.uint32) << 16).view(np.float32)
+                pair.append(vals.reshape(t.shape[1], t.shape[0]).astype(np.float32, copy=True))
             a, b = pair
             # a 是 (rank, n_in)、b 是 (n_out, rank)：A 的最后维、B 的第一维对着几何，
             # 另一维必须同 rank，两处任一对不上都说明这个 adapter 不属于这个模型。

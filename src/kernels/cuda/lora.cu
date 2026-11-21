@@ -1,10 +1,21 @@
 // src/kernels/cuda/lora.cu - see include/strata/kernels/lora.hpp.
 //
+// The tables are FP16 (raw bits), on the host and on every device.  Why not FP32: as measured offline on two
+// rank-8 adapters (`.workbuddy/tmp/idrun/zobench/quant_err.py`, 156 projections), the relative error of
+// dW = s*B*A - the only thing a logp shift depends on - is 2.9e-4 for FP16 against 7.6e-3 for Q8 and 9.5e-2
+// for Q4.  A training step moves the parameters by 2-5% of their norm with a per-sample |pj| of ~0.09, so Q4's
+// 9.5% would bury the difference the zeroth-order read exists to measure, while FP16's 2.9e-4 sits three
+// orders of magnitude below it and halves both the VRAM and the per-step PCIe traffic (a step rewrites every
+// table).  BF16 is NOT an option here: 8 mantissa bits give 2.4e-3 on A/B values of order 1/sqrt(n_in) ~ 0.02,
+// i.e. 8x worse than FP16 - the one place in this tree where the bf16-vs-fp16 choice is not a tie.
+//
 // Two paths for y += B (A x), both reading the request flag on the device:
 //   * small (n <= SMALL_N tokens per launch, the decode and verify windows): h = A x, then y += B h, two kernels
 //     through the layer's own h.  The second is a programmatic dependent launch: it starts while the first runs and
 //     loads its column of B before it waits for h.
 //   * tiled (the prompt path, eager): h = X A^T and y += h B^T as two tiled fp32 GEMMs through a per-device scratch.
+//     The scratch and the products stay fp32: only the tables are 16-bit, and the f16->f32 widening is one
+//     convert per multiply-accumulate, on a path whose share of a forward pass is 0.2% (r=1) to 0.8% (r=4).
 #include "strata/kernels/lora.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
@@ -34,9 +45,10 @@ Lora g_lora;
 int g_polarity_host = 0;
 constexpr int kDevices = 64;
 // Per PROJECTION of a layer: a: rank x n_in, bt: rank x n_out (B transposed), h: the small path's A x (SMALL_N x
-// rank).  h is per projection: two streams of one device never run the same projection at once, but a layer split
-// with both stages on one card reads a prompt on two streams at once, on different layers.
-struct ProjDev { float* a = nullptr; float* bt = nullptr; float* h = nullptr; };
+// rank).  a and bt are FP16 bits (see the header); h is the accumulation and stays FP32.  h is per projection: two
+// streams of one device never run the same projection at once, but a layer split with both stages on one card
+// reads a prompt on two streams at once, on different layers.
+struct ProjDev { uint16_t* a = nullptr; uint16_t* bt = nullptr; float* h = nullptr; };
 struct LayerDev { std::map<std::string, ProjDev> projs; };
 struct Scratch { float* h = nullptr; int64_t tokens = 0; };   // the tiled path's A x, T x rank_max
 struct DevTables {
@@ -46,7 +58,7 @@ struct DevTables {
     bool ready() const { return on != nullptr; }
 };
 DevTables g_dev[kDevices];
-struct ProjHost { int64_t rank = 0, n_in = 0, n_out = 0; std::vector<float> a, bt; };
+struct ProjHost { int64_t rank = 0, n_in = 0, n_out = 0; std::vector<uint16_t> a, bt; };   // f16 bits, not f32
 struct LayerHost { std::map<std::string, ProjHost> projs; };
 std::vector<LayerHost> g_host;
 std::mutex g_scratch_mu;
@@ -74,11 +86,11 @@ bool upload_here(std::string& err) {
         for (const auto& [name, ph] : g_host[l].projs) {
             if (ph.rank == 0) continue;
             ProjDev& d = t.layers[l].projs[name];
-            ok = cudaMalloc(&d.a, ph.a.size() * sizeof(float)) == cudaSuccess &&
-                 cudaMalloc(&d.bt, ph.bt.size() * sizeof(float)) == cudaSuccess &&
+            ok = cudaMalloc(&d.a, ph.a.size() * sizeof(uint16_t)) == cudaSuccess &&
+                 cudaMalloc(&d.bt, ph.bt.size() * sizeof(uint16_t)) == cudaSuccess &&
                  cudaMalloc(&d.h, (size_t) SMALL_N * ph.rank * sizeof(float)) == cudaSuccess &&
-                 cudaMemcpy(d.a, ph.a.data(), ph.a.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
-                 cudaMemcpy(d.bt, ph.bt.data(), ph.bt.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+                 cudaMemcpy(d.a, ph.a.data(), ph.a.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) == cudaSuccess &&
+                 cudaMemcpy(d.bt, ph.bt.data(), ph.bt.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) == cudaSuccess;
             if (!ok) break;
         }
     }
@@ -90,6 +102,8 @@ bool upload_here(std::string& err) {
     return true;
 }
 
+// The numeric load, for activations AND for the FP16 tables (the name is historical): the overload picks the
+// widening, so a call site does not spell out whether its operand is fp32 or fp16 bits.
 __device__ __forceinline__ float load_x(const float* x, int64_t i) { return __ldg(x + i); }
 __device__ __forceinline__ float load_x(const uint16_t* x, int64_t i) { return f32_from_f16(__ldg(x + i)); }
 
@@ -98,19 +112,19 @@ __device__ __forceinline__ float load_x(const uint16_t* x, int64_t i) { return f
 //   down: h[t, r] = sum_k a[r, k] x[t, k]    one block per row r of A (A read once, x from L2)
 //   up:   y[t, o] += sum_r bt[r, o] h[t, r]  one thread per output o (bt coalesced across the warp)
 template <typename XT, int NT>
-__global__ void __launch_bounds__(DOWN_THREADS) lora_down_kernel(const float* __restrict__ a, const XT* __restrict__ x,
+__global__ void __launch_bounds__(DOWN_THREADS) lora_down_kernel(const uint16_t* __restrict__ a, const XT* __restrict__ x,
                                                                  int64_t ldx, float* __restrict__ h, int rank, int n_in,
                                                                  const int* __restrict__ on) {
     if (*on == 0) return;
     __shared__ float red[NT][DOWN_WARPS];
     const int r = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const float* ar = a + (int64_t) r * n_in;
+    const uint16_t* ar = a + (int64_t) r * n_in;
     float p[NT];
 #pragma unroll
     for (int t = 0; t < NT; ++t) p[t] = 0.0f;
 #pragma unroll 4
     for (int k = threadIdx.x; k < n_in; k += DOWN_THREADS) {
-        const float av = __ldg(ar + k);
+        const float av = load_x(ar, k);
 #pragma unroll
         for (int t = 0; t < NT; ++t) p[t] = fmaf(av, load_x(x, (int64_t) t * ldx + k), p[t]);
     }
@@ -131,7 +145,7 @@ __global__ void __launch_bounds__(DOWN_THREADS) lora_down_kernel(const float* __
 }
 
 template <int NT>
-__global__ void __launch_bounds__(UP_THREADS) lora_up_kernel(const float* __restrict__ bt, const float* __restrict__ h,
+__global__ void __launch_bounds__(UP_THREADS) lora_up_kernel(const uint16_t* __restrict__ bt, const float* __restrict__ h,
                                                              float* __restrict__ y, int64_t ldy, int rank, int n_out,
                                                              const int* __restrict__ on) {
     const float sg = (float) *on;   // 0: off, +1: theta + eps, -1: theta - eps
@@ -146,7 +160,7 @@ __global__ void __launch_bounds__(UP_THREADS) lora_up_kernel(const float* __rest
     for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
 #pragma unroll 8
     for (int r = 0; r < rank; ++r) {
-        const float bv = __ldg(bt + (int64_t) r * n_out + o);
+        const float bv = load_x(bt, (int64_t) r * n_out + o);
 #pragma unroll
         for (int t = 0; t < NT; ++t) acc[t] = fmaf(bv, hs[t * rank + r], acc[t]);
     }
@@ -165,7 +179,7 @@ __global__ void __launch_bounds__(UP_THREADS) lora_up_kernel(const float* __rest
 constexpr bool kPdl = true;
 constexpr int PDL_RANK = 64;
 template <int NT>
-__global__ void __launch_bounds__(UP_THREADS) lora_up_pdl_kernel(const float* __restrict__ bt, const float* h,
+__global__ void __launch_bounds__(UP_THREADS) lora_up_pdl_kernel(const uint16_t* __restrict__ bt, const float* h,
                                                                  float* __restrict__ y, int64_t ldy, int rank, int n_out,
                                                                  const int* __restrict__ on) {
     const float sg = (float) *on;
@@ -174,7 +188,7 @@ __global__ void __launch_bounds__(UP_THREADS) lora_up_pdl_kernel(const float* __
     const int o = blockIdx.x * UP_THREADS + threadIdx.x;
     float bv[PDL_RANK];
 #pragma unroll
-    for (int r = 0; r < PDL_RANK; ++r) bv[r] = (r < rank && o < n_out) ? __ldg(bt + (int64_t) r * n_out + o) : 0.0f;
+    for (int r = 0; r < PDL_RANK; ++r) bv[r] = (r < rank && o < n_out) ? load_x(bt, (int64_t) r * n_out + o) : 0.0f;
 #if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();   // h written and visible; before sm_90 the launch is an ordinary one
 #endif
@@ -197,7 +211,7 @@ __global__ void __launch_bounds__(UP_THREADS) lora_up_pdl_kernel(const float* __
 #endif   // !__HIPCC__: the PDL up kernel is CUDA-only
 
 template <typename XT, int NT>
-void launch_small(const float* a, const float* bt, float* h, const XT* x, int64_t ldx, float* y, int64_t ldy, int rank,
+void launch_small(const uint16_t* a, const uint16_t* bt, float* h, const XT* x, int64_t ldx, float* y, int64_t ldy, int rank,
                   int n_in, int n_out, const int* on, cudaStream_t s) {
     lora_down_kernel<XT, NT><<<(unsigned) rank, DOWN_THREADS, 0, s>>>(a, x, ldx, h, rank, n_in, on);
     const unsigned up_blocks = (unsigned) ((n_out + UP_THREADS - 1) / UP_THREADS);
@@ -221,12 +235,13 @@ void launch_small(const float* a, const float* bt, float* h, const XT* x, int64_
     lora_up_kernel<NT><<<up_blocks, UP_THREADS, up_smem, s>>>(bt, h, y, ldy, rank, n_out, on);
 }
 
-// C[T, N] (=, or += with `add`) X[T, K] . W, W given as [N, K] (w_nk) or [K, N] row-major, all fp32 but X.
+// C[T, N] (=, or += with `add`) X[T, K] . W, W given as [N, K] (w_nk) or [K, N] row-major, all fp32 but X and W
+// (W is the adapter's FP16 table, X the fp32 activation or the fp32 h).
 // 64 x 64 output tile per block, 4 x 4 per thread, K in slabs of 16.  Split K: block z sums k in [z kc, (z+1) kc)
 // into C + z * split_stride (the partial sums, added up by lora_sum_kernel in a fixed order).
-template <typename XT, bool W_NK>
+template <typename XT, typename WT, bool W_NK>
 __global__ void __launch_bounds__(TILE_THREADS) lora_tiled_kernel(const XT* __restrict__ X, int64_t ldx,
-                                                                  const float* __restrict__ W, int64_t ldw,
+                                                                  const WT* __restrict__ W, int64_t ldw,
                                                                   float* __restrict__ C, int64_t ldc, int T, int N, int K,
                                                                   int kc, int64_t split_stride, int add,
                                                                   const int* __restrict__ on) {
@@ -246,12 +261,12 @@ __global__ void __launch_bounds__(TILE_THREADS) lora_tiled_kernel(const XT* __re
             const int row = i / TK, kk = i % TK, k = k0 + kk;   // row-fastest over k: coalesced X and [N, K] W
             const int t = t0 + row, nn = n0 + row;
             xs[kk][row] = t < T && k < ke ? load_x(X, (int64_t) t * ldx + k) : 0.0f;
-            if (W_NK) ws[kk][row] = nn < N && k < ke ? __ldg(W + (int64_t) nn * ldw + k) : 0.0f;
+            if (W_NK) ws[kk][row] = nn < N && k < ke ? load_x(W, (int64_t) nn * ldw + k) : 0.0f;
         }
         if (!W_NK)
             for (int i = threadIdx.x; i < TILE * TK; i += TILE_THREADS) {
                 const int kk = i / TILE, col = i % TILE, k = k0 + kk, nn = n0 + col;   // coalesced [K, N] W
-                ws[kk][col] = nn < N && k < ke ? __ldg(W + (int64_t) k * ldw + nn) : 0.0f;
+                ws[kk][col] = nn < N && k < ke ? load_x(W, (int64_t) k * ldw + nn) : 0.0f;
             }
         __syncthreads();
 #pragma unroll
@@ -356,12 +371,13 @@ void apply(int64_t layer, const char* proj, const XT* x, int64_t ldx, int64_t n,
         const int64_t count = n * h.rank;
         float* hsum = hs + (int64_t) splits * count;
         const dim3 g1((unsigned) ((h.rank + TILE - 1) / TILE), (unsigned) ((n + TILE - 1) / TILE), (unsigned) splits);
-        lora_tiled_kernel<XT, true><<<g1, TILE_THREADS, 0, s>>>(x, ldx, d.a, h.n_in, hs, h.rank, (int) n, (int) h.rank,
-                                                               (int) h.n_in, kc, count, 0, t.on);
+        lora_tiled_kernel<XT, uint16_t, true><<<g1, TILE_THREADS, 0, s>>>(x, ldx, d.a, h.n_in, hs, h.rank, (int) n, (int) h.rank,
+                                                                        (int) h.n_in, kc, count, 0, t.on);
         lora_sum_kernel<<<(unsigned) ((count + 255) / 256), 256, 0, s>>>(hs, splits, count, hsum, t.on);
         const dim3 g2((unsigned) ((h.n_out + TILE - 1) / TILE), (unsigned) ((n + TILE - 1) / TILE));
-        lora_tiled_kernel<float, false><<<g2, TILE_THREADS, 0, s>>>(hsum, h.rank, d.bt, h.n_out, y, ldy, (int) n,
-                                                                    (int) h.n_out, (int) h.rank, (int) h.rank, 0, 1, t.on);
+        lora_tiled_kernel<float, uint16_t, false><<<g2, TILE_THREADS, 0, s>>>(hsum, h.rank, d.bt, h.n_out, y, ldy, (int) n,
+                                                                            (int) h.n_out, (int) h.rank, (int) h.rank, 0,
+                                                                            1, t.on);
     }
     if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("lora_apply: launch failed");
 }
@@ -385,10 +401,14 @@ static bool build_host(const std::vector<LoraLayerHost>& layers, std::vector<Lay
             }
             ProjHost& h = out[i].projs[name];
             h.rank = src.rank; h.n_in = src.n_in; h.n_out = src.n_out;
-            h.a = src.a;
+            // The loader hands over fp32; the tables become FP16 here, once, so both the host copy and every
+            // device copy are half the bytes (see the header's error table).
+            h.a.resize(src.a.size());
+            for (size_t k = 0; k < src.a.size(); ++k) h.a[k] = f16_from_f32(src.a[k]);
             h.bt.resize(src.b.size());
             for (int64_t o = 0; o < src.n_out; ++o)
-                for (int64_t r = 0; r < src.rank; ++r) h.bt[(size_t) (r * src.n_out + o)] = src.b[(size_t) (o * src.rank + r)];
+                for (int64_t r = 0; r < src.rank; ++r)
+                    h.bt[(size_t) (r * src.n_out + o)] = f16_from_f32(src.b[(size_t) (o * src.rank + r)]);
             l.adapted[i][name] = true;
             l.rank_max = std::max(l.rank_max, src.rank);
         }
@@ -442,8 +462,8 @@ bool lora_update(const std::vector<LoraLayerHost>& layers, std::string& err) {
             for (const auto& [name, ph] : host[i].projs) {
                 if (ph.rank == 0) continue;
                 const ProjDev& dv = g_dev[d].layers[i].projs[name];
-                if (cudaMemcpy(dv.a, ph.a.data(), ph.a.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-                    cudaMemcpy(dv.bt, ph.bt.data(), ph.bt.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+                if (cudaMemcpy(dv.a, ph.a.data(), ph.a.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+                    cudaMemcpy(dv.bt, ph.bt.data(), ph.bt.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess) {
                     cudaSetDevice(prev);
                     err = "lora: table upload failed (the adapter is now half-updated)";
                     return false;
@@ -483,7 +503,7 @@ uint64_t lora_device_bytes(const std::vector<LoraLayerHost>& layers) {
     uint64_t b = sizeof(int);
     for (const LoraLayerHost& l : layers)
         for (const auto& [name, p] : l.projs)
-            b += (uint64_t) (p.a.size() + p.b.size() + SMALL_N * p.rank) * sizeof(float);
+            b += (uint64_t) (p.a.size() + p.b.size()) * sizeof(uint16_t) + (uint64_t) SMALL_N * p.rank * sizeof(float);
     return b;
 }
 
@@ -491,7 +511,7 @@ uint64_t lora_device_bytes() {
     uint64_t b = sizeof(int);
     for (const LayerHost& l : g_host)
         for (const auto& [name, p] : l.projs)
-            b += (uint64_t) (p.a.size() + p.bt.size() + SMALL_N * p.rank) * sizeof(float);
+            b += (uint64_t) (p.a.size() + p.bt.size()) * sizeof(uint16_t) + (uint64_t) SMALL_N * p.rank * sizeof(float);
     return b;
 }
 
