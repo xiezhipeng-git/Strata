@@ -545,7 +545,12 @@ class EngineMezo:
             loss_fn = raw_fn if base is None else (lambda th: raw_fn(th) - base)
         else:
             loss_fn = lambda th: self.loss_at(th, batch)  # noqa: E731
-        out = opt.step(theta, vel, lr, loss_fn, rng)
+        out = opt.step(theta, vel, lr, loss_fn, rng, step_max=self._step_max_at(lr))
+        # 上限钉死 = lr 曲线被重归一化吃掉。要计数，否则「调了 --lr-schedule 却没变化」
+        # 在日志里完全看不出来（2026-11-21：v4 冷启动 1500 步把 12 题数学打成 1/12，
+        # 长锚漂移 −0.73 nats/token = 噪声底 150×，而 lr 一直显示 1.00e-03）。
+        self._zo_clamped_n = getattr(self, "_zo_clamped_n", 0) + (1 if opt.clamped else 0)
+        self._zo_step_n = getattr(self, "_zo_step_n", 0) + 1
         if opt.one_point:
             self._zo_prev_loss = opt.prev_loss
         if use_sub:
@@ -570,6 +575,26 @@ class EngineMezo:
         return lr_at(args.lr_schedule, args.lr, args.lr_final, args.lr_warmup,
                      args.steps, step)
 
+    def _step_max_at(self, lr: float) -> float | None:
+        """本步的绝对位移上限 = `--zo-step-max` × lr 曲线的相对值（const 曲线不缩放）。
+
+        为什么必须缩放：`zo/optim.py` 的裁剪作用在**施加的位移**上，
+        `scale = step_max / ‖lr·v‖` 把范数重归一化回 step_max ⇒ 只要上限被钉死，
+        `--lr-schedule` 与 `--lr-final` 对位移就完全没有影响，θ 以恒定速度随机游走。
+        实测（2026-11-21，identity v4 冷启动，step-max 0.03 / lr 1e-3 / 1500 步）：
+        θ 范数 2.82→6.95（2.46×），长锚 per-token logp 漂移 −0.728 nats（噪声底 0.0047
+        的 155×），保持集 8/12→1/12（McNemar p=0.016，12 条全 `length` 自环）。
+        上限跟着曲线收手后同一个 run 才有「先学事实、后停手」的形状。
+        """
+        sm = float(getattr(self.args, "zo_step_max", 0.0) or 0.0)
+        if sm <= 0:
+            return None
+        if getattr(self.args, "lr_schedule", "const") == "const":
+            return sm
+        base = float(getattr(self.args, "lr", 0.0) or 0.0)
+        if base <= 0:
+            return sm
+        return sm * max(0.0, min(1.0, lr / base))
     def lr_finder(self) -> int:
         """LR range test 的零阶改造版：每档从 θ₀ 重置，只扫一个短窗口。
 
@@ -1173,6 +1198,13 @@ class EngineMezo:
         done = step + 1 if args.steps else 0     # 早停后按实际跑的步数记账
         print(f"trained {done}/{args.steps} steps in {wall:.0f} s"
               f" ({wall / max(done, 1):.1f} s/step)", flush=True)
+        # 上限钉死的步数：这是「lr 曲线是否真的作用到了位移上」的唯一直接读数。
+        # 100% 且曲线不是 const ⇒ 修好之前 lr 衰减被重归一化吃掉；修好后上限自己也随曲线缩放，
+        # 仍然 100% 是正常的（此时施加位移 ∝ 曲线），所以这里只报数、不告警。
+        _n, _c = getattr(self, "_zo_step_n", 0), getattr(self, "_zo_clamped_n", 0)
+        if _n and _c:
+            print(f"step-max 钉死 {_c}/{_n} 步（{100.0 * _c / _n:.0f}%）；"
+                  f"曲线 {args.lr_schedule} 已按 lr/lr0 作用到上限上", flush=True)
         # 重放省了多少，必须让它自己说出来：否则「步时变快」无法与「换了别的配置」区分。
         _rs = getattr(eng, "replay_stats", None) or {}
         if _rs.get("captures"):

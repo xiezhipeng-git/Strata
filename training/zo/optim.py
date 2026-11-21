@@ -131,6 +131,10 @@ class Mezo:
         self.facs = tuple(facs)
         self.rel_cap = float(rel_cap or 0.0)
         self.step_max = float(step_max or 0.0)
+        # 上一步的裁剪读数（诊断用：`mezo` 靠它统计「上限钉死了多少步」）
+        self.clamped = False
+        self.step_pre = 0.0
+        self.scale = 1.0
         self.one_point = bool(one_point)
         self.subspace = max(0, int(subspace))
         self.subspace_noise = float(subspace_noise)
@@ -278,12 +282,17 @@ class Mezo:
         z_raw = z_raw * (np.sqrt(d) / nrm)       # 范数钉在 √d：ε/lr 语义与均匀模式一致
         return self._unflatten(z_raw)
 
-    def step(self, theta: dict, vel: dict, lr: float, loss_fn, rng):
+    def step(self, theta: dict, vel: dict, lr: float, loss_fn, rng,
+             step_max: float | None = None):
         """跑一步，原地改 theta/vel，返回 (pj_vals, ‖θ‖, rel, loss_mid, ‖θ_能动‖)。
 
         `loss_mid = mean_q (L(θ+εz_q) + L(θ−εz_q))/2`：**零额外开销**的中心损失估计
         —— 差分本来就算过这两个点，取平均即 L(θ) 的 O(ε²) 估计。轮次曲线画它而不是画
         pj，是因为 pj 是方向导数，可正可负、随方向抖动。
+
+        `step_max`：本步的绝对位移上限，缺省用实例值。**训练器每步传进来**是为了让
+        lr 曲线能作用到上限上 —— 上限一旦先钉死，`scale` 会把位移重归一化回同一个
+        范数，lr 衰减被完全吃掉（见 `clamped` 与 `mezo._zo_step` 的注释）。
         """
         theta_lo = {l: dict(theta[l]) for l in self.layers}   # 只取参与更新的层
 
@@ -354,10 +363,14 @@ class Mezo:
                 step_pre += float(np.sum((lr * va) ** 2) + np.sum((lr * vb) ** 2))
         step_pre = step_pre ** 0.5
         scale = 1.0
+        sm = self.step_max if step_max is None else float(step_max)
         if self.rel_cap > 0 and mov_pre > 0 and step_pre > self.rel_cap * mov_pre:
             scale = self.rel_cap * mov_pre / step_pre
-        if self.step_max > 0 and step_pre > self.step_max:
-            scale = min(scale, self.step_max / step_pre)
+        if sm > 0 and step_pre > sm:
+            scale = min(scale, sm / step_pre)
+        self.clamped = sm > 0 and step_pre > sm
+        self.step_pre = step_pre
+        self.scale = scale
 
         for l in self.layers:
             for which, (a, b) in theta_lo[l].items():

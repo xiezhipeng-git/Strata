@@ -321,8 +321,12 @@ def resolve_engine_model(a) -> tuple[str, str, str, str, str]:
     if not os.path.isdir(pack):
         raise SystemExit(f"引擎 pack 目录不存在：{pack}")
 
+    # 0.2.9 把 data/ 挪到 terminal/data/：先看新位置，再看旧位置（老树不变）
+    _prof_new = repo_root() / "terminal" / "data" / "expert-profile.bin"
+    _prof_old = repo_root() / "data" / "expert-profile.bin"
     prof = (a.expert_profile or os.environ.get("STRATA_EXPERT_PROFILE", "")
-            or info.get("expert_profile", "") or str(repo_root() / "data" / "expert-profile.bin"))
+            or info.get("expert_profile", "")
+            or str(_prof_new if _prof_new.is_file() else _prof_old))
     if not os.path.exists(prof):
         raise SystemExit(f"专家路由表不存在：{prof}（--expert-profile）")
     return shards[0], pack, exe, prof, origin

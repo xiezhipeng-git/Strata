@@ -102,6 +102,37 @@ drift. The 5/5 point was reproduced on three separate checkpoints (500 / 1 000 /
 it is a plateau, not a fluke — but it is a knife edge, and the in-run eval reads one step
 behind the checkpoint (eval uses θ before the update).
 
+**The step budget has to follow the lr curve, and it now does** (2026-11-21). `zo/optim.py`
+clips the *applied displacement* (`scale = cap / ‖lr·v‖`), so once `--zo-step-max` binds, the
+displacement norm is the cap regardless of `lr` — `--lr-schedule` and `--lr-final` were
+silently inert, and the log kept printing a decaying lr while θ walked at a constant speed.
+`EngineMezo._step_max_at()` now multiplies the cap by the curve (`lr / lr₀`, clamped to
+[0, 1]); `const` keeps the historical path bit for bit.
+
+What that costs if you skip it — identity v4 cold start, 14 rows, cap 0.03, rank 4 on the
+last two layers, measured with `retain.py` (same engine, adapter swapped in place; the
+12-item MATH-500 holdout is generated per arm, long-anchor drift is per-token logp over four
+936-token paragraphs, noise floor = the same adapter read twice in one process):
+
+| arm | steps | ce | probe `logp(name)` | MATH holdout | long-anchor drift |
+|---|---|---|---|---|---|
+| no training | 0 | 4.5748 | −51.51 | 7–9 / 12 | 0 (by construction) |
+| constant cap | 500 | 3.3138 | −40.36 | 8/12 (McNemar p=1.00) | −0.022 |
+| **constant cap** | 1 500 | 0.8328 | −14.16 | **1–2 / 12** (p=0.06) | **−0.728** |
+| cosine cap | 500 | 3.5738 | −44.36 | 7/12 (p=1.00) | −0.006 |
+| cosine cap | 1 000 | 1.7069 | −24.44 | 7/12 (p=1.00) | −0.135 |
+| cosine cap | 2 000 | 1.1169 | −18.05 | 5/12 (p=0.69) | −0.286 |
+
+Two things follow. First, the anchor noise floor in one process is std 0.005–0.010 nats/token,
+so −0.728 is ~150× noise and −0.022 is within it: the collapse is the constant budget, not
+"training in general". Second, **the damage and the learning are on the same knob** — the
+cosine arm stays inside the noise band on the 12-item holdout but never surfaces the injected
+token (0/20 held phrasings), while the constant arm surfaces it (6/20 at 1 500 steps, 1/20
+exactly) and pays for it with a fifth of the math holdout. `--select-tokens excess` (57% of
+answer tokens kept) moves the same curve: 1/20 at 1 000 steps, then 20/20 `length` loops at
+1 500. Pick the step budget for the capability you refuse to lose, and stop there.
+
+
 ### Full context (128K)
 
 | what | measured |

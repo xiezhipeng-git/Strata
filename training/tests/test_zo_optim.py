@@ -255,6 +255,53 @@ class TestOnePoint(unittest.TestCase):
                                    msg=f"one_point={one}: pj {pj[0]} != Σz {want}")
 
 
+class TestStepMaxOverride(unittest.TestCase):
+    """`step(..., step_max=)`：上限必须能被**每步**改写，否则 lr 曲线对它完全无效。
+
+    为什么这是一条判据而不是「多一个参数」：裁剪作用在**施加的位移**上
+    （`scale = cap / ‖lr·v‖`），cap 一旦钉死，位移范数就恒等于 cap、与 lr 无关
+    ⇒ `--lr-schedule` 与 `--lr-final` 全部被重归一化吃掉，θ 以恒定速度随机游走。
+    2026-11-21 实测（identity v4 冷启动，cap 0.03 / lr 1e-3 恒定 / 1500 步）：
+    答案 CE 4.5748→0.8328 但 ‖θ‖ 2.82→6.95（2.46×），数学保持集 8/12→1/12
+    （McNemar p=0.016，12 条全 `length` 自环），长锚 per-token logp 漂移
+    −0.728 nats（同进程噪声底 std 0.0047 的 155×）。训练器据此每步把 cap 乘上
+    lr 曲线的相对值 —— 这条通路必须有测试守着，否则「调了调度却没变化」无声无息。
+    """
+
+    def _delta(self, cap_override, lr=1.0, base_cap=1e-2):
+        th = make_theta(0.0)
+        b0 = th[0]["ssm_out"][1].copy()
+        opt = Mezo(LAYOUT, [0], eps=1e-3, dirs=1, momentum=0.0,
+                   facs=("b",), step_max=base_cap)
+        opt.step(th, opt.zeros(th), lr, LinearLoss(), np.random.default_rng(3),
+                 step_max=cap_override)
+        d = th[0]["ssm_out"][1].astype(np.float64) - b0.astype(np.float64)
+        return float(np.linalg.norm(d))
+
+    def test_override_scales_the_step_linearly(self):
+        full = self._delta(None)                 # 用实例上限
+        quarter = self._delta(2.5e-3)            # 上限 × 0.25
+        self.assertLessEqual(quarter, full * 1.000001)
+        self.assertAlmostEqual(quarter / full, 0.25, delta=0.02,
+                               msg=f"上限缩到 1/4 但位移比是 {quarter / full:.3f}")
+
+    def test_override_overrides_not_min(self):
+        """传更大的上限必须真的放大位移 —— 否则「覆盖」只是「取小」。"""
+        bigger = self._delta(4e-2)
+        self.assertAlmostEqual(bigger / self._delta(None), 4.0, delta=0.2)
+
+    def test_clamped_flag_reports_the_binding(self):
+        th = make_theta(0.0)
+        opt = Mezo(LAYOUT, [0], eps=1e-3, dirs=1, momentum=0.0,
+                   facs=("b",), step_max=1e-9)
+        opt.step(th, opt.zeros(th), 1.0, LinearLoss(), np.random.default_rng(0))
+        self.assertTrue(opt.clamped, "位移被上限钉死却没置位 ⇒ 训练器数不到这个症状")
+        th2 = make_theta(0.0)
+        opt2 = Mezo(LAYOUT, [0], eps=1e-3, dirs=1, momentum=0.0, facs=("b",))
+        opt2.step(th2, opt2.zeros(th2), 1e-9, LinearLoss(), np.random.default_rng(0))
+        self.assertFalse(opt2.clamped, "没给上限时不能自称被裁")
+
+
 class TestRelCapSelflock(unittest.TestCase):
     """`rel_cap` 配 `facs=("b",)` 会自锁 —— 上限 ∝ 自己要长的那个量。
 
