@@ -800,7 +800,6 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=2,
                     help="grpo × backward 每步用几条 prompt（与 grpo.py 的默认一致）。"
                          "轮次折算成步数要用它：steps/epoch = ceil(行数 / (batch × group))")
-    ap.add_argument("--max-new", type=int, default=32, help="每条轨迹最多生成多少 token")
     ap.add_argument("--temperature", type=float, default=1.0, help="采样温度（1.0 才有多样性）")
     ap.add_argument("--resample-every", type=int, default=1,
                     help="每几步重采一次：1=标准 on-policy；>1 用同一批多训几步")

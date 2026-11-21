@@ -27,7 +27,7 @@ for _d in (_p.Path(__file__).resolve().parent, _p.Path(__file__).resolve().paren
     if str(_d) not in _s.path:
         _s.path.insert(0, str(_d))
 
-from zo.optim import Mezo, theta_norms       # noqa: E402
+from zo.optim import Mezo, theta_norms, rel_cap_would_selflock       # noqa: E402
 
 
 def make_theta(b_scale=0.0, rank=2, n_in=8, n_out=4):
@@ -253,6 +253,47 @@ class TestOnePoint(unittest.TestCase):
                               np.random.default_rng(rng_seed))
             self.assertAlmostEqual(pj[0], want, places=3,
                                    msg=f"one_point={one}: pj {pj[0]} != Σz {want}")
+
+
+class TestRelCapSelflock(unittest.TestCase):
+    """`rel_cap` 配 `facs=("b",)` 会自锁 —— 上限 ∝ 自己要长的那个量。
+
+    2026-11-18 的回归：把 `--zo-rel` 默认值改成 1e-2 时没看默认 `--zo-factors` 是 `b`，
+    于是「修步长」实际修成「每步只走首步的 rel 倍」，而 ‖B‖ 只能靠步长长大 ⇒ 参数几乎不动，
+    **训练不报错、ΔCE 看着也在动**。这里钉两件事：判定函数认得这个组合；而且不是纸面推论
+    —— 实跑能看到 ‖B‖ 被压住，换成 ab 就正常。
+    """
+
+    def test_predicate(self):
+        self.assertTrue(rel_cap_would_selflock(("b",), 0.0))
+        self.assertFalse(rel_cap_would_selflock(("b",), 1e-3), "resume 的 θ 非零时有分母，不算自锁")
+        self.assertFalse(rel_cap_would_selflock(("a", "b"), 0.0), "A 是随机基，分母有常数基线")
+
+    def _grow(self, facs, rel, steps=20):
+        th = make_theta(0.0)
+        opt = Mezo(LAYOUT, [0], eps=1e-3, dirs=1, momentum=0.0, facs=facs, rel_cap=rel)
+        vel = opt.zeros(th)
+        for i in range(steps):
+            opt.step(th, vel, 1e-3, LinearLoss(), np.random.default_rng(100 + i))
+        return float(np.linalg.norm(th[0]["ssm_out"][1]))
+
+    def test_b_selflocks_and_ab_does_not(self):
+        """自锁的指纹是「首步走满、之后每步只有 rel 倍」 ⇒ 20 步几乎不长。
+
+        不是「完全不动」：第 1 步 mov_pre=0 不裁，‖B‖ 会到 s₁；此后每步 ≤ rel·‖B‖，
+        20 步的上界就是 s₁·(1+19·rel)。所以判据是「相对 s₁ 只涨 rel×步数」，
+        而自由跑是 √N 增长（随机方向），ab 则因分母恒为 ‖A‖ 而正常生长。
+        """
+        s1 = self._grow(("b",), 0.0, steps=1)
+        free_b = self._grow(("b",), 0.0)
+        cap_b = self._grow(("b",), 1e-2)
+        cap_ab = self._grow(("a", "b"), 1e-2)
+        self.assertLess(cap_b / s1, 1.5,
+                        f"rel 1e-2 + facs b 的 20 步应几乎不长（≤1.5×s₁），实测 {cap_b / s1:.2f}×")
+        self.assertGreater(free_b / s1, 2.0,
+                           f"关掉上限时 20 步必须真的走（≈√20），实测 {free_b / s1:.2f}×")
+        self.assertGreater(cap_ab, 3.0 * cap_b,
+                           f"同样的 rel 换成 ab 有常数分母、不再自锁：ab {cap_ab:.3g} vs b {cap_b:.3g}")
 
 
 if __name__ == "__main__":

@@ -181,6 +181,28 @@ def load_data(spec: str, word: str = "", *, allow_target: bool = False,
     return rows
 
 
+def dataset_thinks(targets: list[str]) -> tuple[bool, str]:
+    """详细答案**自带**思考段吗？决定训练与生成同不同意模型先想再答。
+
+    规则（2026-11-18 定）：看答案本身，不看命令行开关 ——
+      * 含 `<think>` / `</think>`（`with_thinking` 合成的主干也以 `</think>` 收尾）⇒ 思考**开**。
+        目标里有思考段，就一定要在思考模板下训练：不给开，这段文本会被当成「答案的开头」，
+        推理时模型又不会主动写它 —— 训练分布与推理分布错位。
+      * 不含 ⇒ 思考**关**。这时答案就是全部要学的文本；再塞一个空思考段只会让模型在推理时
+        先写一段没有任何监督的自由文本，然后在 `</think>` 之后才答（历史上成功率为 0 的那批
+        实验里，这一档最典型：CE 降、生成不变）。
+
+    以前这条靠人传 `--think-targets`，传错**不报错**，只是把训练和推理放到两条模板上。
+    返回 `(是否开, 人类可读的理由)`，调用方把理由打出来。
+    """
+    n_tags = sum(1 for t in targets if "<think" in t or "</think" in t)
+    if not targets:
+        return False, "空数据集，按关闭处理"
+    if n_tags:
+        return True, f"{n_tags}/{len(targets)} 条目标的详细答案里有 `<think>`/`</think>` 段"
+    return False, f"0/{len(targets)} 条目标的详细答案里有思考段（答案本身就是全部要学的文本）"
+
+
 def with_thinking(q: str, a: str, word: str, identity: bool) -> str:
     """把答案包成「思考段 + </think> + 答案」。语言跟着问题走（中文问就中文想）。"""
     zh = any("\u4e00" <= ch <= "\u9fff" for ch in q)
@@ -279,9 +301,21 @@ def load_rollouts(spec: str) -> list[dict]:
         pids = r.get("prompt_ids") or []
         row["prompt_ids"] = [int(x) for x in pids] if pids else None
         row["finish_reason"] = r.get("finish_reason")
+        # gold（采样任务的 `target`）：RL 兜底要用 —— 组全错时优势恒 0，那一步换成
+        # 「gold answer 的 SFT/DPO」。采样侧（collect_rollouts.py）本来就把 target 写进
+        # jsonl 了，以前这里丢掉它，兜底就只能靠人手另备一份答案文件。
+        row["gold"] = str(r.get("target") or r.get("gold") or "")
         rows.append(row)
     if not rows:
         raise SystemExit(f"{path}: no rows")
+    # 截断的轨迹会**静默**变成「答错」：`completion` 是被砍断的半句话，reward 与 logprobs
+    # 都落在它上面，训练曲线看不出来。读的时候报一次 —— 撞上限不是「模型答不出」。
+    cut = sum(1 for r in rows if r.get("finish_reason") == "length")
+    if cut:
+        print(f"!! {path}: {cut}/{len(rows)} 条轨迹的 `finish_reason == length` —— 采样时撞上了"
+              f"生成预算，不是模型答不出。这些行的 completion 与 token_logprobs 是半句话，"
+              f"判分和训练都会把「没写完」记成「答错」；重采时把 --max-new 给 0（用满上下文）。",
+              flush=True)
     return rows
 
 

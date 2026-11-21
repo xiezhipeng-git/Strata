@@ -122,7 +122,14 @@ def main() -> int:
     ap.add_argument("--prompts", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--group", type=int, default=4)
-    ap.add_argument("--max-new", type=int, default=48)
+    ap.add_argument("--max-new", type=int, default=0,
+                    help="每条轨迹的生成预算。**默认 0 = 不设上限**：引擎把 `max_tokens <= 0` "
+                         "解释成「用满剩余上下文」，写不写得完由上下文窗口决定，不由这里的一个小数决定。"
+                         "给正数就是人为截断 —— 长推理链会每条都停在半路，而那条轨迹照样能被判分，"
+                         "于是「没答完」被记成「答错」，训练就在这种数据上跑（以前默认 48 就是这个坑）。")
+    ap.add_argument("--allow-truncated", action="store_true",
+                    help="允许多条轨迹以 `finish_reason == length` 收尾（撞上生成预算）。"
+                         "默认不允许：撞上限的轨迹不是「模型答不出」，拿它训练/判分都是错的读数")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--think", action="store_true", help="默认关思考：max_tokens 同时覆盖思考与回答")
     ap.add_argument("--reasoning-effort", default="", choices=("", "xhigh", "medium", "low"),
@@ -205,6 +212,17 @@ def main() -> int:
           f"  wall: {n} requests in {wall:.1f}s with parallel={args.parallel} "
           f"-> {wall_tok_s:.1f} tok/s aggregate "
           f"(end-to-end, meta in {args.out}.meta.json)", flush=True)
+
+    # 截断门：撞上生成预算的轨迹**不是**「模型答不出」，拿它判分或训练得到的是错读数。
+    # 默认直接失败，逼调用方把预算交给上下文窗口（--max-new 0）或显式接受。
+    cut = [t for t in trajs if t.get("finish_reason") == "length"]
+    if cut:
+        print(f"!! {len(cut)}/{n} 条轨迹以 `finish_reason == length` 收尾：撞上了生成预算"
+              f"（--max-new {args.max_new}），不是模型答不出。这些轨迹的 reward 与 token_logprobs\n"
+              f"   记的是「被砍断的半句话」，拿去判分/训练都是错的读数。改法：--max-new 0"
+              f"（用满上下文，默认）或显式加大；确认要留下时给 --allow-truncated。", flush=True)
+        if not args.allow_truncated:
+            return 2
     return 0
 
 

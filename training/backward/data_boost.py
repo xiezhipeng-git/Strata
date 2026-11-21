@@ -269,7 +269,9 @@ class BoostCfg:
 
     blocks: int = 1          # 分几段自回归扩展。默认 1（见下方「为什么 blocks=1」）
     steps: int = 4           # MH 步数（论文 10；每步一次全序列 SCORE，最贵）
-    max_new: int = 700       # 轨迹 token 上限（安全阀，正常由模型自己写 EOS 收尾）
+    max_new: int = 0         # 每段生成预算：**0 = 用满上下文剩余空间**（ctx − 已用 − 8）。
+    #                          以前是 700，对满上下文训练里的长轨迹等于人为截断：超了就只能
+    #                          退回原轨迹（`fallback=over_budget`），一条都 boost 不成。
     temperature: float = 0.6  # 提议的采样温度（论文 0.6）
     require_hit: bool = True   # 生成轨迹必须判对才收（等价类兜底）
     min_gain: float = 0.0      # 接受所需的最小平均 logprob 提升（nats/token）
@@ -277,8 +279,17 @@ class BoostCfg:
     seed: int = 0
     start: str = "empty"       # empty = 从空串生成整条（论文原样）；expert = 从专家轨迹起跑
 
-    def jump(self) -> int:
-        return max(1, self.max_new // max(1, self.blocks))
+    def jump(self, used: int = 0, ctx: int = 0) -> int:
+        """一段能写多少 token。`max_new` > 0 时按它均分；= 0 时用满上下文剩余空间。
+
+        `ctx` 是引擎报的窗口；引擎没报（0）就退回旧默认 700 —— 那是有上限的那一档，
+        调用方要满上下文就得确认引擎报了 `max_context`（`launch_engine` 会挂上去）。
+        """
+        if self.max_new > 0:
+            return max(1, self.max_new // max(1, self.blocks))
+        room = ctx - used - 8 if ctx > 0 else 700
+        return max(1, room // max(1, self.blocks)) if room > 0 else 0
+
 
 
 @dataclass
@@ -398,7 +409,10 @@ class Booster:
         t0 = time.time()
         prefix = self.prompt_ids(question)
         cfg = self.cfg
-        jump = cfg.jump()
+        # 每段预算交给上下文窗口：`--max-new 0` 时 = 窗口剩余空间，不再有 700 这种常数上限。
+        jump = cfg.jump(len(prefix), int(getattr(self.eng, "max_context", 0) or 0))
+        if jump <= 0:
+            return BoostRow(text="", source="original", fallback="context_full")
         expert_ids = self._ids(expert, special=False)
 
         if cfg.start == "expert":
@@ -865,7 +879,9 @@ def main(argv=None) -> int:
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 条（先小批试跑）")
     ap.add_argument("--blocks", type=int, default=BoostCfg.blocks)
     ap.add_argument("--steps", type=int, default=BoostCfg.steps)
-    ap.add_argument("--max-new", type=int, default=BoostCfg.max_new)
+    ap.add_argument("--max-new", type=int, default=BoostCfg.max_new,
+                    help="每段生成的 token 预算。默认 0 = 用满上下文剩余空间（ctx − 已用 − 8）；"
+                         "给正数就是人为截断，超出预算的轨迹只能退回原轨迹")
     ap.add_argument("--temperature", type=float, default=BoostCfg.temperature,
                     help="提议采样温度（论文 0.6）；经引擎的 --temperature 生效")
     ap.add_argument("--top-p", type=float, default=0.95, dest="top_p")
@@ -942,7 +958,7 @@ def main(argv=None) -> int:
                    temperature=a.temperature, require_hit=a.require_hit,
                    min_gain=a.min_gain, min_effect=a.min_effect,
                    seed=a.seed, start=a.start)
-    if cfg.max_new % cfg.blocks:
+    if cfg.max_new > 0 and cfg.max_new % cfg.blocks:
         log(f"note: max_new {cfg.max_new} 不是 blocks {cfg.blocks} 的整数倍，"
             f"实际每段 {cfg.jump()} tok（共 {cfg.jump() * cfg.blocks}）")
 
@@ -996,7 +1012,8 @@ def main(argv=None) -> int:
 
         key = cache_key(cfg, rows, a.gguf + "|" + (a.lora or "base"))
         log(f"boost: {len(rows)} 条  blocks={cfg.blocks} steps={cfg.steps} "
-            f"jump={cfg.jump()} max_new={cfg.max_new} require_hit={cfg.require_hit}  key={key}")
+            f"max_new={'auto（用满上下文）' if cfg.max_new <= 0 else cfg.max_new} "
+            f"require_hit={cfg.require_hit}  key={key}")
         out, stats = boost_rows(rows, booster, gold_of=gold_of_row, log=log,
                                 budget_secs=a.budget_secs, resume=done, show=a.show)
     finally:

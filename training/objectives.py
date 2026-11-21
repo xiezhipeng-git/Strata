@@ -232,6 +232,31 @@ def group_advantages(rewards, group_size: int, *, scale: bool = True, eps: float
     return adv, used, used == 0
 
 
+def fallback_group_indices(rewards, group_size: int) -> list[int]:
+    """RL 次级算法兜底的判据：**全错组**（该组全部奖励 == 0）的组起始下标。
+
+    这是算法层的判据，mezo（回放）/ backward（两段式）两个方法共用 —— 就像
+    grpo_loss 只有一份。全错组在 GRPO/LUSPO 里优势恒 0：模型连一个可模仿的正样本
+    都没采出来，这一步原本是纯空转。算法层的应对是次级算法兜底 —— 该步换成
+    gold answer 的监督更新（sft_loss / dpo_loss，同样只有一份）：
+      sft  gold answer 的前向 CE（sft_loss）
+      dpo  (chosen=gold, rejected=该组一条失败轨迹) 的偏好对（dpo_loss + dpo_margin）
+
+    全对组、或「全等但非 0」的组**不触发**（模型已会 / 仍有稠密奖励语义）。
+    numpy 与 torch 双路径，与 group_advantages 同一套约定。
+    """
+    out: list[int] = []
+    for i0 in range(0, len(rewards), group_size):
+        grp = rewards[i0:i0 + group_size]
+        if not _is_torch(grp):
+            grp = np.asarray(grp, dtype=np.float32)   # 调用方可能传 python list
+        grp = _as_float(grp)
+        n = grp.numel() if _is_torch(grp) else grp.size
+        if n >= 2 and bool(_as_bool((grp == 0).all())):
+            out.append(i0)
+    return out
+
+
 def grpo_loss(logp, old_logp, adv, mask, cfg: GrpoCfg | None = None,
               tis=None, denom: float | None = None):
     """裁剪代理目标，返回 `(loss, stats)`；loss 保留计算图。

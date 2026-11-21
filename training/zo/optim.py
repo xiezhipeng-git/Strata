@@ -84,6 +84,19 @@ def theta_norms(theta: dict, layers: list, facs: tuple[str, ...] = ("a", "b")):
     return float(np.sqrt(full)), float(np.sqrt(moving))
 
 
+def rel_cap_would_selflock(facs: tuple[str, ...], norm_moving0: float) -> bool:
+    """`rel_cap` 在这个 (更新因子, 起点可动范数) 上是否**自锁**。
+
+    自锁的定义是「上限 ∝ 自己要长的那个量」：`--zo-factors b` 下上限 = rel×‖B‖，而 ‖B‖ 从 0 起、
+    只能靠步长长大 ⇒ 第一步把 ‖B‖ 抬到 s₁，第二步上限就是 rel×s₁（比 s₁ 小两个数量级），
+    之后永远 ≈ rel×‖B‖。实测（2026-11-14 idH）rel 0.01 把每步钉在 1.4e-4，17 步 ‖B‖ 没长。
+
+    `--zo-factors ab` 不会：‖A‖ 是随机初始化基、不动，分母有常数基线。
+    这个判定必须显式报错而不是打印警告 —— 症状是「训练不报错也不动」，看一眼日志根本看不出来。
+    """
+    return "a" not in facs and norm_moving0 <= 0.0
+
+
 class Mezo:
     """零阶优化器：持超参，跑一步，原地改 θ 与动量，返回读数。
 

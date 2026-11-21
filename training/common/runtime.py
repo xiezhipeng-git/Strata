@@ -345,6 +345,9 @@ def launch_engine(args, log_path: str, init_adapter: str,
                             encoding="utf-8", errors="replace", bufsize=1,
                             cwd=os.path.dirname(os.path.abspath(args.engine)))
     eng = Engine(proc)
+    # 引擎的上下文窗口挂到句柄上：调用方要回答「还能写多少」时只能问它，
+    # 自己填一个常数就是人为截断（`data_boost` 的每段预算用它）。
+    eng.max_context = int(getattr(args, "max_context", 0) or 0)
     while True:
         line = proc.stdout.readline()
         if not line:

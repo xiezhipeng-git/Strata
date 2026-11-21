@@ -120,6 +120,33 @@ class Advantages(unittest.TestCase):
         self.assertEqual(adv.dtype, torch.float32)
 
 
+class FallbackGroups(unittest.TestCase):
+    """RL 次级算法兜底的判据：只有「全错组」触发，其余一律不触发。"""
+
+    def test_only_all_zero_groups(self):
+        # 组0 混合[1,0]、组1 全错[0,0]、组2 全对[1,1]、组3 全等非0
+        r = [1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0]
+        self.assertEqual(O.fallback_group_indices(r, 2), [2])
+
+    def test_matches_mezo_replay_case(self):
+        # mezo 回放的真实形状：4 组里 1 组全错
+        r = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0]
+        self.assertEqual(O.fallback_group_indices(r, 4), [0])
+
+    def test_torch_input_same_answer(self):
+        # 组0 与组2 都是 [0,0] 全错，都触发
+        r = torch.tensor([0.0, 0.0, 1.0, 1.0, 0.0, 0.0])
+        self.assertEqual(O.fallback_group_indices(r, 2), [0, 4])
+
+    def test_single_sample_group_never_triggers(self):
+        # 与 group_advantages 同约定：n<2 的组跳过（那边跳过优势，这边跳过兜底）
+        self.assertEqual(O.fallback_group_indices([0.0], 4), [])
+
+    def test_group_size_larger_than_rewards(self):
+        # 尾部残组与 group_advantages 同约定：n≥2 就算一组（那边照样算优势）
+        self.assertEqual(O.fallback_group_indices([0.0, 0.0], 4), [0])
+
+
 class GrpoLoss(unittest.TestCase):
     def _one(self, logp, old, adv, mask, **kw):
         t = lambda v: torch.tensor([v], dtype=torch.float32)  # noqa: E731

@@ -115,12 +115,12 @@ import objectives  # noqa: E402  共享目标函数（numpy 路径；与反传�
 import guard        # noqa: E402  token 选择（select_mask）与反传线共用同一份纯逻辑
 import metrics as mtr  # noqa: E402  训练指标出口（JSONL + 本地 HTTP，RSI 控制器轮询用）
 import report  # noqa: E402  回环内的评测与记录（判据展示只在这里改）
-from zo.optim import Mezo, theta_norms  # noqa: E402  零阶估计器（算法只在 zo/optim.py 有一份）
+from zo.optim import Mezo, theta_norms, rel_cap_would_selflock  # noqa: E402  零阶估计器（算法只在 zo/optim.py 有一份）
 from common.chat import (load_template, load_tokenizer, load_transcript_template,
                          template_thinks)
 from common.data import (IDENTITY_ROWS, SYSTEM_IDENTITY, THINK_EN, THINK_GEN_EN, THINK_GEN_ZH,
                          THINK_ZH,
-                         builtin_data, load_conversations, load_data, load_dpo,
+                         builtin_data, dataset_thinks, load_conversations, load_data, load_dpo,
                          load_rollouts, with_thinking)
 from common.encode import answer_seg, enc_answer, enc_transcript, engine_keep, eos_id, name_logprob
 from common.lora import (adapter_layout, init_theta, read_adapter, read_adapter_alpha,
@@ -172,21 +172,22 @@ class EngineMezo:
         self.render_off = (load_template(args.pack, enable_thinking=False, system=system,
                                          reasoning_effort=effort)
                            if template_thinks(render) else render)
+        # `--think-targets auto`：**按数据判**要不要让模型先写思考段，且必须在建 eval_render
+        # 之前定下来 —— 评测与训练必须走同一条模板，这条判错两组读数就不是同一个位置。
+        self.think_mode = self._resolve_think_mode(args)
         # 评测/探针走**哪条通道**必须与训练目标一致，否则量的是模型从没被监督过的位置。
         # 2026-11-14 实测：`--think-targets off`（只训纯答案）时，评测仍用思考模板
         # （prompt 以 `<think>` 收尾，模板默认 reasoning_effort='xhigh'），而身份答案在
         # `</think>` 之后 —— 64 token 的预算连思考段都写不完，`success` 恒 0/5，
         # 与学没学会无关；`logp(word|probe)` 也测在 `<think>` 紧随的位置，训练从未优化那里。
-        # auto = 跟着 --think-targets（off → 非思考模板；both/on/raw → 思考模板，历史口径不变）。
+        # auto = 跟着判定结果（off → 非思考模板；on/raw → 思考模板）。
         _er = (getattr(args, "eval_render", "") or "auto").strip()
         if _er == "off":
             self.eval_render = self.render_off
         elif _er == "on":
             self.eval_render = render
         else:
-            self.eval_render = (self.render_off
-                                if (getattr(args, "think_targets", "both") or "both") == "off"
-                                else render)
+            self.eval_render = self.render_off if self.think_mode == "off" else render
         # 回合结束 token：答案末尾必须带上它，否则模型从没学过「在哪收尾」（2026-11-15 定位）。
         # `--no-answer-eos` 只为把历史 run 复现出来做对照，不是正常用法。
         _tok_eos = eos_id(tok)
@@ -210,6 +211,36 @@ class EngineMezo:
             f"{args.objective}-{getattr(args, 'method', 'mezo')}")
 
     # ---- 三个算法钩子（子类覆写） -------------------------------------------
+    def _resolve_think_mode(self, args) -> str:
+        """把 `--think-targets` 定成一个具体档（off / on / raw / both）。
+
+        `auto`（默认）看**详细答案本身**：里面有 `<think>`/`</think>` 就开思考，没有就关。
+        理由写在 `common/data.dataset_thinks` 里 —— 目标里有什么，推理就允许写什么；
+        目标里没有的，不该让模型在推理时凭空多写一段没人监督的文本。
+
+        读不到监督目标（例如纯多轮转录自带思考段）时按 `off` 并说明原因。
+        """
+        mode = getattr(args, "think_targets", "auto") or "auto"
+        if mode != "auto":
+            return mode
+        targets: list[str] = []
+        why = ""
+        try:
+            obj = self.objective
+            if obj == "ce" and getattr(args, "data", ""):
+                targets = [a for _, a in load_data(args.data, args.word)]
+            elif obj == "dpo":
+                spec = getattr(args, "dpo_data", "") or getattr(args, "data", "")
+                targets = [r["chosen"] for r in load_dpo(spec) if r.get("chosen")]
+            elif getattr(args, "rollouts", ""):
+                targets = [r.get("completion") or "" for r in load_rollouts(args.rollouts)]
+        except (SystemExit, OSError, ValueError, KeyError) as exc:
+            targets, why = [], f"读不到监督目标（{type(exc).__name__}）"
+        on, why2 = dataset_thinks(targets) if targets else (False, why or "没有监督目标文本")
+        mode = "on" if on else "off"
+        print(f"think-targets auto → {mode}：{why2}", flush=True)
+        return mode
+
     def load_items(self) -> list[dict]:
         raise NotImplementedError
 
@@ -885,11 +916,7 @@ class EngineMezo:
         # rel-cap 是**相对**上限：每步 ≤ rel_cap × ‖θ_能动‖。B=0 起点上 ‖θ_能动‖=0，
         # 而它只能靠步长长大 —— 于是 步长 = rel_cap×‖B‖ 变成自锁（2026-11-14 idH 实测：
         # rel_cap 0.01 把每步钉死在 1.4e-4，比 idC 的 6.4e-3 小 45 倍，‖B‖ 17 步没长）。
-        # 从零初始化起步只能用绝对 --zo-step-max。
-        if getattr(args, "zo_rel", 0.0) and getattr(args, "zo_factors", "b") != "ab":
-            print(f"警告：--zo-rel {args.zo_rel:g} 在 B=0 起点会自锁（步长 ∝ ‖B‖，"
-                  "而 ‖B‖ 只能靠步长增长）—— 零阶从零起训请改用 --zo-step-max，"
-                  "或确认 --resume 的 θ 已有 ‖B‖>0", flush=True)
+        # 从零初始化起步只能用绝对 --zo-step-max。θ 加载后（run() 里）还有一道硬门。
         # r=1 且只训 B：ΔW = B·A 秩为 1（A 是 (r,n_in)、B 是 (n_out,r)），
         # Δlogits(h) = (U·B)·(A·h)·alpha/r，而 A·h 在 r=1 时是标量 ⇒ 任意隐藏态下
         # 的词表变化都沿 U·B 这一个方向。2026-11-14 bias_probe.py 实测（idM 4000 步）：
@@ -989,6 +1016,23 @@ class EngineMezo:
 
         rng = np.random.default_rng(args.seed + 1)
         theta, layout = self.theta, self.layout
+        # ---- rel-cap 的硬门（θ 已加载，能看真实范数了）。
+        # 分母是「能动的那个范数」：`--zo-factors b` 下就是 ‖B‖，而 B 从 0 起、只能靠步长长大
+        # ⇒「每步 ≤ rel×‖B‖」把步长钉在 rel×‖B‖ 上，‖B‖ 再也不动。这不是更保守，是**不动**，
+        # 而且不报错（2026-11-14 idH：rel 0.01 把每步压到 1.4e-4，17 步 ‖B‖ 没长）。
+        # 所以要约束零阶步长：b 用绝对 --zo-step-max（可加性，N 步总位移按 √N 规划），
+        # 或改 ab（‖A‖ 是随机基，常数，rel 才有分母）。
+        if getattr(args, "zo_rel", 0.0) and getattr(args, "zo_factors", "b") != "ab":
+            _mov0 = theta_norms(theta, layers, ("b",))[1]
+            if rel_cap_would_selflock(("b",), _mov0):
+                raise SystemExit(
+                    f"--zo-rel {args.zo_rel:g} 配 --zo-factors b 会自锁：这一步的上限是 "
+                    f"rel×‖B‖，而 ‖B‖ = 0 起点只能靠步长长大 ⇒ 训练不报错但几乎不动。\n"
+                    "两条可行路径：\n"
+                    f"  --zo-factors ab --zo-rel {args.zo_rel:g}      （A 是随机基，‖A‖ 常数，rel 有分母）\n"
+                    f"  --zo-factors b  --zo-step-max X  （绝对步长，可加性，X 取 0.01–0.03）")
+            print(f"注意：--zo-rel {args.zo_rel:g} 的分母取已加载的 ‖B‖ = {_mov0:.3g}"
+                  "（非零，不会自锁）；这是 --resume 的 θ，请确认它确实非零", flush=True)
         # 动量状态：与 theta 同形状，零初始化
         vel = {l: {w: (np.zeros_like(theta[l][w][0]), np.zeros_like(theta[l][w][1]))
                    for w in theta[l]} for l in layers}
@@ -1168,7 +1212,12 @@ class SftMezo(EngineMezo):
         conv = getattr(self.args, "conv_data", "") or ""
         if conv:
             return self.load_conv_items()
-        mode = getattr(self.args, "think_targets", "both")
+        items = []
+        ws: list[float] = []
+        rows = load_data(self.args.data, self.args.word, weights=ws)
+        # 已由 `_resolve_think_mode` 在 __init__ 里定下（auto 按数据的详细答案判），
+        # 这里只取用：评测通道 `eval_render` 用的是同一个值，两条模板不许各判一次。
+        mode = self.think_mode
         thinks = template_thinks(self.render)
         if mode == "on" and not thinks:
             # 模板不收思考段（nothink 口径）时硬塞 `</think>` 会把目标变成垃圾
@@ -1187,7 +1236,6 @@ class SftMezo(EngineMezo):
                                        reasoning_effort=effort)
         items = []
         ws: list[float] = []
-        rows = load_data(self.args.data, self.args.word, weights=ws)
         for i, (q, a) in enumerate(rows):
             iw = ws[i] if ws else None                # item 权重（jsonl 的 weight 字段）
             if thinks and mode in ("both", "on", "raw"):
@@ -1464,13 +1512,15 @@ class GrpoMezo(EngineMezo):
                     region[s:e] = True
                 items.append({"seq": seq, "start": spans[0][0], "region": region,
                               "nseg": int(region[1:].sum()), "reward": r["reward"],
-                              "turns": len(spans)})
+                              "turns": len(spans), "gold": r.get("gold") or ""})
             else:
                 seq, plen, lps = self._seq_from_rollout(r)
                 items.append({"seq": seq, "start": plen, "nseg": len(seq) - plen,
-                              "reward": r["reward"], "turns": 1, "sampler_lp": lps})
+                              "reward": r["reward"], "turns": 1, "sampler_lp": lps,
+                              "gold": r.get("gold") or ""})
         if self.objective == "luspo":
             self._check_luspo_premises(items)
+        self._build_fallback(items)
         return items
 
     def _seq_from_rollout(self, r: dict) -> tuple[list, int, np.ndarray | None]:
@@ -1624,6 +1674,106 @@ class GrpoMezo(EngineMezo):
                   "「rel 没超界」不等于「学到了」。知识类目标请走 sft/dpo。", flush=True)
 
 
+    def _build_fallback(self, items: list[dict]) -> None:
+        """RL 的次级算法兜底：预先找出「全错组」，把每组的次级更新材料备好。
+
+        奖励在回放文件里是**固定的** ⇒ 哪些组全错在 load 时就知道，不用等训练中撞上
+        才发现。全错组（奖励全 0）在 GRPO/LUSPO 里优势恒 0、pj 恒 0 —— 模型一条
+        可模仿的正样本都没采出来，这一步原本是纯粹的空转（步时间照付、参数纹丝不动）。
+        兜底 = 这一步换成 gold answer 的次级更新：
+
+          sft  gold answer 的 answer-CE（每 token 平均，与 CE 臂同尺度）
+          dpo  (chosen=gold answer, rejected=该组第一条失败轨迹) 的偏好对；
+               ref 在 theta0_cache 里按 θ₀ 预打，与 DpoMezo 同口径
+
+        全对组、或「全等但非 0」（words:N 那种整组同分的）不触发：前者模型已会，
+        后者仍有稠密奖励语义，不归兜底管。
+        """
+        self.fb_mode = getattr(self.args, "rl_fallback", "off") or "off"
+        self.fb_used = 0
+        self.fb_groups = 0
+        if self.fb_mode == "off":
+            return
+        k = max(1, self.args.group_size)
+        rewards = np.asarray([it["reward"] for it in items], dtype=np.float32)
+        # 判据在算法层（objectives.fallback_group_indices），与反传线共用同一份
+        fails = objectives.fallback_group_indices(rewards, k)
+        groups = [items[i:i + k] for i in fails]
+        if not groups:
+            print(f"rl-fallback({self.fb_mode})：{len(items) // k} 组里没有全错组，本次不会触发", flush=True)
+            return
+        for g in groups:
+            gold = next((x.get("gold") for x in g if x.get("gold")), "")
+            if not gold:
+                raise SystemExit(
+                    "--rl-fallback 需要回放里带 gold（采样任务 jsonl 的 `target` 字段，"
+                    "collect_rollouts 本来就会写）。当前文件没有 —— 把 target 带上重采，"
+                    "或显式 --rl-fallback off 走旧行为（全错组空转）")
+            if g[0].get("region") is not None:
+                self._warn_once("多轮轨迹（messages）的兜底暂不支持（prompt 头不是单一 "
+                                "span，gold 序列没法与采样头对齐）：该组保持空转")
+                continue
+            head = list(g[0]["seq"][:g[0]["start"]])
+            body = list(self.tok.encode(gold, parse_special=True))
+            if self.eos is not None and (not body or body[-1] != int(self.eos)):
+                body.append(int(self.eos))
+            if self.fb_mode == "sft":
+                gi = {"seq": head + body, "start": len(head), "nseg": len(body)}
+                for it in g:
+                    it["gold_item"] = gi        # 同组共享一份，SCORE 一次
+            else:                               # dpo：chosen=gold，rejected=首条失败轨迹
+                pair = {"c_seq": head + body, "c_start": len(head), "c_ntok": len(body),
+                        "r_seq": list(g[0]["seq"]), "r_start": int(g[0]["start"]),
+                        "r_ntok": int(g[0]["nseg"])}
+                for it in g:
+                    it["dpo_fb"] = pair
+            self.fb_groups += 1
+        print(f"rl-fallback({self.fb_mode})：{len(groups)} 组里 {self.fb_groups} 组全错"
+              f" → 那些步换 {'gold answer 的 CE' if self.fb_mode == 'sft' else '(gold, 失败轨迹) 的 DPO'}"
+              f"（其余组照常走组内优势）", flush=True)
+
+    def _fallback_loss(self, batch: list[dict]) -> float:
+        """zero_std 时的次级更新。返回值就是这一步的 loss —— 与 RL loss 同一条
+        θ±ε 差分链路（swap 在 loss_at 开头已做），pj 的语义不变：次级目标的梯度。"""
+        if max(float(x["reward"]) for x in batch) > 0.0:
+            return 0.0        # 全对 / 全等非 0：不触发兜底
+        if self.fb_mode == "off" or self.fb_groups == 0:
+            return 0.0
+        self.fb_used += 1
+        # 计数单位是 loss 评测（零阶一步 = θ±ε 两次 loss_at），不是训练步。
+        if self.fb_mode == "sft":
+            ces, seen = [], set()
+            for it in batch:
+                gi = it.get("gold_item")
+                if gi is None or id(gi) in seen:
+                    continue
+                seen.add(id(gi))
+                slp, _ = self.eng.score(gi["seq"])
+                seg = answer_seg(gi, slp)
+                # 损失也走算法层那份 sft_loss（mezo/backward 同一个数）
+                ces.append(float(objectives.sft_loss(seg)))   # nats/token
+            val = float(np.mean(ces)) if ces else 0.0
+            print(f"  [rl-fallback sft] 评测#{self.fb_used}：gold answer-CE {val:.4f}", flush=True)
+            return val
+        losses, seen = [], set()
+        for it in batch:
+            pair = it.get("dpo_fb")
+            if pair is None or id(pair) in seen:
+                continue
+            seen.add(id(pair))
+            sc, _ = self.eng.score(pair["c_seq"])
+            sr, _ = self.eng.score(pair["r_seq"])
+            pol_c = float(np.sum(answer_seg({"seq": pair["c_seq"], "start": pair["c_start"]}, sc)))
+            pol_r = float(np.sum(answer_seg({"seq": pair["r_seq"], "start": pair["r_start"]}, sr)))
+            margin = objectives.dpo_margin(pol_c, pol_r, pair["ref_c"], pair["ref_r"],
+                                           pair["c_ntok"], pair["r_ntok"])
+            beta_eff = objectives.dpo_beta_effective(self.args.beta,
+                                                     pair["c_ntok"], pair["r_ntok"])
+            losses.append(float(objectives.dpo_loss(margin, beta_eff)))
+        val = float(np.mean(losses)) if losses else 0.0
+        print(f"  [rl-fallback dpo] 评测#{self.fb_used}：margin-loss {val:.4f}", flush=True)
+        return val
+
     def batch_at(self, step: int) -> list[dict]:
         # 一步一组：优势必须在组内归一，跨组的批没有意义（--batch-rows 不参与）。
         k = self.args.group_size
@@ -1662,6 +1812,7 @@ class GrpoMezo(EngineMezo):
                 print(f"theta0 cache: {len(self.items) - k} score calls, "
                       f"{k} rows reused from sampler logprobs "
                       f"({min(len(reuse), self.args.sampler_logp_check)} verified)", flush=True)
+                self._fallback_refs()
                 return
             print(f"  WARN: 采样侧 logp 不可信 → {bad}", flush=True)
         elif reuse:
@@ -1672,6 +1823,25 @@ class GrpoMezo(EngineMezo):
             slp, _ = self.eng.score(it["seq"])
             it["old"] = answer_seg(it, slp)
         print(f"theta0 cache: {len(self.items)} score calls (grpo old logp)", flush=True)
+        self._fallback_refs()
+
+    def _fallback_refs(self) -> None:
+        """--rl-fallback dpo：兜底偏好对的 ref 侧（θ₀ 处 chosen/rejected 的 logp 和）。
+        必须在 θ₀ 缓存这一步打 —— 与 DpoMezo 的 ref 同一语义：margin 相对训练起点。"""
+        if getattr(self, "fb_mode", "off") != "dpo" or not getattr(self, "fb_groups", 0):
+            return
+        pairs, seen = [], set()
+        for it in self.items:
+            p = it.get("dpo_fb")
+            if p and id(p) not in seen:
+                seen.add(id(p))
+                pairs.append(p)
+        for p in pairs:
+            sc, _ = self.eng.score(p["c_seq"])
+            sr, _ = self.eng.score(p["r_seq"])
+            p["ref_c"] = float(np.sum(answer_seg({"seq": p["c_seq"], "start": p["c_start"]}, sc)))
+            p["ref_r"] = float(np.sum(answer_seg({"seq": p["r_seq"], "start": p["r_start"]}, sr)))
+        print(f"rl-fallback dpo: +{2 * len(pairs)} score calls（兜底对的 ref @ θ₀）", flush=True)
 
     def _verify_sampler_logp(self, idx: list[int]) -> str:
         """抽样复核采样侧 logp 与 θ₀ 处 SCORE 的差；返回空串=可信，否则返回原因。
@@ -1725,7 +1895,9 @@ class GrpoMezo(EngineMezo):
         rewards = np.array([it["reward"] for it in batch], dtype=np.float32)
         adv, _used, zero_std = objectives.group_advantages(rewards, self.args.group_size)
         if zero_std:
-            return 0.0        # 这组全对/全错：优势恒 0，没有可学方向（pj=0）
+            # 这组全对/全错：优势恒 0，没有可学方向。全错时模型连一个可模仿的正样本
+            # 都没采出来 —— 按次级算法兜底（gold answer 的 sft/dpo），不再空转。
+            return self._fallback_loss(batch)
         cfg = objectives.GrpoCfg(clip_low=self.args.clip, clip_high=self.args.clip)
         total_tok = sum(int(it["nseg"]) for it in batch)
         # 分母是这两条算法唯一的实质差别：grpo 除 token 数（每个 token 等权），
@@ -1866,6 +2038,16 @@ def main() -> int:
                          "dpo/grpo/luspo 的 eval 靠它才有 ce 一项（不然只有一个词的 logp）")
     ap.add_argument("--beta", type=float, default=0.1, help="DPO 的 β")
     ap.add_argument("--group-size", type=int, default=4, help="GRPO：一条 prompt 的采样条数 K")
+    ap.add_argument("--rl-fallback", choices=("sft", "dpo", "off"), default="sft", metavar="sft|dpo|off",
+                    help="RL 的次级算法兜底（默认 sft）：某组 K 条轨迹**全错**（奖励全 0）时"
+                         "优势恒 0、这一步什么也学不到 —— 模型连一个能模仿的正样本都没有。"
+                         "此时这一步不再空转，换成用 gold answer（采样任务里的 `target` 字段）"
+                         "做一次次级更新：sft = gold answer 的 answer-CE；dpo = "
+                         "(gold=chosen, 该组第一条失败轨迹=rejected) 的偏好对。判据与损失在"
+                         "算法层（objectives.fallback_group_indices / sft_loss / dpo_loss），"
+                         "与 backward 线共用同一份。奖励全对或全等但非 0 的组不触发"
+                         "（模型已会/有信号）。回放文件缺 target 时**报错**（不静默降级）"
+                         "—— 要旧行为请显式 --rl-fallback off")
     ap.add_argument("--clip", type=float, default=0.2, help="GRPO 裁剪 ε（对称）")
     ap.add_argument("--kl-coef", type=float, default=0.0, metavar="C",
                     help="对 θ₀ 的 KL 惩罚系数（k3 估计），默认 0=关。**零阶线是零成本**："
@@ -1939,11 +2121,12 @@ def main() -> int:
                          "实测它占 wall 的 ~28%%（800 步 374 s 里约 103 s）。被跳过的轮次只累积 "
                          "round_loss，不 swap、不评测、不早停；下一次全量评测照常记录整段均值。"
                          "只影响评测频率，训练数值逐位不变。")
-    ap.add_argument("--think-targets", choices=("both", "on", "off", "raw"), default="both",
-                    help="ce 目标形态。both = 每条样本进两遍（思考段+答案 / 纯答案），覆盖推理侧的"
-                         "两种形态；on/off 只训一种。补思考段的理由：模型推理时先写思考段，目标只放"
-                         "答案会让训练分布与推理分布不一致（2026-11-04 实测）。raw = 思考段形态但"
-                         "不补合成前言，目标逐字等于数据文本（回灌自己采的轨迹用这一档）")
+    ap.add_argument("--think-targets", choices=("auto", "both", "on", "off", "raw"), default="auto",
+                    help="ce 目标形态。**auto（默认）= 按数据判**：详细答案里有 `<think>`/`</think>` "
+                         "就训思考形态（on），没有就训纯答案（off）—— 目标里有思考段就必须开思考模板，"
+                         "没有就不该让模型先写一段没人监督的自由文本（见 common/data.dataset_thinks）。"
+                         "both = 每条样本进两遍（思考段+答案 / 纯答案）；on/off 只训一种。"
+                         "raw = 思考段形态但不补合成前言，目标逐字等于数据文本（回灌自己采的轨迹用这一档）")
     ap.add_argument("--eval-render", choices=("auto", "off", "on"), default="auto",
                     help="评测与 logp 探针走哪条通道。auto = 跟着 --think-targets"
                          "（off → 非思考模板，both/on/raw → 思考模板，历史口径不变）。"
@@ -1983,12 +2166,16 @@ def main() -> int:
     ap.add_argument("--zo-subspace-noise", type=float, default=0.2, metavar="F",
                     help="--zo-subspace 开启时子空间外各向同性噪声占比（0.2 = 噪声能量为子空间分量的 4%%）")
     ap.add_argument("--zo-rel", type=float, default=0.0, metavar="RELTARGET",
-                    help="每步相对步长上限（‖Δθ‖/‖θ‖，0=关=旧行为）。零阶步长天然没有尺度："
-                         "一步的位移是 lr·|pj|·‖z‖，而 z 是 3.3 M 维高斯，‖z‖≈1800，"
-                         "所以 lr 1e-4 下实测 rel 中位数 5e-2 —— 每步在参数空间里跳 ‖θ‖ 的 5%%，"
-                         "方向却是随机的：120 步后 ‖θ‖ 19.6→47，CE 只动 1%%，累积的信号被随机游走淹掉。"
-                         "给定上限后位移变成等速，动量里的一致分量线性累加、各向同性噪声按 √N 涨，"
-                         "方向才会朝真梯度收敛（等价于带信赖域约束的 normalized SGD）")
+                    help="每步相对步长上限（‖Δθ‖/‖θ_能动‖）。默认 0 = 关。"
+                         "**它只在 --zo-factors ab 下有意义，配默认的 b 会自锁**：分子分母都 ∝ ‖B‖，"
+                         "而 B 从 0 起、只能靠步长长大 ⇒ 每步被钉在 rel·‖B‖ 上不动，且不报错"
+                         "（2026-11-14 idH：rel 0.01 把每步压到 1.4e-4，17 步 ‖B‖ 没长）。"
+                         "所以 b 要用绝对 --zo-step-max，或改 ab（‖A‖ 是常数基线）。"
+                         "为什么需要尺度：一步的位移是 lr·|pj|·‖z‖，z 是 d 维高斯、‖z‖=√d，"
+                         "同一串 lr 在不同 d 下含义完全不同 —— 2026-11-18 实测 lr 1e-4 跑 400 步，"
+                         "‖b‖ 0.98→326、answer-CE 4.84→9.44、生成退化成固定模板。"
+                         "ab + 1e-2 时位移变成等速，累积的信号才不会被随机游走淹掉"
+                         "（等价于带信赖域约束的 normalized SGD）")
     ap.add_argument("--zo-step-max", type=float, default=0.0, metavar="STEPMAX",
                     help="每步**绝对**步长上限 ‖Δθ‖（LoRA 的 B 空间单位，0=关=旧行为）。"
                          "与 --zo-rel 的区别是可加性：上限固定 ⇒ N 步的总位移按 √N 增长，"
@@ -2005,12 +2192,15 @@ def main() -> int:
                     help="只更新层号区段（含两端），可带步长：`20,34` / `20` / `12,44,4`。"
                          "与 --zo-layers 互斥。为什么需要它：输出投影只给词表加与位置无关的偏置，"
                          "而「在位置 t 说 X」要改中间层写进 KV 的事实；历史 run 全是末 1–2 层")
-    ap.add_argument("--zo-projs", default="out", choices=["out", "all"], metavar="out|all",
+    ap.add_argument("--zo-projs", default="out", choices=["out", "all", "ffn", "all+ffn"],
+                    metavar="out|all|ffn|all+ffn",
                     help="adapter 挂哪些投影。out（默认，历史路径）= 每层只挂输出投影"
                          "（QSA 层 attn_output / GDN 层 ssm_out）；all = 对齐 InferZO 的全模块口径"
                          "（QSA 层加 attn_q/attn_k/attn_v，GDN 层加 attn_qkv/attn_gate，即引擎适配的"
-                         "全部 7 类矩阵）。注意：挂点多 ⇒ d 大 ⇒ 零阶信噪比 1/√d 更差，且每步的"
-                         "adapter 写盘/换装开销按挂点数放大 —— 这是能力项，不是默认更优")
+                         "全部 7 类矩阵）；ffn = 每层 shared expert 的 gate/up/down（专家 FFN 的入口，"
+                         "r=4 约 1.8 M 参数）；all+ffn = 两者相加。注意：挂点多 ⇒ d 大 ⇒ 零阶信噪比"
+                         "1/√d 更差，且每步的 adapter 写盘/换装开销按挂点数放大 —— 这是能力项，"
+                         "不是默认更优")
     ap.add_argument("--zo-block", type=int, default=0, metavar="K",
                     help="在上面的层集里**每步只动 K 层**、按步轮转（0=每步全动）。零阶信噪比 ∝ 1/√d，"
                          "而覆盖全层又要求 d 大，块坐标把两者拆开：每步 d 小、多步轮转覆盖全层。"
@@ -2156,19 +2346,34 @@ def main() -> int:
         if z_alpha != args.alpha:
             raise SystemExit(f"--resume 的 alpha 不匹配：{args.out} 是 {z_alpha}，本次 "
                              f"--alpha {args.alpha}；s=alpha/rank 变了等于换了一个 adapter")
-        restored = {int(l): {str(w): (np.array(z[f"a_{l}_{w}"], copy=True),
-                                     np.array(z[f"b_{l}_{w}"], copy=True))
-                            for w in ("ssm_out", "attn_output") if f"a_{l}_{w}" in z}
-                    for l in z["layers"]}
-        restored = {l: dict(v) for l, v in restored.items() if v}
+        # 按 npz 实际键名恢复**所有挂点**（不能硬编码 ssm_out/attn_output：
+        # all+ffn / shexp 的挂点也在 npz 里，漏掉的挂点会让恢复后的层字典不完整，
+        # write_adapter 按 layout 全挂点写就 KeyError 'attn_qkv'）。
+        import re as _re
+        restored = {}
+        for l in z["layers"]:
+            l = int(l)
+            ws = {}
+            for k in z.files:
+                m = _re.match(rf"a_{l}_(.+)$", k)
+                if not m:
+                    continue
+                w = m.group(1)
+                if f"b_{l}_{w}" in z:
+                    ws[w] = (np.array(z[f"a_{l}_{w}"], copy=True),
+                             np.array(z[f"b_{l}_{w}"], copy=True))
+            if ws:
+                restored[l] = ws
         # npz 只存**训过的层**（--zo-layers 1 ⇒ 只剩第 47 层）。self.theta 必须是全层：
         #   * swap(self.theta, ...) 在 before / theta0_cache 时直接拿它写 final/plus.gguf，
         #     而 write_adapter 按 layout 全层写，缺层就 KeyError；
         #   * _zo_step 的 th_plus/th_minus 也只带训过的层，要靠 {**self.theta, **th} 补全。
         # 未训层沿用同 seed/rank 的初始骨架（B=0 ⇒ ΔW=0，语义就是「没动」）。
+        # 层内必须 update 合并而非整体替换：npz 没存的挂点（例如那次 --zo-projs 只训了
+        # 一部分）要保留 init 骨架的完整挂点集合，层字典才满足 layout。
         theta = init_theta(layout, z_rank, args.seed)
         for l, v in restored.items():
-            theta[l] = v
+            theta[l].update(v)
         print(f"resumed theta from {args.out}: 恢复层 {sorted(restored)}，"
               f"其余 {len(layout) - len(restored)} 层保持 B=0", flush=True)
         # 引擎是拿 `--lora <init>` 起的：resume 时也必须有一份 adapter 才能起得来。

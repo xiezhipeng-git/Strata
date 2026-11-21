@@ -272,7 +272,7 @@ def check_trainable_lengths(trajs, max_seq, max_skip_frac=0.0, tok=None, log=pri
 
 def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logprobs,
              mask_truncated, epochs, steps, opt, params, log=print, objective="grpo",
-             max_skip_frac=0.0, kl_coef=0.0):
+             max_skip_frac=0.0, kl_coef=0.0, fallback="sft"):
     """一个 `GrpoCfg` 的训练循环；返回最后一步的指标（整批没梯度时返回空 dict）。
 
     抽成函数的理由：`_verify_grpo_switches.py` 要在**一次加载**里对同一批轨迹跑多个
@@ -307,6 +307,31 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
         # 所以这里把有效的组数也打出来 —— 它是"这一步到底有没有梯度"的唯一判据。
         adv_all, groups_used, zero_std = objectives.group_advantages(
             rewards, group, scale=cfg.scale_rewards)
+
+        # RL 的次级算法兜底：全错组这一步优势恒 0（模型连一个可模仿的正样本都没采出
+        # 来），原本是纯空转。判据在算法层（objectives.fallback_group_indices，与
+        # mezo 回放线共用同一份）；损失同样走算法层的 sft_loss —— 换成 gold answer
+        # 的监督更新，而不是让这一步空转。
+        fb_rows = []
+        if fallback != "off":
+            if fallback != "sft":
+                raise SystemExit("backward 线的兜底暂只支持 --rl-fallback sft"
+                                 "（dpo 兜底在 mezo 回放线）")
+            for g0 in objectives.fallback_group_indices(rewards, group):
+                t0 = sl[g0]
+                gold_text = (t0.get("target") or "").strip()
+                if not gold_text:
+                    raise SystemExit(
+                        "--rl-fallback 需要轨迹带 `target`（gold answer，采样任务本来"
+                        "就写进 jsonl 了）。缺它请重采，或显式 --rl-fallback off 走旧行为")
+                _pfb = prompt_spec(t0["prompt"])
+                pids_fb = t0.get("prompt_ids") or tok.apply_chat_template(
+                    _pfb[0], return_dict=False, **_pfb[1])
+                gids = tok(gold_text, add_special_tokens=False).input_ids
+                if eos_id is not None and (not gids or gids[-1] != eos_id):
+                    gids = gids + [eos_id]
+                fb_rows.append([torch.tensor([list(pids_fb) + gids], device=DEV),
+                                len(pids_fb), torch.tensor(gids, device=DEV)])
 
         # 先把这一批的序列准备好，old logprob 只算一次（这才是"旧策略"）
         prepared = []
@@ -390,7 +415,10 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
             e_ratios = []
             e_clipped = 0.0
             e_tis = 0.0
-            for row in prepared:
+            e_fb = 0
+            # 本步有兜底组时跳过 RL 行：zero_std 意味着全部组退化、每条 adv=0、
+            # RL loss 恒 0 —— 那些前向是纯浪费（GPU 显存紧张线上，一次前向都很贵）。
+            for row in (prepared if not fb_rows else []):
                 i, ids_t, n_prompt, labels, old, tis, ref, eng = row
                 adv = adv_all[i].item()
                 hidden = body(input_ids=ids_t, use_cache=False).last_hidden_state[0, n_prompt - 1 : -1]
@@ -426,7 +454,17 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
                 e_clipped += st["clip_frac"]
                 e_tis += st["tis"]
                 e_used += 1
-            if e_used == 0:
+            # 兜底行：gold answer 的监督更新。损失走算法层那份 sft_loss（mezo 同一个数），
+            # 分母是「每 token 平均」—— 与 SFT 算法的口径一致，不是整批 token 数。
+            for ids_fb, n_pf, labels_fb in fb_rows:
+                hidden = body(input_ids=ids_fb, use_cache=False).last_hidden_state[0, n_pf - 1: -1]
+                fb_lp = token_logprobs(hidden, head, labels_fb, chunk=128)
+                fb_loss = objectives.sft_loss(fb_lp)
+                fb_loss.backward()
+                e_loss += float(fb_loss.detach())
+                e_pg += float(fb_loss.detach())     # 对照口径里它就是全部损失
+                e_fb += 1
+            if e_used == 0 and not fb_rows:
                 log(f"step {step}: 整批没有可用轨迹（trunc {n_trunc} / toolong {n_toolong}"
                     f" / empty {n_empty}）—— 这一步没有梯度")
                 break
@@ -441,7 +479,7 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
                 "kl": (e_kl / e_used) if ref_snap else None, "kl_coef": kl_coef,
                 "old_local": n_old_local, "old_engine": n_old_engine,
                 "reward": float(rewards.mean()), "reward_std": float(rewards.std()),
-                "zero_std": zero_std, "groups": groups_used,
+                "zero_std": zero_std, "groups": groups_used, "fallback": e_fb,
                 "used": e_used, "batch": len(sl), "trunc": n_trunc,
                 "toolong": n_toolong, "empty": n_empty,
                 "len_check": len_stat,
@@ -456,7 +494,8 @@ def run_grpo(model, tok, trajs, cfg, *, group, batch, max_seq, max_new, old_logp
                 + (f"kl {e_kl / e_used:.5f}({kl_coef})  " if ref_snap else "")
                 + f"reward {last['reward']:.3f}  "
                 f"reward_std {last['reward_std']:.4f}  zero_std {zero_std}  groups {groups_used}  "
-                f"used {e_used}/{len(sl)}  trunc {n_trunc}  toolong {n_toolong}"
+                + (f"rl-fallback[sft] {e_fb}  " if fb_rows else "")
+                + f"used {e_used}/{len(sl)}  trunc {n_trunc}  toolong {n_toolong}"
                 f"  empty {n_empty}  tokens {total_tokens}  "
                 f"peak {last['peak']:.1f} GiB"
             )
@@ -489,7 +528,13 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=3)
     ap.add_argument("--group", type=int, default=4, help="每条 prompt 采样几条")
     ap.add_argument("--batch", type=int, default=2, help="每步用几条 prompt")
-    ap.add_argument("--max-new", type=int, default=96)
+    ap.add_argument("--max-new", type=int, default=0,
+                    help="每条轨迹的生成预算。**默认 0 = 不设上限**：引擎把 `max_tokens <= 0` "
+                         "解释成「用满剩余上下文」。给正数就是人为截断 —— 长推理链每条都停在半路，"
+                         "而轨迹照样能被判分，「没答完」于是被记成「答错」")
+    ap.add_argument("--allow-truncated", action="store_true",
+                    help="允许轨迹以 `finish_reason == length` 收尾。默认不允许：撞上限的轨迹"
+                         "不是「模型答不出」，用它算奖励/优势是错的读数")
     ap.add_argument("--max-seq", type=int, default=768,
                     help="训练侧接受的单条序列长度上限（prompt+completion）。默认 768 是配 "
                          "`--max-new 96` 的身份训练用的；训数学/长推理链必须显式调大，"
@@ -498,6 +543,11 @@ def main() -> int:
                     help="允许被 `--max-seq` 丢掉的轨迹比例，默认 0 = 一条都不许丢（超了报错）。"
                          "GRPO 轨迹长度不可控，确有长尾时要显式给这个值，别指望静默筛样本")
     ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--rl-fallback", choices=("sft", "off"), default="sft", metavar="sft|off",
+                    help="RL 的次级算法兜底（默认 sft）：全错组（奖励全 0）优势恒 0，"
+                         "这一步换成 gold answer（`target` 字段）的监督更新。判据与损失"
+                         "在算法层（objectives.fallback_group_indices / sft_loss），"
+                         "与 mezo 回放线共用同一份。缺 target 报错，不静默降级")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-method", choices=("lora", "unilora"), default="lora",
@@ -617,6 +667,16 @@ def main() -> int:
     for t in trajs:
         t["reward"] = reward_of(t)
 
+    # 截断门：`finish_reason == length` 的轨迹的文本与 logp 都是「被砍断的半句话」。
+    # 它会让 reward 恒为 0（看起来是「这题不会」），而真正的原因是没有生成预算。
+    cut = [t for t in trajs if t.get("finish_reason") == "length"]
+    if cut:
+        print(f"!! {len(cut)}/{len(trajs)} 条轨迹以 `finish_reason == length` 收尾：撞上了生成预算"
+              f"（--max-new {args.max_new}），不是模型答不出。先改成 --max-new 0（用满上下文，默认）"
+              f"再采；确认要留下时给 --allow-truncated。", flush=True)
+        if not args.allow_truncated:
+            raise SystemExit(2)
+
     # 长度门（提前版）：此刻还没加载 21.8 GiB 的学生，用引擎回显的 prompt_ids / token_ids 判定，
     # 一条都训不了就立刻退出。缺字段时判不了 —— run_grpo 在加载 tokenizer 后会再判一次（精确）。
     check_trainable_lengths(trajs, args.max_seq, args.max_skip_frac, tok=None)
@@ -667,7 +727,7 @@ def main() -> int:
         max_seq=args.max_seq, max_new=args.max_new, old_logprobs=args.old_logprobs,
         mask_truncated=args.mask_truncated, epochs=args.epochs, steps=args.steps,
         opt=opt, params=params, objective=args.objective,
-        max_skip_frac=args.max_skip_frac, kl_coef=args.kl_coef)
+        max_skip_frac=args.max_skip_frac, kl_coef=args.kl_coef, fallback=args.rl_fallback)
     if not last:
         print("整个训练没有产生任何梯度：每一批都被跳过或组内 std=0", flush=True)
 

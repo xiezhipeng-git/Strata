@@ -18,13 +18,20 @@ import urllib.request
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def chat(base_url: str, messages: list[dict], *, model: str, max_tokens: int = 128,
+def chat(base_url: str, messages: list[dict], *, model: str, max_tokens: int = 0,
          temperature: float = 1.0, top_p: float = 0.95, seed: int | None = None,
          timeout: float = 600.0, enable_thinking: bool | None = None,
-         reasoning_effort: str | None = None) -> dict:
+         reasoning_effort: str | None = None, extra_sampling: dict | None = None) -> dict:
     """`reasoning_effort` 必须与训练侧同档：模板默认 `xhigh`，会插一整段 system 指令。
     实测（2026-11-18）不传时采样 prompt 21 token、训练模板 61 token —— 两条不同的上下文，
-    奖励与 logp 就都落在不是训练用的那条上。"""
+    奖励与 logp 就都落在不是训练用的那条上。
+
+    `max_tokens` 默认 **0 = 不设上限**：`serve/server.py` 把 `max_tokens <= 0` 解释成
+    「用满剩余上下文」（`max_new = ctx - 8 - len(prompt)`），超了也只收敛到剩余空间、不报错。
+    所以「写不写得完」由上下文窗口决定，不由客户端的一个小数决定 —— 给 48/128 这种值会让
+    长推理链每条都截在半路，而那**不报错**，只是把「没答完」记成「答错」，训练就在这种
+    数据上跑。真要截断（例如刻意做短回答）必须显式给正数，并自己看 `finish_reason`。
+    """
     payload = {
         "model": model,
         "messages": messages,
@@ -35,6 +42,10 @@ def chat(base_url: str, messages: list[dict], *, model: str, max_tokens: int = 1
         "top_logprobs": 0,
         "strata_rollout": True,
     }
+    # 显式压过 server 的 model_card_sampling 默认（qwen4exp thinking 卡面带 top_k 20 等，
+    # 不传就会漏进来 —— T=0 也挡不住 top_k 截断翻 token，rollout/评测口径就分叉了）
+    if extra_sampling:
+        payload.update(extra_sampling)
     _kw = {}
     if enable_thinking is not None:
         _kw["enable_thinking"] = enable_thinking
