@@ -482,7 +482,10 @@ class Deps(unittest.TestCase):
         这是"零阶线装完引擎就能跑"的可执行版本：核心层一旦多出一个包，这条就红，
         而不是等人跑到一半才发现要 pip install。
         """
-        req = Path(__file__).resolve().parents[2] / "requirements.txt"
+        root = Path(__file__).resolve().parents[2]
+        req = root / "requirements.txt"
+        if not req.is_file():                        # 0.2.9: the tree's requirements live under terminal/
+            req = root / "terminal" / "requirements.txt"
         text = req.read_text(encoding="utf-8")
         have = set()
         for line in text.splitlines():

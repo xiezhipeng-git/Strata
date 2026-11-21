@@ -1,7 +1,7 @@
 """LoRA adapter 的磁盘格式与几何（GGUF 侧）。
 
 引擎的 `LORA <file>` 换表要求张量集合与形状全程不变，所以 rank 在训练期间固定；
-写盘走 tools/gguf_writer.py（与引擎读的那份格式同源）。
+写盘走 terminal/tools/gguf_writer.py（与引擎读的那份格式同源）。
 """
 
 from __future__ import annotations
@@ -12,8 +12,11 @@ import sys
 import numpy as np
 
 _REPO = pathlib.Path(__file__).resolve().parents[2]
-if str(_REPO / "tools") not in sys.path:
-    sys.path.insert(0, str(_REPO / "tools"))
+_TOOLS = _REPO / "terminal" / "tools"            # (0.2.9: tools/ moved under terminal/)
+if not _TOOLS.is_dir():
+    _TOOLS = _REPO / "tools"
+if str(_TOOLS) not in sys.path:
+    sys.path.insert(0, str(_TOOLS))
 from gguf_writer import GGUFWriter, _Tensor  # noqa: E402
 
 def read_geometry(gguf_path: str) -> dict:
