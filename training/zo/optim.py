@@ -97,6 +97,26 @@ def rel_cap_would_selflock(facs: tuple[str, ...], norm_moving0: float) -> bool:
     return "a" not in facs and norm_moving0 <= 0.0
 
 
+def theta_guard_exceeded(norm: float, norm0: float, max_rel: float) -> bool:
+    """`--theta-max-rel` 的停机判据：‖θ‖ > max_rel × ‖θ₀‖。
+
+    为什么需要它（2026-11-22 identity v6/time 4000 步实测）：零阶的位移是**纯累积**的，
+    `--zo-step-max` 只限制单步、不限制总量，`step_max` 一旦被钉死（本例 4000/4000 步），
+    θ 就以恒定速度随机游走。‖θ‖ 2.82→5.85（2.07×）时生成掉进重复环，2.96× 时保持集
+    48 题从 44 掉到 3 —— 而训练侧的 loss 曲线全程在降，**没有任何一个读数会提前报警**。
+    这条是唯一在「已损坏」之前就能触发的读数。
+
+    0 / 非正 / NaN 一律不触发：给了非法值绝不能把训练停在第 0 步。
+    """
+    try:
+        max_rel, norm, norm0 = float(max_rel), float(norm), float(norm0)
+    except (TypeError, ValueError):
+        return False
+    if not (max_rel > 0 and norm0 > 0 and norm == norm):
+        return False
+    return norm > norm0 * max_rel
+
+
 class Mezo:
     """零阶优化器：持超参，跑一步，原地改 θ 与动量，返回读数。
 

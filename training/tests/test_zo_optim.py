@@ -27,7 +27,8 @@ for _d in (_p.Path(__file__).resolve().parent, _p.Path(__file__).resolve().paren
     if str(_d) not in _s.path:
         _s.path.insert(0, str(_d))
 
-from zo.optim import Mezo, theta_norms, rel_cap_would_selflock       # noqa: E402
+from zo.optim import (Mezo, theta_norms, rel_cap_would_selflock,       # noqa: E402
+                      theta_guard_exceeded)
 
 
 def make_theta(b_scale=0.0, rank=2, n_in=8, n_out=4):
@@ -341,6 +342,37 @@ class TestRelCapSelflock(unittest.TestCase):
                            f"关掉上限时 20 步必须真的走（≈√20），实测 {free_b / s1:.2f}×")
         self.assertGreater(cap_ab, 3.0 * cap_b,
                            f"同样的 rel 换成 ab 有常数分母、不再自锁：ab {cap_ab:.3g} vs b {cap_b:.3g}")
+
+
+class TestThetaGuard(unittest.TestCase):
+    """`--theta-max-rel`：‖θ‖ 的**总量**上限（单步上限管不住累积）。
+
+    为什么必须有这条：2026-11-22 identity v6 4000 步，`--zo-step-max 0.03` 被钉死 4000/4000 步，
+    ‖θ‖ 2.82→5.85（2.07×）时生成进复读环、2.96× 时保持集 44/48→3/48，而 loss/ce 全程在降
+    —— 训练侧没有任何读数会提前报警，只有 ‖θ‖ 涨幅可以。判据必须「给了非法值绝不误停」，
+    否则一个 `--theta-max-rel 0` 的笔误会把训练停在第 0 步。
+    """
+
+    def test_triggers_only_above_limit(self):
+        self.assertFalse(theta_guard_exceeded(5.0, 2.8, 2.0))
+        self.assertFalse(theta_guard_exceeded(5.6, 2.8, 2.0))     # 恰好 2.0× 不算越界
+        self.assertTrue(theta_guard_exceeded(5.61, 2.8, 2.0))
+        self.assertTrue(theta_guard_exceeded(5.85, 2.82, 1.8))    # v6 的实际崩坏点
+
+    def test_off_and_junk_never_stop(self):
+        for rel in (0.0, -1.0, None, float("nan"), "off"):
+            self.assertFalse(theta_guard_exceeded(99.0, 2.8, rel), f"rel={rel!r} 不该触发")
+        # 起点范数为 0 / 读数 NaN：判不了，就不能停
+        self.assertFalse(theta_guard_exceeded(99.0, 0.0, 2.0))
+        self.assertFalse(theta_guard_exceeded(float("nan"), 2.8, 2.0))
+
+    def test_guard_reads_the_same_norm_the_log_prints(self):
+        """守护必须用日志里那一个 `|theta|`（a+b 全量），不能偷偷换成分量范数。"""
+        theta = make_theta(b_scale=1.0)
+        full, _moving = theta_norms(theta, list(LAYOUT), ("a", "b"))
+        self.assertAlmostEqual(full, float(np.sqrt(2 * 8 * 0.25 + 4 * 2 * 1.0)), places=6)
+        self.assertTrue(theta_guard_exceeded(full * 1.01, full, 1.001))
+        self.assertFalse(theta_guard_exceeded(full, full, 1.001))
 
 
 if __name__ == "__main__":

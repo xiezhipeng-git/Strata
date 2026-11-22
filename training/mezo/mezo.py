@@ -115,7 +115,8 @@ import objectives  # noqa: E402  共享目标函数（numpy 路径；与反传�
 import guard        # noqa: E402  token 选择（select_mask）与反传线共用同一份纯逻辑
 import metrics as mtr  # noqa: E402  训练指标出口（JSONL + 本地 HTTP，RSI 控制器轮询用）
 import report  # noqa: E402  回环内的评测与记录（判据展示只在这里改）
-from zo.optim import Mezo, theta_norms, rel_cap_would_selflock  # noqa: E402  零阶估计器（算法只在 zo/optim.py 有一份）
+from zo.optim import (Mezo, theta_norms, rel_cap_would_selflock,  # noqa: E402
+                      theta_guard_exceeded)   # 零阶估计器（算法只在 zo/optim.py 有一份）
 from common.chat import (load_template, load_tokenizer, load_transcript_template,
                          template_thinks)
 from common.data import (IDENTITY_ROWS, SYSTEM_IDENTITY, THINK_EN, THINK_GEN_EN, THINK_GEN_ZH,
@@ -1123,6 +1124,14 @@ class EngineMezo:
                   f"每步 d = {_blk / len(layers):.3f} × 全层，"
                   f"每层位移上限 = step-max/√{_blk}"
                   f"（动量在 {_rounds} 步后衰减到 {args.momentum ** _rounds:.3f}）", flush=True)
+        # `--theta-max-rel`：‖θ‖ 的停机上限。单步上限管不住总量（step_max 钉死时 θ 匀速游走），
+        # 而「训坏」的唯一可观测前兆就是 ‖θ‖ 的涨幅 —— v6 在 2.07× 处生成已进复读环、
+        # 2.96× 处保持集从 44/48 掉到 3/48，期间 loss 曲线一路在降。
+        _g_rel = float(getattr(args, "theta_max_rel", 0.0) or 0.0)
+        _th0 = theta_norms(theta, layers, ("a", "b"))[0] if _g_rel > 0 else 0.0
+        if _g_rel > 0:
+            print(f"theta-max: |theta| 起点 {_th0:.3f}，上限 {_g_rel:.2f}× = {_th0 * _g_rel:.3f}"
+                  f"（到点即停，产物仍是 final.gguf）", flush=True)
         for step in range(args.steps):
             t0 = time.time()
             batch = self.batch_at(step)
@@ -1169,6 +1178,14 @@ class EngineMezo:
                            rel=rel, theta_norm=norm, theta_norm_train=mov,
                            lr=lr_now, ms=round(ms, 1),
                            tok=int(sum(len(it.get("seq") or it.get("c_seq") or []) for it in batch)))
+
+            if theta_guard_exceeded(norm, _th0, _g_rel):
+                print(f"theta-max: |theta| {norm:.3f} > {_g_rel:.2f}×{_th0:.3f}"
+                      f"（{norm / max(_th0, 1e-9):.2f}×）⇒ 第 {step + 1} 步停训。"
+                      f"再往后就是 v6 那条路（生成进复读环、保持集崩）", flush=True)
+                self.sink.end(steps_done=step + 1, wall_s=round(time.time() - t_train0, 1),
+                              reason="theta-max")
+                break
 
             if args.eval_every and (step + 1) % args.eval_every == 0:
                 report.eval_step(self, succ_rows, t_train0, step=step,
@@ -2247,6 +2264,12 @@ def main() -> int:
                          "可以规划到「一个正常 LoRA 的范数」；而相对上限按当前范数的百分比放行，"
                          "B 从 0 起时第一步不生效、之后每步复利，300 步能把 ‖b‖ 从 16.8 抬到 460。"
                          "经验值：rank8×48 层取 0.01–0.03；配 --zo-rel 0 使用，两者同时给时取更严的")
+    ap.add_argument("--theta-max-rel", type=float, default=0.0, metavar="R",
+                    help="‖θ‖/‖θ₀‖ 的停机上限（0=关）。单步上限（--zo-step-max）管不住总位移："
+                         "上限一旦每步钉死，θ 就是以恒定速度随机游走，loss 曲线一路下降而生成"
+                         "已经崩了。实测 identity v6 4000 步：‖θ‖ 2.82→5.85（2.07×）时生成进"
+                         "复读环、保持集 48 题 44→5。给 1.5–1.8 可在「已损坏」之前停手；"
+                         "停训那一步的 θ 照样写成 final.gguf，不需要重跑。")
     ap.add_argument("--zo-layers", type=int, default=0, metavar="K",
                     help="只更新**末 K 层**（0=全部）。零阶单方向的信噪比是 1/√d，"
                          "d = Σ rank×(n_in+n_out)（48 层 rank8 ⇒ 3.34e6，末 2 层 rank4 ⇒ 6.97e4）。"
