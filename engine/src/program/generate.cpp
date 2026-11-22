@@ -18094,7 +18094,13 @@ int main(int argc, char** argv) {
             static std::unordered_map<unsigned long long, FrontierSlot> frontier_slots;
             static std::deque<unsigned long long> frontier_order;   // least-recently-used first
             static unsigned long long frontier_current_key = 0;     // the slot the path's replay state points at
-            constexpr size_t kFrontierSlotMaxCount = 16;
+            // The count cap has to clear the training set or the store does nothing: with 33 rows and a
+            // window of 1, a 16-slot store evicts row s exactly when it is needed again (33 > 16), so every
+            // step pays one full read.  Measured on the MeZO 2000-step run at layers [46,48): 2140 captures
+            // in 2000 steps = 333 s of 980 s, for sequences it had already read.  A count of 128 covers a
+            // small dataset outright; memory is still governed by the byte budget below, which is what
+            // actually bounds the cost (a slot the byte cap cannot hold never captures at all).
+            constexpr size_t kFrontierSlotMaxCount = 128;
             constexpr size_t kFrontierSlotMaxBytes = 640ull << 20;  // pinned-host budget for the whole store
             static size_t frontier_slot_bytes = 0;
             static bool frontier_slot_warned = false;
