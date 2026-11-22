@@ -545,6 +545,15 @@ class EngineMezo:
             loss_fn = raw_fn if base is None else (lambda th: raw_fn(th) - base)
         else:
             loss_fn = lambda th: self.loss_at(th, batch)  # noqa: E731
+        if getattr(self, "_prof", False):
+            _inner = loss_fn
+
+            def loss_fn(th):                     # noqa: F811 —— 只包一层计时，语义不变
+                t0 = time.perf_counter()
+                v = _inner(th)
+                self._prof_acc["forward"] += time.perf_counter() - t0
+                self._prof_acc["n"] += 1
+                return v
         out = opt.step(theta, vel, lr, loss_fn, rng, step_max=self._step_max_at(lr))
         # 上限钉死 = lr 曲线被重归一化吃掉。要计数，否则「调了 --lr-schedule 却没变化」
         # 在日志里完全看不出来（2026-11-21：v4 冷启动 1500 步把 12 题数学打成 1/12，
@@ -906,13 +915,24 @@ class EngineMezo:
         self.minus_path = os.path.join(args.work, "minus.gguf")
         self.final_path = os.path.join(args.work, "final.gguf")
 
+        # 步时去向：SCORE 只是其中一段。`STRATA_MEZO_PROFILE=1` 时按「写盘 / 热加载 / 前向」
+        # 三段累计，每 200 步报一次 —— 否则「一步 0.3 s」无法判断该优化哪一段
+        # （2026-11-22：`--zo-one-point` 把前向次数砍半，步时只从 310 ms 降到 273 ms）。
+        self._prof = os.environ.get("STRATA_MEZO_PROFILE") == "1"
+        self._prof_acc = {"write": 0.0, "lora": 0.0, "forward": 0.0, "n": 0}
+
         def swap(th: dict, path: str) -> None:
             # `--zo-layers` 下 th 可能只含被训的那几层（_zo_step 的 th_plus/th_minus 就是
             # 按 `layers` 拼的）。适配器文件必须写满全层 —— 引擎 lora_update 要求张量集合
             # 与形状不变 —— 未训层沿用 θ₀（B=0、A 仍是初始随机基），语义就是「没动」。
             full = th if len(th) == len(self.layout) else {**self.theta, **th}
+            t0 = time.perf_counter() if self._prof else 0.0
             write_adapter(path, self.layout, full, args.alpha)
+            t1 = time.perf_counter() if self._prof else 0.0
             eng.lora(os.path.abspath(path))    # 引擎 cwd 是它自己的目录：永不给相对路径
+            if self._prof:
+                self._prof_acc["write"] += t1 - t0
+                self._prof_acc["lora"] += time.perf_counter() - t1
         self.swap = swap
 
         self.items = self.items or self.load_items()
@@ -1131,6 +1151,19 @@ class EngineMezo:
             rel_disp = "  n/a" if rel != rel else f"{rel:.2e}"
             print(f"step {step:3d}: pj {pj_disp}  lr {lr_now:.2e}  |theta| {norm:.3f}"
                   f"  |b| {mov:.4f}  rel {rel_disp}  {ms:6.0f} ms{warn}", flush=True)
+            if getattr(self, "_prof", False) and (step + 1) % 200 == 0:
+                _a = self._prof_acc
+                _n = max(1, step + 1)
+                # `loss_at()` 内部就走 swap（写盘 + 热加载），所以前向计时把它们包在里面：
+                # 减掉才是纯 SCORE 的耗时，否则三段相加会超过总步时。
+                _fwd = _a["forward"] - _a["write"] - _a["lora"]
+                _fwd_n = max(1, _a["n"])
+                print(f"  profile/{_n}: 写盘 {1000*_a['write']/_n:.0f} ms/步"
+                      f" · 热加载 {1000*_a['lora']/_n:.0f} ms/步"
+                      f" · 前向 {1000*_fwd/_fwd_n:.1f} ms/次 ({_a['n']/_n:.1f} 次/步"
+                      f" = {1000*_fwd/_n:.0f} ms/步)"
+                      f" · 其余 {ms - 1000*(_a['write']+_a['lora']+_fwd)/_n:.0f} ms/步",
+                      flush=True)
             self.sink.step(step=step, round=step // per_epoch, loss=loss_mid,
                            pj=float(pj_arr.mean()), pj_std=float(pj_arr.std()) if len(pj_arr) > 1 else None,
                            rel=rel, theta_norm=norm, theta_norm_train=mov,
