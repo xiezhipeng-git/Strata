@@ -117,6 +117,41 @@ def theta_guard_exceeded(norm: float, norm0: float, max_rel: float) -> bool:
     return norm > norm0 * max_rel
 
 
+def theta_ema_init(theta: dict, layers: list) -> dict:
+    """给 `theta_ema_update` 建累积器：按层/挂点深拷贝一份 θ（B=0 起点就是全零）。"""
+    return {l: {w: (np.array(fa, dtype=np.float32, copy=True),
+                    np.array(fb, dtype=np.float32, copy=True))
+                for w, (fa, fb) in theta[l].items()} for l in layers}
+
+
+def theta_ema_update(avg: dict, theta: dict, layers: list, beta: float) -> None:
+    """`avg ← beta·avg + (1−beta)·θ`，就地（θ 是每步更新后的权重）。
+
+    为什么零阶特别需要这个（2026-11-22 实测）：`--zo-step-max` 恒定 ⇒ 每步位移都是同样的
+    0.03，1500 步的路径长 45，而 ‖θ−θ₀‖ 只到 2.95 —— 说明方向之间有大量相互抵消，路径是
+    「持续漂移 + 随机游走」的叠加。两者的效果完全不同：漂移贡献 logp 进展，随机游走只把 θ
+    推离 θ₀（正是让解码器退化的那一半）。EMA 对前者近似不动、对后者按 √(1/(1−β)) 压。
+
+    它和 `--anchor-weight`（KL 锚）不是一回事，也不能互相替代：锚在训练**过程中**施加约束，
+    会把「往目标走」和「乱走」一起压（实测注入 8/20→1/20）；EMA 只改**取哪个点当产物**，
+    轨迹一步不动，所以没有这个副作用。
+
+    beta 越接近 1 窗口越长：0.99 ⇒ 100 步。调用方负责保证 0 < beta < 1。
+    """
+    if not 0.0 < float(beta) < 1.0:
+        raise ValueError(f"beta 要在 (0,1) 之间，收到 {beta!r}："
+                         "1 会把 avg 冻在起点（看起来像平均了、实际一步没动），0 就是不做平均")
+    keep = np.float32(beta)
+    fresh = np.float32(1.0) - keep
+    for l in layers:
+        for w, (fa, fb) in theta[l].items():
+            ea, eb = avg[l][w]
+            ea *= keep
+            ea += fresh * fa
+            eb *= keep
+            eb += fresh * fb
+
+
 class Mezo:
     """零阶优化器：持超参，跑一步，原地改 θ 与动量，返回读数。
 

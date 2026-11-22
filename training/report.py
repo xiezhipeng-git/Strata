@@ -21,18 +21,25 @@ import time
 
 
 def eval_step(trainer, succ_rows, t_train0: float, step: int | None = None,
-              rnd: int | None = None) -> None:
+              rnd: int | None = None, path: str | None = None,
+              theta: dict | None = None) -> None:
     """一次回环内评测：probe 读数 + 可选 success/graded 判分 → 打印 + 发指标。
 
     `trainer` 只按用到的属性鸭子取：`args` `eng` `tok` `eval_render` `theta`
     `final_path` `swap` `answer_ce()` `lp0` `ce0` `sink`；判据相关的是
     `graded_slots`（由宿主从 `identity_score.slots_from_triples` 抽好后挂上）。
+
+    `path` / `theta`：这次评哪组权重、写到哪里（默认 `trainer.theta` →
+    `trainer.final_path`）。`--theta-avg` 要评平均后的 θ̄，而 `final.gguf` 必须留着 θ_T
+    —— 两者是同一轨迹上的两个点，覆盖掉就再也比不了。θ 走参数传，不改 `trainer.theta`：
+    后者是 `swap()` 补齐未训层时的基准，换成只含被训层的 θ̄ 会让它 KeyError。
     """
     from common.encode import name_logprob
     from _eval_hard import success_eval
 
     args, eng, tok, render = trainer.args, trainer.eng, trainer.tok, trainer.eval_render
-    trainer.swap(trainer.theta, trainer.final_path)
+    trainer.swap(theta if theta is not None else trainer.theta,
+                 path or trainer.final_path)
     lp_now = name_logprob(eng, tok, render, args.probe, args.word)
     ce_now = trainer.answer_ce()
     text = ""

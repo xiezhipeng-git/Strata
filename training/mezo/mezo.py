@@ -116,7 +116,7 @@ import guard        # noqa: E402  token 选择（select_mask）与反传线共�
 import metrics as mtr  # noqa: E402  训练指标出口（JSONL + 本地 HTTP，RSI 控制器轮询用）
 import report  # noqa: E402  回环内的评测与记录（判据展示只在这里改）
 from zo.optim import (Mezo, theta_norms, rel_cap_would_selflock,  # noqa: E402
-                      theta_guard_exceeded)   # 零阶估计器（算法只在 zo/optim.py 有一份）
+                      theta_guard_exceeded, theta_ema_init, theta_ema_update)
 from common.chat import (load_template, load_tokenizer, load_transcript_template,
                          template_thinks)
 from common.data import (IDENTITY_ROWS, SYSTEM_IDENTITY, THINK_EN, THINK_GEN_EN, THINK_GEN_ZH,
@@ -1128,10 +1128,23 @@ class EngineMezo:
         # 而「训坏」的唯一可观测前兆就是 ‖θ‖ 的涨幅 —— v6 在 2.07× 处生成已进复读环、
         # 2.96× 处保持集从 44/48 掉到 3/48，期间 loss 曲线一路在降。
         _g_rel = float(getattr(args, "theta_max_rel", 0.0) or 0.0)
-        _th0 = theta_norms(theta, layers, ("a", "b"))[0] if _g_rel > 0 else 0.0
+        # θ₀ 的范数总是算（一次 7 MB pass）：停机闸与 `--theta-avg` 的「省掉多少位移」都要它。
+        _th0 = theta_norms(theta, layers, ("a", "b"))[0]
         if _g_rel > 0:
             print(f"theta-max: |theta| 起点 {_th0:.3f}，上限 {_g_rel:.2f}× = {_th0 * _g_rel:.3f}"
                   f"（到点即停，产物仍是 final.gguf）", flush=True)
+        # `--theta-avg`：adapter 的指数滑动平均。**只改产物，不改轨迹** —— 每一步照旧用 θ_t
+        # 前向，平均的是「拿哪个点去生成」。零阶的每步位移方向都带噪声，θ_T 里混着两部分：
+        # 持续漂移（方向一致、贡献 logp 进展）和随机游走（方向随机、只贡献 ‖θ‖ 却决定伤害）。
+        # 平均对漂移近似不动、对随机游走按 √窗口 压低。第一版从**第 1 步之后**起算，
+        # 不含 θ₀：否则 1/(1−BETA) 步之内会把未训练的起点混进来，读数变成「平均了但没学到」。
+        _avg_beta = float(getattr(args, "theta_avg", 0.0) or 0.0)
+        _avg = None
+        if _avg_beta > 0:
+            if not 0.0 < _avg_beta < 1.0:
+                raise SystemExit(f"--theta-avg 要在 (0,1) 之间（收到 {_avg_beta:g}）；0 是关")
+            print(f"theta-avg: beta {_avg_beta:g}，有效窗口 {1.0 / (1.0 - _avg_beta):.0f} 步；"
+                  "收尾会额外写 avg.gguf 并对它跑一次完整评测", flush=True)
         for step in range(args.steps):
             t0 = time.time()
             batch = self.batch_at(step)
@@ -1142,6 +1155,11 @@ class EngineMezo:
                 slot=(step % len(self.items)) if len(batch) == 1 else None)
             if loss_mid is not None:
                 round_loss.append(loss_mid)
+            if _avg_beta > 0:                      # --theta-avg：逐步 EMA（θ 已就地更新完）
+                if _avg is None:
+                    _avg = theta_ema_init(theta, layers)
+                else:
+                    theta_ema_update(_avg, theta, layers, _avg_beta)
 
             ms = (time.time() - t0) * 1000.0
             # 相对更新量 = ‖lr·v‖ / ‖θ_能动‖。这条比 lr 本身有判据价值：绝对步长要看参数
@@ -1264,6 +1282,21 @@ class EngineMezo:
             print(f"replay: {_c} capture(s) {_rs['capture_s']:.0f} s + {_r} replay(s) "
                   f"{_rs['replay_s']:.0f} s = {_now:.0f} s（若每次都全读：{_would:.0f} s，"
                   f"省 {100.0 * (1.0 - _now / max(_would, 1e-9)):.0f}%）", flush=True)
+        # `--theta-avg` 的产物单独评一次。θ_T 与 θ̄ 是**同一条轨迹上的两个点**，差别只在
+        # 「取哪个去生成」：若 θ̄ 在更小的位移上给出同样的注入量，那说明进展是漂移、伤害来自
+        # 随机游走，平均就是免费的收益；若 θ̄ 只是「稍微落后一点、指标同时变差」，那说明漂移
+        # 本来就是主导，平均没有意义 —— 这一比能把两种情形分开，不需要再跑一条臂。
+        if _avg is not None:
+            _avgp = os.path.join(args.work, "avg.gguf")
+            _tn = theta_norms(theta, layers, ("a", "b"))[0]
+            _an = theta_norms(_avg, layers, ("a", "b"))[0]
+            print(f"  avg: |theta| {_an:.3f}（θ_T 是 {_tn:.3f}，EMA 窗口 "
+                  f"{1.0 / (1.0 - _avg_beta):.0f} 步；"
+                  f"只少了 {100.0 * (1.0 - (_an - _th0) / max(_tn - _th0, 1e-9)):.0f}% 的位移）",
+                  flush=True)
+            report.eval_step(self, succ_rows, t_train0, step=max(done - 1, 0),
+                             path=_avgp, theta=_avg)
+            print(f"  avg: 产物 {_avgp}", flush=True)
         self.sink.end(steps_done=done, steps_total=args.steps, wall_s=round(wall, 1),
                       s_per_step=round(wall / max(done, 1), 2), reason="done",
                       lp1=lp1, ce1=ce1, d_lp=lp1 - self.lp0,
@@ -1275,6 +1308,10 @@ class EngineMezo:
             for w, (a, b) in theta[l].items():
                 out[f"a_{l}_{w}"] = a
                 out[f"b_{l}_{w}"] = b
+                if _avg is not None:            # --theta-avg：两套权重都存，事后可离线复评
+                    ea, eb = _avg[l][w]
+                    out[f"a_{l}_{w}_avg"] = ea
+                    out[f"b_{l}_{w}_avg"] = eb
         np.savez(args.out, **out)
         print(f"saved theta: {args.out}\n"
               f"saved adapter: {self.final_path} (engine --lora / ab_identity)", flush=True)
@@ -2270,6 +2307,13 @@ def main() -> int:
                          "已经崩了。实测 identity v6 4000 步：‖θ‖ 2.82→5.85（2.07×）时生成进"
                          "复读环、保持集 48 题 44→5。给 1.5–1.8 可在「已损坏」之前停手；"
                          "停训那一步的 θ 照样写成 final.gguf，不需要重跑。")
+    ap.add_argument("--theta-avg", type=float, default=0.0, metavar="BETA",
+                    help="对 adapter 做指数滑动平均（0=关），有效窗口 1/(1−BETA) 步，"
+                         "产物写 <work>/avg.gguf 并在收尾时对它跑一遍完整评测。"
+                         "零阶每步位移方向都带噪声，路径是「漂移 + 随机游走」的叠加：随机游走"
+                         "只把 θ 推离 θ₀（伤解码器）而不贡献 logp 进展，平均能把这一半压掉而留住"
+                         "漂移。它改的是**取哪个点当产物**，不改轨迹 —— 与 --anchor-weight 不同，"
+                         "后者在训练中施加约束、会连注入一起压死。建议 0.99（窗口 100 步）。")
     ap.add_argument("--zo-layers", type=int, default=0, metavar="K",
                     help="只更新**末 K 层**（0=全部）。零阶单方向的信噪比是 1/√d，"
                          "d = Σ rank×(n_in+n_out)（48 层 rank8 ⇒ 3.34e6，末 2 层 rank4 ⇒ 6.97e4）。"

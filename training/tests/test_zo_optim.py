@@ -28,7 +28,7 @@ for _d in (_p.Path(__file__).resolve().parent, _p.Path(__file__).resolve().paren
         _s.path.insert(0, str(_d))
 
 from zo.optim import (Mezo, theta_norms, rel_cap_would_selflock,       # noqa: E402
-                      theta_guard_exceeded)
+                      theta_guard_exceeded, theta_ema_init, theta_ema_update)
 
 
 def make_theta(b_scale=0.0, rank=2, n_in=8, n_out=4):
@@ -373,6 +373,65 @@ class TestThetaGuard(unittest.TestCase):
         self.assertAlmostEqual(full, float(np.sqrt(2 * 8 * 0.25 + 4 * 2 * 1.0)), places=6)
         self.assertTrue(theta_guard_exceeded(full * 1.01, full, 1.001))
         self.assertFalse(theta_guard_exceeded(full, full, 1.001))
+
+
+class TestThetaEma(unittest.TestCase):
+    """`--theta-avg`：把「漂移」和「随机游走」分开取。
+
+    零阶每步位移的**模长**被 `--zo-step-max` 钉住，所以路径是定长的随机游走叠在一条漂移上：
+    漂移贡献 logp 进展，随机游走只把 θ 推离 θ₀（解码器退化就发生在这条轴上）。EMA 对前者
+    近似不动、对后者按 √窗口 压掉。判据不能只看「平均后 ‖θ‖ 变小了」——那连「什么都没学到」
+    也满足；必须同时验「恒定漂移会原样保留」。
+    """
+
+    def test_init_is_a_deep_copy(self):
+        theta = make_theta(b_scale=1.0)
+        avg = theta_ema_init(theta, list(LAYOUT))
+        avg[0]["ssm_out"][1][0, 0] = 99.0
+        self.assertEqual(float(theta[0]["ssm_out"][1][0, 0]), 1.0)
+
+    def test_one_update_moves_by_one_minus_beta(self):
+        theta = make_theta(b_scale=0.0)
+        avg = theta_ema_init(theta, list(LAYOUT))
+        theta[0]["ssm_out"][1][:, :] = 1.0
+        theta_ema_update(avg, theta, list(LAYOUT), 0.75)
+        self.assertAlmostEqual(float(avg[0]["ssm_out"][1][0, 0]), 0.25, places=6)
+
+    def test_constant_drift_is_kept(self):
+        """θ 恒为 d ⇒ avg → d（窗口外无残留）：平均不能把「学到的东西」也一起抹掉。"""
+        theta = make_theta(b_scale=0.0)
+        avg = theta_ema_init(theta, list(LAYOUT))
+        theta[0]["ssm_out"][1][:, :] = 2.0
+        for _ in range(400):                      # β 0.99 ⇒ 400 步 ≫ 窗口 100
+            theta_ema_update(avg, theta, list(LAYOUT), 0.99)
+        self.assertAlmostEqual(float(avg[0]["ssm_out"][1][0, 0]), 2.0, delta=0.05)
+
+    def test_noise_is_suppressed_drift_is_not(self):
+        """本函数的全部理由：同样的 ‖位移‖，纯噪声被压、恒定漂移留下。
+
+        起点要先落在稳态上：累积器是从**第一次看到的 θ** 起算的，所以从 0 起会带一段
+        `β^T` 的滞后尾巴（200 步 0.99 还剩 13%），那是初始条件不是噪声；从噪声相位起算
+        则会把那一次的噪声整段留在里面。两边都不是本函数要证明的事。
+        """
+        drift = 1.0
+        noise = 1.0
+        theta = make_theta(b_scale=0.0)
+        theta[0]["ssm_out"][1][:, :] = drift              # 累积器从「干净的漂移」起算
+        avg = theta_ema_init(theta, list(LAYOUT))
+        for t in range(1, 200):
+            sign = 1.0 if t % 2 == 0 else -1.0            # 零均值交替 ⇒ 期望位移 0
+            theta[0]["ssm_out"][1][:, :] = drift + sign * noise
+            theta_ema_update(avg, theta, list(LAYOUT), 0.99)
+        got = float(avg[0]["ssm_out"][1][0, 0])
+        self.assertAlmostEqual(got, drift, delta=0.05)     # 漂移在，只剩 (1−β)/(1+β) 的波纹
+        self.assertGreater(abs(drift + noise - got), 0.5)  # 而 θ_T 还在 ±1 的噪声里
+
+    def test_rejects_out_of_range_beta(self):
+        theta = make_theta(b_scale=0.0)
+        avg = theta_ema_init(theta, list(LAYOUT))
+        for beta in (0.0, 1.0, 1.5, -0.1):
+            with self.assertRaises(ValueError):
+                theta_ema_update(avg, theta, list(LAYOUT), beta)
 
 
 if __name__ == "__main__":
