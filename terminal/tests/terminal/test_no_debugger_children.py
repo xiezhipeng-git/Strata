@@ -157,7 +157,8 @@ class EntryPointsSetItForEveryChild(unittest.TestCase):
 # listed here (and, when it starts a Strata program - the engine, the picture reader, sd-cli, setup, a worker - it builds its environment with
 # quiet_crash_env or inherits the one an entry point set).
 STRATA_PROGRAMS = {
-    "serve/server.py": 6,              # the engine, the picture reader (env from child_env / vision_env), the strata-device probe, before_load commands, the training session's engine (train_bridge_env)    "serve/server_parts/engines.py": 2,   # (moved out of serve/server.py unchanged, file split)
+    "serve/server.py": 7,              # the engine, the picture reader (env from child_env / vision_env), the strata-device probe, before_load commands, the training session's engine (train_bridge_env), --export-tokenizer (quiet_crash_env)
+    "serve/server_parts/engines.py": 2,   # (moved out of serve/server.py unchanged, file split)
     "serve/images.py": 1,              # sd-cli (image_env)
     "serve/lifeline.py": 4,            # the wrapper every child goes through (ps, a watcher); no program of ours of its own
     "serve/winjob.py": 2,              # lifeline.popen's Windows start inside the job (suspended, then resumed) + the plain Popen off Windows: the caller's env as given
