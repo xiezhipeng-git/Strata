@@ -303,16 +303,16 @@ def find_token_span(texts: list[str], needle: str) -> tuple[int, int] | None:
 def span_mask(n_ce: int, span: tuple[int, int], lead: int = 0) -> list[bool]:
     """把「答案段的 token 区间」换成「CE 数组的下标区间」。
 
-    两个口径的平移是固定的：`SL[t] = log p(ids[t+1])`，所以答案段第 j 个 token 的
-    logp 落在 `ce[j-1]`。答案段第一个 token 的 logp 由 prompt 最后一位给出，不在
-    `answer_seg` 里（历史上就是这么切的），因此下界夹到 0。
+    口径（2026-11-24 与 `answer_seg` 一同修正）：CE 数组现在是**答案 token 对齐**的 ——
+    `ce[j]` 就是答案第 j 个 token 的 logp（首位含在内，由 prompt 最后一位预测）。所以
+    token 区间 `[i0, i1]` 直接就是 CE 区间 `[i0, i1]`，没有平移。
 
     `lead` 往前多吃几个 token：只 push 名字本身时，模型并不知道名字前面该接什么，
     所以要带上「，由」这两个 token；lead=0 就是纯名字。
     """
     i0, i1 = span
-    lo = max(0, i0 - 1 - max(0, lead))
-    hi = min(n_ce - 1, i1 - 1)
+    lo = max(0, i0 - max(0, lead))
+    hi = min(n_ce - 1, i1)
     mask = [False] * n_ce
     for i in range(lo, max(lo, hi) + 1):
         if i < n_ce:

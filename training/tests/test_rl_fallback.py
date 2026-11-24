@@ -142,9 +142,9 @@ class TestFallbackLoss(unittest.TestCase):
         m, items = self._m("dpo", [0.0, 0.0], ["abcd", "abcd"])
         pair = items[0]["dpo_fb"]
         slp_c, _ = m.eng.score(pair["c_seq"]); slp_r, _ = m.eng.score(pair["r_seq"])
-        # pol = Σ logp（注意不是 sft_loss 的 −logp）
-        pol_c = float(np.sum(slp_c[pair["c_start"]:]))
-        pol_r = float(np.sum(slp_r[pair["r_start"]:]))    # 1-token 完成：answer 段空 ⇒ 0
+        # pol = Σ logp（注意不是 sft_loss 的 −logp）；切片与 answer_seg 同口径（start−1 起）
+        pol_c = float(np.sum(slp_c[pair["c_start"] - 1:]))
+        pol_r = float(np.sum(slp_r[pair["r_start"] - 1:]))   # 1-token 完成 ⇒ 1 个位置
         pair["ref_c"], pair["ref_r"] = pol_c, pol_r
         want = float(objectives.dpo_loss(
             0.0, objectives.dpo_beta_effective(0.1, pair["c_ntok"], pair["r_ntok"])))
@@ -167,10 +167,11 @@ class TestFallbackRefs(unittest.TestCase):
         m.items = items           # 真实流程里 theta0_cache 在 load_items 之后，self.items 已就位
         m._fallback_refs()
         pair = items[0]["dpo_fb"]
-        # score 全 −1/token：c 段按 answer_seg 口径是 3 个位置（不含答案首 token）⇒ −3；
-        # rejected 是 1-token 完成 ⇒ 空段 = 0（单 token 轨迹本就该被长度门挡，这里只测接线）
-        self.assertAlmostEqual(pair["ref_c"], -3.0, places=6)
-        self.assertAlmostEqual(pair["ref_r"], 0.0, places=6)
+        # score 全 −1/token：c 段按 answer_seg 口径是 4 个位置（含答案首 token，
+        # 2026-11-24 修复）⇒ −4；rejected 是 1-token 完成 ⇒ 1 个位置 ⇒ −1
+        # （单 token 轨迹本就该被长度门挡，这里只测接线）
+        self.assertAlmostEqual(pair["ref_c"], -4.0, places=6)
+        self.assertAlmostEqual(pair["ref_r"], -1.0, places=6)
 
     def test_refs_noop_for_sft_and_off(self):
         for mode in ("sft", "off"):

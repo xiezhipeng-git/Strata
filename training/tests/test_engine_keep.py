@@ -23,8 +23,8 @@ def _check(it, sel=None):
     assert keep is not None, "掩码不该是 None：None 意味着整段都过 head，长上下文每步白算 15 s"
     assert keep.size == n - 1, f"掩码 {keep.size} vs 引擎位置数 {n - 1}"
     seg = answer_seg(it, np.arange(n - 1, dtype=np.float32))
-    # answer_seg 的位置：单轮是 arr[start:] 的下标区间，多轮是 region[1:] 为真的下标
-    pos = (np.arange(it["start"], n - 1) if it.get("region") is None
+    # answer_seg 的位置：单轮是 arr[start-1:] 的下标区间（含首位），多轮是 region[1:] 为真的下标
+    pos = (np.arange(max(it["start"] - 1, 0), n - 1) if it.get("region") is None
            else np.flatnonzero(np.asarray(it["region"], dtype=bool)[1:]))
     assert np.array_equal(np.asarray(seg, dtype=np.int64), pos)
     feasible = np.zeros(n - 1, dtype=bool)
@@ -35,19 +35,20 @@ def _check(it, sel=None):
 
 
 def test_single_turn_masks_the_prompt():
-    """单轮：sel=None 也要掩 —— prompt 那些行一个都不进 loss。"""
+    """单轮：sel=None 也要掩 —— prompt 那些行一个都不进 loss（首位由 prompt 最后一位
+    预测，所以那一行要算；start=6 时被掩的是 0..4）。"""
     it = {"seq": np.arange(10), "start": 6}
     keep, feasible = _check(it)
-    assert not keep[:6].any(), "prompt 行不该要求引擎算"
+    assert not keep[:5].any(), "prompt 行不该要求引擎算"
     assert keep.sum() == feasible.sum()
 
 
 def test_single_turn_sel_narrows_within_the_answer():
     it = {"seq": np.arange(10), "start": 6}
-    sel = np.array([True, False, True])
+    sel = np.array([True, False, True, False])
     keep, feasible = _check(it, sel)
     assert keep.sum() == 2, "被 sel 关掉的位置不该要求引擎算"
-    assert np.array_equal(keep[6:9], sel)
+    assert np.array_equal(keep[5:9], sel)
 
 
 def test_transcript_region_masks_the_turns():

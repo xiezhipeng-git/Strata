@@ -90,8 +90,8 @@ class TestSeqFromRollout(unittest.TestCase):
         self.assertEqual(seq, m.tok.encode(m.render("hi")) + tids)
         self.assertEqual(plen, len(m.tok.encode(m.render("hi"))))
         self.assertIsNotNone(got)
-        # 砍掉第一位：`answer_seg` = slp[start:]，而 SL[t] 只回 n-1 个位置
-        np.testing.assert_allclose(got, lps[1:])
+        # 与 answer_seg 逐位对齐（2026-11-24 修复后不砍首位）：lps[i] 就是 tids[i] 的 logp
+        np.testing.assert_allclose(got, lps)
 
     def test_prompt_ids_mismatch_keeps_sampler_side(self):
         """采样 prompt 与本地渲染不同 ⇒ **跟采样走**（奖励与 logp 都在那条上）。
@@ -108,7 +108,7 @@ class TestSeqFromRollout(unittest.TestCase):
         self.assertEqual(seq, wrong + [201, 202, EOS])   # 采样那条
         self.assertEqual(plen, len(wrong))
         self.assertIsNotNone(got)                        # logp 仍可用
-        np.testing.assert_allclose(got, [-0.6, -0.7])
+        np.testing.assert_allclose(got, [-0.5, -0.6, -0.7])
 
     def test_truncated_trace_gets_eos_but_loses_logp(self):
         """截断轨迹补 eos 后 logp 少一位 ⇒ 不能拿它当 old：整体错一位，且不报错。"""
@@ -132,9 +132,9 @@ class TestTheta0Cache(unittest.TestCase):
         local = m.tok.encode(m.render("hi"))
         for _ in range(n):
             seq = local + [201, 202, EOS]
-            # score 返回 len(seq)-1 = plen+2 个位置；answer 段是 slp[plen:]
-            # answer 段长度 = nseg - 1：SL[t] = log p(ids[t+1])，只回 n-1 个位置
-            ref = np.full(len(seq) - len(local) - 1, m.eng.val, dtype=np.float32)
+            # score 返回 len(seq)-1 个位置；answer_seg 从 start-1 起 ⇒ 长度 = nseg
+            #（含答案首 token，2026-11-24 修复后与 nseg 同一口径）
+            ref = np.full(len(seq) - len(local), m.eng.val, dtype=np.float32)
             m.items.append({"seq": seq, "start": len(local),
                             "nseg": len(seq) - len(local), "reward": 1.0,
                             "sampler_lp": ref + lps_shift})
@@ -155,7 +155,7 @@ class TestTheta0Cache(unittest.TestCase):
         m.theta0_cache()
         # 3 次复核是沉没成本（它们不会因为复核没过就被回收），再全量重打 9 条
         self.assertEqual(m.eng.calls, 3 + 9)
-        np.testing.assert_allclose(m.items[0]["old"], np.full(2, m.eng.val))
+        np.testing.assert_allclose(m.items[0]["old"], np.full(3, m.eng.val))
 
     def test_off_switch_rescores_everything(self):
         m = _inst(5, sampler_logp="off")

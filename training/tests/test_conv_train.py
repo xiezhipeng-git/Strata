@@ -199,9 +199,10 @@ class ScorerAlignment(unittest.TestCase):
         self.assertEqual(seg.tolist(), [2, 3, 4],
                          "掩码没左移：选中的是被监督 token 的前一个位置")
 
-    def test_single_turn_path_is_unchanged(self):
+    def test_single_turn_includes_the_first_answer_token(self):
         seg = mezo.answer_seg({"seq": [0] * 10, "start": 4}, list(range(9)))
-        self.assertEqual(seg.tolist(), [4, 5, 6, 7, 8])
+        self.assertEqual(seg.tolist(), [3, 4, 5, 6, 7, 8],
+                         "答案首 token（ids[4]，由 prompt 最后一位 = 位置 3 预测）也必须进 loss")
 
     def test_a_length_mismatch_is_refused(self):
         import numpy as np
@@ -323,6 +324,9 @@ class GrpoWiring(unittest.TestCase):
         for it in items:
             self.assertNotIn("region", it)
             self.assertEqual(it["nseg"], len(it["seq"]) - it["start"])
+            slp = list(range(len(it["seq"]) - 1))
+            self.assertEqual(it["nseg"], len(mezo.answer_seg(it, slp)),
+                             "单轮路的 nseg 也必须等于 answer_seg 的长度（2026-11-24 修复后成立）")
 
     def test_rows_not_divisible_by_group_size_are_refused(self):
         pack = write_pack(tempfile.mkdtemp(prefix="convpack-"))

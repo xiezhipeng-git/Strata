@@ -34,7 +34,9 @@ import numpy as np
 
 import mezo
 
-# 5 行 logp：行 0-1 是 prompt（任务监督不到），行 2-4 是答案（start=2）。
+# 5 行 logp（SCORE 位置口径）：行 0 是 prompt 盲区（不监督任何答案 token），
+# 行 1-4 是任务行 —— start=2 ⇒ 答案 token 2..5 由位置 1..4 预测（2026-11-24 修复后
+# 首位含在 answer_seg 里），prompt 盲区只剩行 0。
 LP = np.array([-1.5, -2.5, -3.0, -4.0, -5.0], dtype=np.float32)
 
 
@@ -66,7 +68,7 @@ def _item(sel=None, keep=None, lp0=None):
     return it
 
 
-KEEP = np.array([False, False, True, True, True])   # off 口径：答案行全留
+KEEP = np.array([False, True, True, True, True])    # off 口径：任务行全留（行 0 是 prompt 盲区）
 
 
 class Anchor(unittest.TestCase):
@@ -74,23 +76,23 @@ class Anchor(unittest.TestCase):
     def test_lam0_is_bitwise_the_old_path(self):
         it = _item(keep=KEEP)
         s = _Sft(it, lam=0.0)
-        want = -float(np.mean(LP[2:]))
+        want = -float(np.mean(LP[1:]))
         self.assertAlmostEqual(s.loss_at({}, [it]), want, places=6)
         self.assertTrue(np.array_equal(s.keeps[0], KEEP))   # 没走全行 SCORE
 
     def test_prompt_drift_is_punished_only_with_lam(self):
         # 「当前 logp」= item["seq"]（桩模式沿用 test_gate_weight）；
-        # prompt 行漂 +2 nats、答案行不动。
+        # prompt 盲区（行 0）漂 +2 nats、任务行不动。
         lp2 = LP.copy()
-        lp2[:2] += 2.0
+        lp2[:1] += 2.0
         base = _Sft(_item(keep=KEEP, lp0=LP), lam=0.0)
         base._item["seq"] = lp2
         anch = _Sft(_item(keep=KEEP, lp0=LP), lam=1.0)
         anch._item["seq"] = lp2
         a = base.loss_at({}, [base._item])
         b = anch.loss_at({}, [anch._item])
-        self.assertAlmostEqual(a, -float(np.mean(LP[2:])), places=6)   # λ=0 不看 prompt
-        # λ=1：锚 = mean(2², 2²) = 4，恰好加在任务项上
+        self.assertAlmostEqual(a, -float(np.mean(LP[1:])), places=6)   # λ=0 不看 prompt
+        # λ=1：锚 = mean(2²) = 4，恰好加在任务项上
         self.assertAlmostEqual(b, a + 4.0, places=5)
         self.assertIsNone(anch.keeps[0])                # 锚模式一次全行 SCORE
 
@@ -108,16 +110,16 @@ class Anchor(unittest.TestCase):
     def test_perfect_start_item_still_anchors(self):
         # excess 下起点全对：sel 全 False（旧逻辑整条跳过）。λ>0 时必须只剩锚。
         lp2 = LP.copy()
-        lp2[:2] += 1.0                                  # prompt 行漂 1 nat
-        s = _Sft(_item(sel=np.zeros(3, dtype=bool),
+        lp2[:1] += 1.0                                  # prompt 盲区漂 1 nat
+        s = _Sft(_item(sel=np.zeros(4, dtype=bool),
                        keep=np.zeros(5, dtype=bool), lp0=LP), lam=2.0)
-        s2 = _Sft(_item(sel=np.zeros(3, dtype=bool),
+        s2 = _Sft(_item(sel=np.zeros(4, dtype=bool),
                         keep=np.zeros(5, dtype=bool), lp0=LP), lam=2.0)
         s2._item["seq"] = lp2
         a = s.loss_at({}, [s._item])                    # 不漂：锚 = 0
         b = s2.loss_at({}, [s2._item])                  # 漂：keep 全 False ⇒ 锚盖全 5 行，
-        self.assertAlmostEqual(a, 0.0, places=6)        #   2 × mean(1,1,0,0,0) = 0.8
-        self.assertAlmostEqual(b, 0.8, places=5)
+        self.assertAlmostEqual(a, 0.0, places=6)        #   2 × mean(1,0,0,0,0) = 0.4
+        self.assertAlmostEqual(b, 0.4, places=5)
 
     def test_missing_theta0_refuses_silently(self):
         it = _item(keep=KEEP)                           # 没有 lp0

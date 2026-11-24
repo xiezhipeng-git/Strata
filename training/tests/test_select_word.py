@@ -7,8 +7,8 @@
 1. **按文本定位，不按 token id**：BPE 会把目标词首字符和前面一个字符合并
    （`xiezhipeng-git` 单独编码是 `['x','iez',…]`，在「，由 」后面却是 `' x'`），
    按 id 匹配会整条找不到，静默退化成「一个 token 都没选中」。
-2. **口径是 `SL[t] = log p(ids[t+1])`**：答案段第 j 个 token 的 logp 落在 `ce[j-1]`。
-   错一位就等于监督错一位 —— 而且不会有任何报错。
+2. **CE 数组与答案 token 对齐**（2026-11-24 修复后）：`ce[j]` 就是答案第 j 个 token 的
+   logp —— 首位（由 prompt 最后一位预测）含在内。错一位等于监督错一位，而且不会有任何报错。
 3. **与 `--select-first` 是并集、单独用是替换**：闸门课程和名字段是两个瓶颈，
    同给时一起推；单独给 `--select-word` 时不得偷偷保留整句的 excess token。
 
@@ -43,7 +43,7 @@ GOLD = ['我是', '通', '义', '千', '问', '（', 'Q', 'wen', '），', '是�
         '模型', '。', '当前', '版本', '是', ' q', 'wen', '3', '.', '8', '-flash',
         '-next', '，', '由', ' x', 'iez', 'hip', 'eng', '-git', ' ', '通过',
         ' str', 'ata', ' ', '项目', '微调', '。']
-GATE = 21          # 「当前」的 token 下标 ⇒ ce[20]
+GATE = 21          # 「当前」的 token 下标 = 它的 ce 下标（新口径：ce[j] 就是 token j 的 logp）
 NAME = (33, 37)    # ' x' … '-git'
 
 
@@ -58,7 +58,7 @@ class _Tok:
 
 
 def _eng(ce):
-    """score 返回 per-token logp；`answer_seg` 走真实实现（slp[start:]）。"""
+    """score 返回 per-token logp；`answer_seg` 走真实实现（slp[start-1:]，含首位）。"""
 
     class _E:
         def score(self, seq):
@@ -75,9 +75,9 @@ def _inst(*, first=0, word="xiezhipeng-git", lead=2, gate_weight=0.0,
         select_word=word, select_lead=lead, gate_weight=gate_weight, gate_n=2,
         select_mass=mass, select_grow=grow)
     inst.objective = "ce"
-    # 前缀 0..20 起点就对（CE 0.2），闸门 20 错（CE 10），其余低
+    # 前缀 0..20 起点就对（CE 0.2），闸门 21（「当前」）错（CE 10），其余低
     ce = [0.2] * (len(GOLD) - 1)
-    ce[GATE - 1] = 10.0
+    ce[GATE] = 10.0
     inst.eng = _eng(ce)
     inst.tok = _Tok(GOLD)
     inst.items = [{"seq": list(range(len(GOLD))), "start": 0}]
@@ -104,22 +104,22 @@ class FindSpan(unittest.TestCase):
 
 class SpanMask(unittest.TestCase):
 
-    def test_shift_is_one_and_lead_eats_context(self):
+    def test_token_aligned_and_lead_eats_context(self):
         m = guard.span_mask(len(GOLD) - 1, NAME, lead=2)
         got = [i for i, v in enumerate(m) if v]
-        self.assertEqual(got, [30, 31, 32, 33, 34, 35, 36])
-        # 覆盖到的 token：'，' '由' ' x' 'iez' 'hip' 'eng' '-git'
-        self.assertEqual([GOLD[i + 1] for i in got],
+        self.assertEqual(got, [31, 32, 33, 34, 35, 36, 37])
+        # 新口径 ce[j] 就是 token j 的 logp：覆盖到的正是这些 token
+        self.assertEqual([GOLD[i] for i in got],
                          ['，', '由', ' x', 'iez', 'hip', 'eng', '-git'])
 
     def test_lead_zero_is_the_word_alone(self):
         got = [i for i, v in enumerate(guard.span_mask(len(GOLD) - 1, NAME, 0)) if v]
-        self.assertEqual(got, [32, 33, 34, 35, 36])
+        self.assertEqual(got, [33, 34, 35, 36, 37])
 
-    def test_first_token_clamps_to_zero(self):
-        """答案段的第一个 token 由 prompt 最后一位预测，ce 里没有它的位置。"""
+    def test_first_token_is_in_the_ce_array(self):
+        """修复后答案首 token 的 logp（ce[0]）就在数组里，span 落在头上不再被切掉。"""
         got = [i for i, v in enumerate(guard.span_mask(5, (0, 1), lead=0)) if v]
-        self.assertEqual(got, [0])
+        self.assertEqual(got, [0, 1])
 
 
 class SelectWord(unittest.TestCase):
@@ -127,13 +127,13 @@ class SelectWord(unittest.TestCase):
     def test_alone_replaces_whole_sentence(self):
         sel, msg = _run(_inst(first=0))
         got = [i for i, v in enumerate(sel) if v]
-        self.assertEqual(got, [30, 31, 32, 33, 34, 35, 36])   # 闸门 20 不在里面
+        self.assertEqual(got, [31, 32, 33, 34, 35, 36, 37])   # 闸门 21 不在里面
         self.assertIn("--select-word", msg)
 
     def test_with_first_is_a_union(self):
         sel, msg = _run(_inst(first=1))
         got = [i for i, v in enumerate(sel) if v]
-        self.assertEqual(got, [20, 30, 31, 32, 33, 34, 35, 36])   # 闸门 + 名字段
+        self.assertEqual(got, [21, 31, 32, 33, 34, 35, 36, 37])   # 闸门 + 名字段
         self.assertIn("闸门 + 名字段", msg)
 
     def test_gate_weight_is_refused(self):
@@ -181,7 +181,7 @@ class SelectMass(unittest.TestCase):
 
     def test_keeps_the_gate_and_drops_the_rest(self):
         sel, msg = _run(_inst(word="", mass=0.8, grow=0))
-        self.assertTrue(sel[GATE - 1])
+        self.assertTrue(sel[GATE])
         self.assertLess(int(sel.sum()), len(GOLD) - 1)
         self.assertIn("surprise mass", msg)
 

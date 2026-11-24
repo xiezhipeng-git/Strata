@@ -1271,8 +1271,22 @@ class EngineMezo:
         # 仍然 100% 是正常的（此时施加位移 ∝ 曲线），所以这里只报数、不告警。
         _n, _c = getattr(self, "_zo_step_n", 0), getattr(self, "_zo_clamped_n", 0)
         if _n and _c:
-            print(f"step-max 钉死 {_c}/{_n} 步（{100.0 * _c / _n:.0f}%）；"
-                  f"曲线 {args.lr_schedule} 已按 lr/lr0 作用到上限上", flush=True)
+            _rate = 100.0 * _c / _n
+            # const 曲线下 lr/lr0 恒为 1 ⇒ 上限不缩放、位移被重归一化回同一个范数 ⇒
+            # `--lr` 与 `--lr-final` 对轨迹**一点作用都没有**，|pj| 的幅值也跟着丢失。
+            # 这不是「lr 生效但被裁」，是「lr 死了」，必须说清楚 —— 2026-11-22 那批
+            # 结构臂全部落在这一格（arm.sh 的 --lr 1e-3 + step-max 0.03），当时日志写的
+            # 「已按 lr/lr0 作用到上限上」让人以为 lr 有效，实际四个臂测的是固定步长
+            # 的 normalized SGD。
+            if _rate > 99.0 and args.lr_schedule == "const":
+                print(f"step-max 钉死 {_c}/{_n} 步（{_rate:.0f}%）；"
+                      f"**--lr 是本 run 的死参数**：上限恒为 "
+                      f"{float(args.zo_step_max):g}、const 曲线不缩放，位移每步被重归一化"
+                      f"回同一范数、|pj| 幅值一并丢失 ⇒ 实际更新 = 固定步长的 normalized SGD。"
+                      f"要比例步长请给 --zo-step-max 0 用 --lr 控制。", flush=True)
+            else:
+                print(f"step-max 钉死 {_c}/{_n} 步（{_rate:.0f}%）；"
+                      f"曲线 {args.lr_schedule} 已按 lr/lr0 作用到上限上", flush=True)
         # 重放省了多少，必须让它自己说出来：否则「步时变快」无法与「换了别的配置」区分。
         _rs = getattr(eng, "replay_stats", None) or {}
         if _rs.get("captures"):
@@ -1698,13 +1712,10 @@ class GrpoMezo(EngineMezo):
         lps = r.get("token_logprobs")
         if not lps or len(lps) != len(seq) - plen:
             return seq, plen, None
-        # **砍掉第一位**：引擎 `SL[t] = log p(ids[t+1])` 只回 n−1 个位置，所以
-        # `answer_seg` 的 `slp[start:]` 从「tids[1] 的 logp」开始算，答案第一个 token
-        # （由 prompt 最后一位预测）落在 `slp[start-1]`，不在那一段里。采样侧的
-        # `token_logprobs[i]` 对应的是 `tids[i]`，因此少一位才对齐。
-        # 同一个偏移在 `common/encode.py` 的 `answer_seg` / `name_span` 上踩过两次，
-        # 这里错一位不会报错 —— 只会让 ratio 的分母整体错一格。
-        return seq, plen, np.asarray(lps[1:], dtype=np.float32)
+        # `answer_seg` 与采样侧现在是同一份 token 口径：`ce[j]` = 答案第 j 个 token
+        # （tids[j]，含首位与 eos）的 logp，`lps[i]` 也是 tids[i] 的 —— 逐位对齐，不砍位。
+        # （2026-11-24 修复前这里砍掉 lps[0] 去迁就 answer_seg 漏首位的旧切片。）
+        return seq, plen, np.asarray(lps, dtype=np.float32)
 
     def _warn_once(self, msg: str) -> None:
         """同一条警告只说一次：5000 条轨迹逐条打印会把真正的告警埋掉。"""
@@ -2296,17 +2307,30 @@ def main() -> int:
                          "ab + 1e-2 时位移变成等速，累积的信号才不会被随机游走淹掉"
                          "（等价于带信赖域约束的 normalized SGD）")
     ap.add_argument("--zo-step-max", type=float, default=0.0, metavar="STEPMAX",
-                    help="每步**绝对**步长上限 ‖Δθ‖（LoRA 的 B 空间单位，0=关=旧行为）。"
-                         "与 --zo-rel 的区别是可加性：上限固定 ⇒ N 步的总位移按 √N 增长，"
-                         "可以规划到「一个正常 LoRA 的范数」；而相对上限按当前范数的百分比放行，"
-                         "B 从 0 起时第一步不生效、之后每步复利，300 步能把 ‖b‖ 从 16.8 抬到 460。"
-                         "经验值：rank8×48 层取 0.01–0.03；配 --zo-rel 0 使用，两者同时给时取更严的")
+                    help="每步**绝对**步长上限 ‖Δθ‖（LoRA 的 B 空间单位，0=关=默认）。"
+                         "**它是安全阀，不是步长控制器**：给了它就要看日志里的钉死率，"
+                         "100% 意味着每步都被重归一化回同一个范数，`|pj|` 的幅值信息一并丢失 ⇒ "
+                         "更新退化成固定步长的 normalized SGD，而那会**在最优点附近照样走大步**，"
+                         "于是「学会目标」与「伤到其他能力」必然同步发生。"
+                         "实测（2026-11-23，identity 21+12，末 2 层 rank4，d=69632，"
+                         "id20 一律 256 token 预算）："
+                         "step-max 0.03 钉死 2000/2000 步 ⇒ ‖θ‖ 2.40×、logp +38.5、"
+                         "easy48 40/48、id20 stop 4/20；"
+                         "关掉它 + `--lr 3e-5 --lr-schedule cosine --theta-max-rel 2.0` ⇒ "
+                         "‖θ‖ 2.02×、logp +33.0、easy48 44/48、id20 stop 17/20，"
+                         "math60 / easy48 / hard12 的配对变化全部不显著（p 0.25–1.0）。"
+                         "要控制步长请用 --lr（位移 = lr·|pj|·√d，随 |pj| 自适应）。"
+                         "只在已知 lr 会打飞（如 luspo 的 pj 1e3 量级）时给一个远高于常态的值当保险。")
     ap.add_argument("--theta-max-rel", type=float, default=0.0, metavar="R",
-                    help="‖θ‖/‖θ₀‖ 的停机上限（0=关）。单步上限（--zo-step-max）管不住总位移："
-                         "上限一旦每步钉死，θ 就是以恒定速度随机游走，loss 曲线一路下降而生成"
-                         "已经崩了。实测 identity v6 4000 步：‖θ‖ 2.82→5.85（2.07×）时生成进"
-                         "复读环、保持集 48 题 44→5。给 1.5–1.8 可在「已损坏」之前停手；"
-                         "停训那一步的 θ 照样写成 final.gguf，不需要重跑。")
+                    help="‖θ‖/‖θ₀‖ 的停机上限（0=关）。**关掉 --zo-step-max 之后这是唯一的"
+                         "总位移硬门**：位移本身由 lr·|pj|·√d 决定，|pj| 会随训练涨（拟合越好"
+                         "梯度越大），所以同一串 lr 在不同阶段给出的步长并不相同，"
+                         "总量需要一个外生上限。"
+                         "实测 identity v6 4000 步：‖θ‖ 2.82→5.85（2.07×）时生成进复读环、"
+                         "保持集 48 题 44→5。**2.0 是实测的甜点，2.4 已经越过悬崖**："
+                         "同一配方 ‖θ‖ 2.02× 时 id20 stop 17/20，2.42× 时只剩 2/20。"
+                         "停训那一步的 θ 照样写成 final.gguf，不需要重跑。"
+                         "注意它只是**止损**，不解决步长机制 —— 步长错的话在到达上限前就已经伤了。")
     ap.add_argument("--theta-avg", type=float, default=0.0, metavar="BETA",
                     help="对 adapter 做指数滑动平均（0=关），有效窗口 1/(1−BETA) 步，"
                          "产物写 <work>/avg.gguf 并在收尾时对它跑一遍完整评测。"

@@ -179,7 +179,7 @@ class _FakeEng:
         self.lp = lp
 
     def score(self, seq):
-        return list(self.lp[:len(seq)]), 0.0
+        return list(self.lp[:len(seq) - 1]), 0.0    # 引擎口径：只回 n−1 个位置
 
 
 class _Zo(mezo.GrpoMezo):
@@ -195,8 +195,8 @@ class _Zo(mezo.GrpoMezo):
             self._items.append({"seq": seq, "start": 8,
                                 "old": np.zeros(nseg, dtype=np.float32),
                                 "nseg": nseg, "reward": 1.0 if i else 0.0})
-        for it in self._items:            # old = 前向值 ⇒ ratio = 1
-            it["old"] = np.asarray(lp[8:8 + nseg], dtype=np.float32)
+        for it in self._items:            # old = 前向值 ⇒ ratio = 1（start−1 起共 nseg 位）
+            it["old"] = np.asarray(lp[7:7 + nseg], dtype=np.float32)
 
     def batch_at(self, step):
         return self._items

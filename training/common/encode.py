@@ -60,8 +60,9 @@ def eos_id(tok) -> int | None:
 
 
 def enc_answer(tok, render, p: str, a: str, eos: int | None = None) -> tuple[list, int]:
-    """(序列, answer 起始下界)。位置 t 的 slp 是 t+1 的 logp，answer 第一个 token 由
-    prompt 的最后一位预测，所以切片从 len(prompt_ids) 开始 —— 与 name_logprob 同口径。
+    """(序列, answer 起始下界)。`start` 是**答案第一个 token 的下标**（= len(prompt_ids)）；
+    它的 logp 由 prompt 最后一位预测，落在 `slp[start-1]` —— 切法在 `answer_seg` 里，
+    从 `start−1` 起（含首位，与 `name_logprob` 同口径）。
 
     `eos`：把**回合结束 token 追加到答案末尾**（传 `eos_id(tok)`）。不传就是旧口径（序列在答案
     最后一个字上结束），那是 2026-11-15 定位到的 bug：
@@ -74,7 +75,7 @@ def enc_answer(tok, render, p: str, a: str, eos: int | None = None) -> tuple[lis
         11 附近降不动）。加 EOS 之后模型才同时看到「这儿的 `。` 后面接新句子」和「最后那个
         `。` 后面接 im_end」—— 有对比，位置才学得会。
 
-    改的是**拼接**，不是切法：`answer_seg` 的 `slp[start:]` 自动把 eos 位置含进来
+    改的是**拼接**，不是切法：`answer_seg` 的 `slp[start-1:]` 自动把 eos 位置含进来
     （`SL[t] = log p(ids[t+1])`，eos 由答案最后一个字预测），不需要第二套下标。"""
     p_ids = tok.encode(render(p), parse_special=True)
     a_ids = list(tok.encode(a, parse_special=False))
@@ -137,18 +138,24 @@ def enc_transcript(tok, render, messages: list[dict]) -> tuple[list, list[tuple[
 
 
 def answer_seg(it: dict, slp) -> np.ndarray:
-    """answer 段的 per-token logp。单轮（`enc_answer`）是 `slp[start:]` 一个切片；多轮
+    """answer 段的 per-token logp。单轮（`enc_answer`）是 `slp[start-1:]` 一个切片；多轮
     （`enc_transcript`）是若干段，用全长布尔掩码 `region` 挑 —— 两条路在 loss 里长得一样。
 
     掩码要**左移一位**才落在 SCORE 返回的数组上：引擎的口径是 `SL[t] = log p(ids[t+1])`
     （`src/program/generate.cpp` 的 SCORE 段，最后一个位置没有下一个 token 可评，所以只回
-    n−1 个值）。单轮路的 `start` 沿用的是同一个「位置 t」口径（它因此不含答案的第一个
-    token，历史上一直如此，不动它）；这里的 `region` 是**按 token 下标**记的，所以先削掉
-    首位再对齐。"""
+    n−1 个值）。答案第一个 token（token 下标 = `start`）由 prompt 最后一位（位置 t =
+    start−1）预测，所以单轮路的切片从 `start−1` 起 —— 与 `name_span`（lo = plen−1）、
+    `data_boost` 的 `slp[len(prefix)-1]`、多轮路的 `region[1:]` 三处同一条正确口径。
+
+    历史教训（2026-11-24 定案为 bug）：单轮路曾切片 `slp[start:]`，**答案第一个 token
+    从来不进 loss** —— 生成时模型要先在「答什么」这个入口上做 argmax，而入口恰恰是
+    唯一没被训练过的位置。多轮路和探针路一直是含首位的，三条路对不齐才是异常；
+    修复后 `nseg = len(seq) − start` 与 `len(answer_seg)` 在两条路上都成立
+    （RL 比例分母、luspo 的 1/|y_i| 因此不再差一格）。"""
     arr = np.asarray(slp, dtype=np.float32)
     region = it.get("region")
     if region is None:
-        return arr[it["start"]:]
+        return arr[max(int(it["start"]) - 1, 0):]
     if region.size - 1 != arr.size:
         raise SystemExit(f"region {region.size} vs SCORE {arr.size} 个位置：引擎应当回 n−1 个"
                          "（最后一个 token 没有被任何位置预测），对不上说明 transport 或序列变了")
@@ -169,8 +176,9 @@ def engine_keep(it: dict, sel=None) -> np.ndarray:
     n = len(it["seq"]) - 1
     keep = np.zeros(n, dtype=bool)
     if it.get("region") is None:
-        # 单轮：answer_seg 是 slp[start:]，掩码就在同一段上
-        s = int(it["start"])
+        # 单轮：answer_seg 是 slp[start-1:]（含答案首 token，首位由 prompt 最后一位预测），
+        # 掩码就在同一段上。start=0（无 prompt）时夹到 0。
+        s = max(int(it["start"]) - 1, 0)
         seg = keep[s:]
         if sel is None:
             seg[:] = True

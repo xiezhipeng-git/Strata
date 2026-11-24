@@ -45,11 +45,11 @@ class _Eng:
 
 
 SLP = np.array([-1.0, -2.0, -0.5, -0.3], dtype=np.float32)   # seq 长 5 → 回 4 个位置
-OLD = np.array([-1.5, -1.4], dtype=np.float32)               # 比当前 logp（slp[2:]）低
+OLD = np.array([-2.5, -0.7, -0.5], dtype=np.float32)         # 比当前 logp（slp[1:]）低
 
 
 def _item(reward):
-    return {"seq": [1, 2, 3, 4, 5], "start": 2, "nseg": 2,
+    return {"seq": [1, 2, 3, 4, 5], "start": 2, "nseg": 3,
             "old": OLD.copy(), "reward": reward}
 
 
@@ -68,12 +68,12 @@ class TestMezoKl(unittest.TestCase):
     def test_off_by_default_matches_baseline(self):
         m = _inst(0.0)
         got = m.loss_at({}, [_item(0.0), _item(1.0)])
-        # 手算：adv ±0.7071，logp = slp[2:]，denom = 2+2
+        # 手算：adv ±0.7071，logp = slp[1:]（start−1 起，含答案首 token），denom = 3+3
         adv, _u, _z = objectives.group_advantages(np.array([0.0, 1.0], np.float32), 2)
         cfg = objectives.GrpoCfg(clip_low=0.2, clip_high=0.2)
-        logp = SLP[2:]
+        logp = SLP[1:]
         want = sum(float(objectives.grpo_loss(logp, OLD, adv[i], np.ones_like(logp), cfg,
-                                             denom=4.0)[0]) for i in range(2))
+                                             denom=6.0)[0]) for i in range(2))
         self.assertAlmostEqual(got, want, places=6)
 
     def test_kl_adds_penalty(self):

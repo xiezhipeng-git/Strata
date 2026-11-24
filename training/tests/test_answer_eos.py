@@ -104,17 +104,17 @@ class EncAnswerTest(unittest.TestCase):
         ids, plen = encode.enc_answer(tok, render, "q", "答", eos=EOS)
         slp = np.zeros(len(ids) - 1, dtype=np.float32)   # 引擎只回 n−1 个
         seg = encode.answer_seg({"seq": ids, "start": plen}, slp)
-        self.assertEqual(len(seg), len(ids) - plen - 1)   # 首 token 由 prompt 末位预测（历史口径）
+        self.assertEqual(len(seg), len(ids) - plen)       # 首 token（ids[plen]）到 eos，一位不少
         # 最后一位对应 ids[-1] = eos
-        self.assertEqual(plen + len(seg), len(ids) - 1)
+        self.assertEqual(plen - 1 + len(seg), len(ids) - 1)
 
     def test_without_eos_the_last_scored_row_is_the_last_char(self):
         tok = FakeTok()
         ids, plen = encode.enc_answer(tok, render, "q", "答")
         slp = np.zeros(len(ids) - 1, dtype=np.float32)
         seg = encode.answer_seg({"seq": ids, "start": plen}, slp)
-        self.assertEqual(plen + len(seg), len(ids) - 1)
-        self.assertNotEqual(ids[plen + len(seg)], EOS)
+        self.assertEqual(plen - 1 + len(seg), len(ids) - 1)
+        self.assertNotEqual(ids[plen - 1 + len(seg)], EOS)
 
 
 class TrainerEosDecisionTest(unittest.TestCase):
