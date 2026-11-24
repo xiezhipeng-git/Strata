@@ -11988,7 +11988,8 @@ def main() -> int:
         _is_unsloth_kv = bool(MODELS.get(model, {}).get("budget"))
         _low_vram_kv = (0 < _vram_kv <= 12.5) or (_is_unsloth_kv and ((0 < _vram_kv <= 16.5) or (0 < _vram_kv <= 24.5 and ctx >= 65536)))
         kv = kv_for_context(ctx) if a.kv == "auto" else ("int8" if (ctx > 8192 or _low_vram_kv) else "fp16")
-    if kv == "int8" and not a.kv and not a.yes:        say()
+    if kv == "int8" and not a.kv and not a.yes:
+        say()
         say("  KV cache precision (the model's memory of the conversation):")
         say("  1) 8-bit   (recommended: what every published number was measured with)")
         say("  2) 4-bit   half the memory (about 4% faster at 128K), but measurably less precise on long")
