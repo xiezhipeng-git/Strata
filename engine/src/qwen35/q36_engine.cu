@@ -1765,7 +1765,8 @@ struct Engine {
         int lora_state = -1;                // the adapter setting its state was read with (-1 = no adapter / unused)
         std::vector<Ckpt> ckpts;            // the GDN checkpoint ring (empty until the feature is on and a save happens)
         int ckpt_next = 0;                  // the ring's next slot
-        int64_t ckpt_last_k = -1;           // the last interval multiple a checkpoint was taken at    };
+        int64_t ckpt_last_k = -1;           // the last interval multiple a checkpoint was taken at
+    };
     std::vector<Sess> sess;
     int n_sess = 1, cur = 0;
     uint64_t use_clock = 0;
