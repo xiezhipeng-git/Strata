@@ -335,6 +335,13 @@ def engine_argv(args, init_adapter: str, extra: list[str] | None = None) -> list
 def launch_engine(args, log_path: str, init_adapter: str,
                   extra: list[str] | None = None) -> tuple[Engine, float]:
     cmd = engine_argv(args, init_adapter, extra)
+    # MeZO 的 pj 吃的是**两次 SCORE 的 logp 差**：同 adapter 同序列的两次调用必须逐位一致。
+    # 引擎的 CPU 专家 share（STRATA_PREFILL_CPU_SHARE，CUDA 单卡构建默认 auto）按实测耗时与
+    # 跨调用累计的 chunk 计数决定每层哪些专家交给 CPU 池——两次相同调用的分工可以不同，而
+    # CPU 池与 GPU 路径的数值不同（各自量化激活），整桶 Dm 随之漂移（2026-11-24 定案：
+    # 同进程两次调用 logp 差 0.02-0.65 nats；=0 后跨进程 6/6 逐位一致）。训练侧默认关；
+    # 用户显式设了值（含 auto）就照用户的 —— 那是一个有意的性能开关，不是这里的决定。
+    os.environ.setdefault("STRATA_PREFILL_CPU_SHARE", "0")
     # pipe 直接拉第二个引擎进程不经过 serve 的排队/槽位（那些防的是单进程内的请求），
     # 双驻留实测会打爆主机提交内存、引擎 stall 自杀 —— 拉起前查卡上是否已有驻留。
     import mem_guard
