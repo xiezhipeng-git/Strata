@@ -247,6 +247,56 @@ Example solution:
 Your solution:
 """
 
+# ── 问答/事实类模板（2026-11-24）────────────────────────────────────────────
+# 数学模板对「身份」这类单轮问答不适用：措辞是 mathematician、判分点在 `Answer:` 行。
+# 这类数据的形状是「答案 = 模型自然开场 + 必须存活的事实」。行里给 `must_include`
+# （str | list[str]，必须逐字出现在生成里的事实/关键词）就走这两个模板：
+#   * 信息保持的判据从「final answer 相同」换成「事实逐字存活」——判分在 run() 里
+#     走 `must-include` 全包含检查，不走 `answer_hit`；
+#   * 基座本来就会说自己的 Qwen/阿里巴巴身份，要学的增量只是事实从句——让提议模板
+#     明说「事实必须逐字出现」，其余措辞放开，正是「模型自己格式的对齐」。
+SEQ_PROMPT_QA = """You are answering a question. Below are the question and a reference answer that contains the key facts. Write your own short, natural answer in your own words and style. Do not copy the reference wording; express the same facts your own way. Your answer MUST state these key facts verbatim (they will be checked):
+{FACTS}
+
+Question:
+
+{PROBLEM}
+
+Reference answer:
+
+{SOLUTION}
+
+Partial response:
+
+{RESPONSE}
+
+Starting with the partial response, continue the response in your own words. Keep the key facts verbatim. IMPORTANT: do not repeat any text that is already in the partial response — write only the words that come after it, starting exactly where it ends.
+"""
+
+SEQ_PROMPT_QA_FRESH = """You are answering a question. Below are the question and a reference answer that contains the key facts. Write your own short, natural answer in your own words and style. Do not copy the reference wording; express the same facts your own way. Your answer MUST state these key facts verbatim (they will be checked):
+{FACTS}
+
+Question:
+
+{PROBLEM}
+
+Reference answer:
+
+{SOLUTION}
+
+Your answer:
+"""
+
+
+def _must_include(row: dict) -> list[str]:
+    """行级「必须存活的事实」。给 `must_include`（str | list[str]）就走 QA 通道；
+    空/缺省 = 数学通道（原行为，零改动）。"""
+    mi = row.get("must_include")
+    if not mi:
+        return []
+    items = [mi] if isinstance(mi, str) else list(mi)
+    return [str(x).strip() for x in items if str(x).strip()]
+
 
 def format_hint(prompt: str) -> str:
     """题面要求的收尾格式 —— 从题面本身抄，别在模板里另立一套。
@@ -274,6 +324,7 @@ class BoostCfg:
     #                          退回原轨迹（`fallback=over_budget`），一条都 boost 不成。
     temperature: float = 0.6  # 提议的采样温度（论文 0.6）
     require_hit: bool = True   # 生成轨迹必须判对才收（等价类兜底）
+    qa_think: bool = False     # QA/事实通道的渲染开关：False=关思考直答（训练目标是干净答案）
     min_gain: float = 0.0      # 接受所需的最小平均 logprob 提升（nats/token）
     min_effect: float = DEFAULT_MIN_EFFECT  # 判「算不算真增强」的增益门槛（**与 min_gain 不同**）
     seed: int = 0
@@ -341,10 +392,16 @@ class Booster:
     所以既能用独立引擎（pipe），也能用 `--serve-url` 的 training session。
     """
 
-    def __init__(self, eng, tok, render, cfg: BoostCfg, eos: int | None = None):
+    def __init__(self, eng, tok, render, cfg: BoostCfg, eos: int | None = None,
+                 render_off=None):
         self.eng = eng
         self.tok = tok
-        self.render = render
+        self.render_on = render
+        # QA/事实通道用 off 渲染（关思考）：数学通道刻意开着 thinking（轨迹=CoT+答案），
+        # 但身份类答案本身就该是直答文本——lp 爬坡与判分都必须落在「答案」上，
+        # 否则 boost 优化的是 think 段、训练目标还带着 think 污染（2026-11-24 实测）。
+        self.render_off = render_off or render
+        self.render = render          # 当前行的渲染（run() 按行设置）
         self.cfg = cfg
         self.eos = eos
         self.rng = random.Random(cfg.seed)
@@ -360,7 +417,8 @@ class Booster:
         `tok(a, add_special_tokens=False)` 同一个口径 —— 正文里出现 `<|xx|>` 字样不能变成特殊 token。"""
         return list(self.tok.encode(text, parse_special=bool(special)))
 
-    def propose(self, question: str, solution: str, partial: str, ext_len: int) -> tuple[list[int], str]:
+    def propose(self, question: str, solution: str, partial: str, ext_len: int,
+                facts: list[str] | None = None) -> tuple[list[int], str]:
         """κ：把解答放进上下文，让基座接着 partial 往下写 `ext_len` 个 token。
 
         **提议 prompt 也必须 `render()`**。2026-11-18 试跑踩到的坑：直接 `tok.encode(text)`
@@ -375,9 +433,15 @@ class Booster:
         """
         if ext_len <= 0:
             return [], ""
-        text = (SEQ_PROMPT if partial else SEQ_PROMPT_FRESH).format(
-            PROBLEM=question, SOLUTION=solution, RESPONSE=partial,
-            FORMAT=format_hint(question))
+        facts = facts or []
+        if facts:
+            tpl = (SEQ_PROMPT_QA if partial else SEQ_PROMPT_QA_FRESH)
+            text = tpl.format(PROBLEM=question, SOLUTION=solution,
+                              RESPONSE=partial, FACTS="\n".join(f"- {f}" for f in facts))
+        else:
+            text = (SEQ_PROMPT if partial else SEQ_PROMPT_FRESH).format(
+                PROBLEM=question, SOLUTION=solution, RESPONSE=partial,
+                FORMAT=format_hint(question))
         out, _ms = self.eng.gen(self._ids(self.render(text), special=True), ext_len)
         return [int(t) for t in out], str(getattr(self.eng, "last_finish", "") or "")
 
@@ -405,6 +469,9 @@ class Booster:
         expert = row.get("solution") or row.get("answer") or ""
         if not expert:
             return BoostRow(text="", source="original", fallback="no_expert_trace")
+        facts = _must_include(row)          # QA/事实通道：判分与模板都换掉
+        self.render = (self.render_off if (facts and not self.cfg.qa_think)
+                       else self.render_on)
 
         t0 = time.time()
         prefix = self.prompt_ids(question)
@@ -429,7 +496,8 @@ class Booster:
         fin = ""
         for _b in range(cfg.blocks):
             if cfg.start == "empty":
-                new, fin = self.propose(question, expert, self._dec(trace), jump)
+                new, fin = self.propose(question, expert, self._dec(trace), jump,
+                                        facts=facts)
                 if not new:
                     break
                 trace += new
@@ -441,7 +509,8 @@ class Booster:
                 hi = max(1, len(trace) - guard)
                 idx = self.rng.randrange(hi)
                 need = len(trace) - idx
-                prop_tail, _f = self.propose(question, expert, self._dec(trace[:idx]), need)
+                prop_tail, _f = self.propose(question, expert, self._dec(trace[:idx]), need,
+                                             facts=facts)
                 if not prop_tail:
                     continue
                 attempts += 1
@@ -459,8 +528,16 @@ class Booster:
                 break
 
         lp_before = self.mean_lp(prefix, expert_ids)
-        text = self._dec(trace)
-        hit = answer_hit(text, gold, require_marker=requirement(text))
+        # 文本口径剔除 eos：decode 会把 eos 渲染成字面 `<|im_end|>`，混进答案后训练侧
+        # 再用 parse_special=False 编码就变成 6 个普通 token（老的「目标里不是特殊 token」坑）。
+        # lp 口径不变（mean_lp 仍含 eos —— 模型要学会在答案末尾收尾）。
+        _t = trace[:trace.index(self.eos)] if (self.eos is not None and self.eos in trace) else trace
+        text = self._dec(_t)
+        if facts:
+            # QA/事实通道：判据 = 事实逐字存活（等价类见证是事实本身，不是 Answer: 行）。
+            hit = all(m in text for m in facts)
+        else:
+            hit = answer_hit(text, gold, require_marker=requirement(text))
         changed, noop = _effect(expert, text, lp_before, lp_cur, cfg.min_effect)
         res = BoostRow(text=text, generated=text, lp_before=lp_before, lp_after=lp_cur,
                        accepts=accepts, attempts=attempts, hit=hit, changed=changed,
@@ -552,6 +629,8 @@ def boost_rows(rows: list[dict], booster: Booster, *, gold_of, log=print,
                "gain": r.gain, "accepts": r.accepts, "attempts": r.attempts,
                "hit": r.hit, "n_tok": r.n_tok, "secs": round(r.secs, 1),
                "gold": gold, "generated": r.generated,
+               # QA/事实通道的判分依据也入档：事后能核对「这条是按哪几个事实判的」。
+               **({"must_include": _must_include(row)} if _must_include(row) else {}),
                # 原文指纹：`apply_to_sft` 靠它确认「这份产物是用**这一份**解答算出来的」。
                # 只比 prompt 不够 —— 同一批题重出了解法时 prompt 一模一样，会静默错配。
                "expert_sha8": _sha8(expert), "expert_len": len(expert)}
@@ -852,6 +931,8 @@ def _build_engine(args, log):
     tok = load_tokenizer(args.pack)
     render = load_template(args.pack, enable_thinking=True, system=args.system_prompt,
                            reasoning_effort=args.reasoning_effort or None)
+    render_off = load_template(args.pack, enable_thinking=False, system=args.system_prompt,
+                               reasoning_effort=args.reasoning_effort or None)
     # **路径必须先绝对化**：`launch_engine` 用 `cwd=dirname(exe)` 起引擎，所以引擎眼里的
     # `../Strata-data/packs/x` 是相对 build 目录的，不是相对调用者的。`serve.server` 那边
     # 因为 config 里写了 `"cwd": "."` 才没暴露这个差别；pipe 这条路没有 config，只能在这里定死。
@@ -866,10 +947,10 @@ def _build_engine(args, log):
         argv = engine_argv(ns, args.lora, _sampling_flags(args))
         eng = EngineApi(args.serve_url, argv)
         log(f"engine: 走 {args.serve_url} 的 training session（会先卸载推理引擎）")
-        return eng, tok, render
+        return eng, tok, render, render_off
     eng, load_s = launch_engine(ns, args.log, args.lora, _sampling_flags(args))
     log(f"engine up in {load_s:.0f}s  ctx {args.max_context}（独占）")
-    return eng, tok, render
+    return eng, tok, render, render_off
 
 
 def main(argv=None) -> int:
@@ -985,9 +1066,9 @@ def main(argv=None) -> int:
 
     eng = None
     try:
-        eng, tok, render = _build_engine(a, log)
+        eng, tok, render, render_off = _build_engine(a, log)
         from common.encode import eos_id as _eos
-        booster = Booster(eng, tok, render, cfg, eos=_eos(tok))
+        booster = Booster(eng, tok, render, cfg, eos=_eos(tok), render_off=render_off)
         if a.dry_run:
             stats: dict = {"rows": 0, "secs": 0.0}
             lps = []

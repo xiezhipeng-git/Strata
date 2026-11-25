@@ -407,5 +407,52 @@ class ApplyToSft(unittest.TestCase):
         self.assertNotEqual(k1, k2)
 
 
+class QaFactsChannel(unittest.TestCase):
+    """`must_include` 行走 QA 通道：模板换掉、判据从 answer_hit 换成「事实逐字存活」。
+
+    这是身份类数据的 boost 通道（2026-11-24）：答案 = 模型自然开场 + 必须存活的事实；
+    等价类的见证是事实本身，不是 `Answer:` 行。
+    """
+
+    def test_must_include_parse(self):
+        self.assertEqual(db._must_include({"must_include": "abc"}), ["abc"])
+        self.assertEqual(db._must_include({"must_include": ["a", " b "]}), ["a", "b"])
+        self.assertEqual(db._must_include({"prompt": "q"}), [])
+
+    def test_fallback_when_fact_missing(self):
+        cfg = db.BoostCfg(blocks=1, steps=0, max_new=8, require_hit=True, seed=0,
+                          start="empty", min_effect=0.0)
+        b = db.Booster(TableEng(gen=lambda ids, n: [ord(c) for c in "no fact here"][:n]),
+                       CharTok(), lambda q: q, cfg, eos=None)
+        r = b.run({"prompt": "q", "answer": "expert with FACT_A", "must_include": ["FACT_A"]},
+                  gold="", requirement=lambda t: False)
+        self.assertFalse(r.hit)
+        self.assertEqual(r.source, "original")
+        self.assertEqual(r.fallback, "generated_trace_failed_judge")
+        self.assertIn("FACT_A", r.text)            # 退回的是原轨迹（事实还在）
+
+    def test_kept_when_facts_survive(self):
+        body = "native phrasing with FACT_A and FACT_B"
+        cfg = db.BoostCfg(blocks=1, steps=0, max_new=len(body), require_hit=True, seed=0,
+                          start="empty", min_effect=0.0)
+        b = db.Booster(TableEng(gen=lambda ids, n: [ord(c) for c in body][:n]),
+                       CharTok(), lambda q: q, cfg, eos=None)
+        r = b.run({"prompt": "q", "answer": "expert", "must_include": ["FACT_A", "FACT_B"]},
+                  gold="", requirement=lambda t: False)
+        self.assertTrue(r.hit)
+        self.assertEqual(r.source, "boosted")
+
+    def test_math_path_untouched(self):
+        """没有 must_include 的行走原判据：requirement/marker 语义不变。"""
+        cfg = db.BoostCfg(blocks=1, steps=0, max_new=8, require_hit=True, seed=0,
+                          start="empty", min_effect=0.0)
+        b = db.Booster(TableEng(gen=lambda ids, n: [ord(c) for c in "zzzz"][:n]),
+                       CharTok(), lambda q: q, cfg, eos=None)
+        r = b.run({"prompt": "q", "solution": "1+1=2\n\nAnswer: 2"},
+                  gold="2", requirement=lambda t: True)
+        self.assertFalse(r.hit)                    # answer_hit 语义：zzzz 判错
+        self.assertEqual(r.fallback, "generated_trace_failed_judge")
+
+
 if __name__ == "__main__":
     unittest.main()
