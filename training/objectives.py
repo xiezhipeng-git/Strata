@@ -131,6 +131,27 @@ def dpo_loss(margin, beta: float = 0.1):
     return (x + ax) / 2.0 + _xp(margin).log1p(_xp(margin).exp(-ax))
 
 
+def dpo_mixed_loss(margin, beta, chosen_logp_mean, nll_weight: float):
+    """DPO + λ·NLL(chosen)：`dpo_loss(margin, β) + λ·(−mean logπ_c)`。
+
+    为什么纯 DPO 不够（2026-11-25 identity 定案）：sigmoid 自限——β_eff·margin
+    到 ~4 后 σ(−x) < 0.02，梯度引擎在 margin 翻正后熄火（实测 β_eff≈4.5、
+    margin +1.6 时梯度只剩 0.07%）。而 margin 翻正只保证 Δc > Δr，**不保证
+    chosen 的绝对 logp 到生成 argmax 翻口所需**（identity 实测：margin +1.6
+    时 probe logp 才 +12 nats，翻口需 ~+37）。NLL 项不经过 sigmoid，在 margin
+    饱和区仍满梯度推 chosen —— λ=1 时 NLL 部分恰为同几何 SFT 损失，DPO 项
+    叠加对比信号，这是「DPO ≥ SFT」成立的数学前提（Rafailov et al. 2023
+    附录的 NLL 正则、Llama-3 同款）。λ=0 退化为纯 DPO。
+
+    `chosen_logp_mean` 是 chosen 答案段的每 token 平均 logp（带梯度路径）；
+    numpy/torch 双路径与 `dpo_loss` 同源，对拍测试覆盖两库。
+    """
+    loss = dpo_loss(margin, beta)
+    if nll_weight > 0:
+        loss = loss + nll_weight * (-chosen_logp_mean)
+    return loss
+
+
 def dpo_beta_effective(beta: float, c_ntok: int = 0, r_ntok: int = 0) -> float:
     """把 β 从「序列级 logp」口径换算到 `dpo_margin` 的「每 token 优势」口径。
 

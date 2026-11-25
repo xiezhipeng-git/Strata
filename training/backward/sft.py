@@ -755,6 +755,11 @@ def main() -> int:
     ap.add_argument("--dpo-beta", type=float, default=0.1, metavar="B",
                     help="DPO 温度 β（论文默认 0.1）：loss = −log σ(β·margin)，"
                          "margin 按答案 token 归一（每侧各自平均，长度不变量）")
+    ap.add_argument("--dpo-nll-weight", type=float, default=0.0, metavar="L",
+                    help="DPO + λ·NLL(chosen) 正则（Rafailov/Llama-3 标准）：纯 DPO 的 "
+                         "sigmoid 在 margin 翻正后梯度自限（β_eff≈4.5 时 margin +1.6 即 "
+                         "0.07%），chosen 绝对 logp 推不到 argmax 翻口；λ·NCL 不过 "
+                         "sigmoid，饱和区仍满梯度。λ=0 纯 DPO；λ=1 时 NLL 部分恰为同几何 SFT")
     ap.add_argument("--seed", type=int, default=0,
                     help="数据洗牌种子。默认固定：跑 A/B 时若每次命中不同专家数，"
                          "s/step 的差异会被数据顺序噪声淹没（实测 loss 0.06~1.24）")
@@ -1227,10 +1232,47 @@ def main() -> int:
     #      advantage）—— 数学原理不同，代价是组内必须有方差（std=0 ⇒ advantage 全零无信号，
     #      所以训练日志必须打 adv0 / uniq）。
     sel_masks: list[list[bool]] | None = None
+    dpo_sel: list[tuple[list[bool], list[bool]]] | None = None
+    dpo_refce_tok: list[tuple[list[float], list[float]]] | None = None
     ref_ce_lists: list[list[float]] | None = None   # 起点答案段逐 token CE（selection 与报告共用一次前向）
     if dpo_rows is not None:
-        if args.select_tokens != "off":
-            print("DPO：--select-tokens 不适用（loss 是序列级 margin，不是逐 token CE），按 off 处理")
+        if args.select_tokens == "excess":
+            t_sel = time.time()
+            was_training = model.training
+            model.eval()
+            # DPO 的 excess 双侧各选各的：margin 变成「每侧惊讶 token 上的每 token
+            # 平均优势差」。chosen 侧只推模型不知道的事实 token；rejected 侧只压
+            # 模型不知道的 token —— 共享的、模型本来就会的开场/格式 token 不再被
+            # rejected 项连坐下压（2026-11-25 v6「我是是由…」开场压坏的教训）。
+            # ref 侧用同一掩码（θ₀ 处已算过 CE，选块直接复用，不额外前向）。
+            dpo_refce_tok = [(answer_ref_ce(body, head, fc, pc),
+                              answer_ref_ce(body, head, fj, pj))
+                             for (fc, pc), (fj, pj) in dpo_enc]
+
+            def _sel(ce: list[float], n_fallback: list[int]) -> list[bool]:
+                m = guard.select_mask(ce, args.select_thresh, args.select_first)
+                if not any(m):
+                    n_fallback[0] += 1
+                    m = [True] * len(ce)     # 该侧全不惊讶 → 退回全量（压 0 token 的 margin 无意义）
+                return m
+
+            n_fb = [0]
+            dpo_sel = [(_sel(cc, n_fb), _sel(cj, n_fb)) for cc, cj in dpo_refce_tok]
+            if was_training:
+                model.train()
+            tot_c = sum(sum(mc) for mc, _ in dpo_sel)
+            tot_r = sum(sum(mj) for _, mj in dpo_sel)
+            ans_c = sum(len(mc) for mc, _ in dpo_sel)
+            ans_r = sum(len(mj) for _, mj in dpo_sel)
+            print(f"token selection (ref CE > {args.select_thresh}): chosen {tot_c}/{ans_c}"
+                  f"  rejected {tot_r}/{ans_r} 答案 token 进 margin"
+                  f"  空选退回全量 {n_fb[0]}/{2 * len(dpo_sel)} 侧  {time.time() - t_sel:.0f}s",
+                  flush=True)
+            if tot_c + tot_r == 0:
+                raise SystemExit(f"--select-thresh {args.select_thresh} 下一个 token 都没选中："
+                                 "阈值过高，或数据与训练起点无差异。先降阈值看分布再跑，不要空转")
+        elif args.select_tokens != "off":
+            print(f"DPO：--select-tokens {args.select_tokens} 不认识，按 off 处理")
     elif args.pretrain_data:
         if args.select_tokens != "off":
             print("pretrain 块数据：--select-tokens 不适用（整块 loss 语义），按 off 处理")
@@ -1413,6 +1455,9 @@ def main() -> int:
                 # ref 已预计算 ⇒ 每对恰 2 次前向 + 1 次反传，无采样。
                 (fc, pc), (fj, pj) = dpo_enc[idx]
                 rc, rj = dpo_ref[idx]
+                mc = mj = None
+                if dpo_sel is not None:
+                    mc, mj = dpo_sel[idx]
                 if dpo_fp is not None:
                     # frozen-prefix：prompt 缓存算一次，chosen/rejected 各 deepcopy 一份
                     # —— 前向原地追加 K/V，不克隆就串序列（tail_logprobs 内部克隆）。
@@ -1421,24 +1466,38 @@ def main() -> int:
                     prefix, (tc, tj) = dpo_fp[idx]
                     cache = prefix_cache(body, prefix)
                     off = (pc - 1) - len(prefix)
-                    lc = tail_logprobs(body, head, tc, cache)[off:].sum()
-                    lj = tail_logprobs(body, head, tj, cache)[off:].sum()
+                    lpc = tail_logprobs(body, head, tc, cache)[off:]
+                    lpj = tail_logprobs(body, head, tj, cache)[off:]
                 else:
-                    lc = policy_logprob_sum(body, head, fc, pc)
-                    lj = policy_logprob_sum(body, head, fj, pj)
+                    lpc = answer_logprobs(body, head, fc, pc)
+                    lpj = answer_logprobs(body, head, fj, pj)
+                if mc is not None:
+                    # excess：双侧各留在「起点惊讶」的 token 上。ref 用同一掩码口径
+                    #（ref logp = −CE，dpo_refce_tok 在选块处预计算）。
+                    keep_c = torch.tensor(mc, device=lpc.device)
+                    keep_j = torch.tensor(mj, device=lpj.device)
+                    lc = lpc[keep_c].sum()
+                    lj = lpj[keep_j].sum()
+                    nc_tok, nr_tok = int(sum(mc)), int(sum(mj))
+                    rcc, rjj = dpo_refce_tok[idx]
+                    rc = -sum(v for v, on in zip(rcc, mc) if on)
+                    rj = -sum(v for v, on in zip(rjj, mj) if on)
+                else:
+                    lc, lj = lpc.sum(), lpj.sum()
+                    nc_tok, nr_tok = int(len(fc) - pc), int(len(fj) - pj)
                 # margin 按答案 token 归一（与引擎侧 mezo 的 DpoMezo 同一语义，objectives
                 # 唯一出处）：量级与序列长度无关，lr 不用随长度重标定。
-                nc_tok, nr_tok = int(len(fc) - pc), int(len(fj) - pj)
                 margin = objectives.dpo_margin(lc, lj, rc, rj, nc_tok, nr_tok)
                 # β 必须跟着归一化换算，否则 KL 约束被除以 n̄（长度越长越松，
                 # 见 objectives.dpo_beta_effective）：这是 2026-11-06 冷启 DPO 崩坏
                 # 的根因，不是 lr 或能力门的问题。
-                loss = objectives.dpo_loss(
-                    margin, objectives.dpo_beta_effective(args.dpo_beta, nc_tok, nr_tok)
+                loss = objectives.dpo_mixed_loss(
+                    margin, objectives.dpo_beta_effective(args.dpo_beta, nc_tok, nr_tok),
+                    lc / max(1, nc_tok), args.dpo_nll_weight,
                 ) / args.accum
                 tot += rule.backward(loss) * args.accum
                 margins.append(float(margin))
-                n_ans += (len(fc) - pc) + (len(fj) - pj)
+                n_ans += nc_tok + nr_tok
                 n_contrib += 1
                 continue
             full, plen = enc[idx]

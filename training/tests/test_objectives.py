@@ -295,6 +295,22 @@ class NumpyIsTorch(unittest.TestCase):
             want = float(O.dpo_loss(torch.tensor(margin), 0.1))
             self.assertAlmostEqual(got, want, places=5)
 
+    def test_dpo_mixed_matches_and_lambda_zero_is_pure_dpo(self):
+        for margin in (-40.0, -3.0, 0.0, 3.0, 40.0):
+            for lam in (0.0, 0.25, 1.0):
+                got = float(O.dpo_mixed_loss(np.float64(margin), 0.1, np.float64(-4.2), lam))
+                want = float(O.dpo_mixed_loss(torch.tensor(margin), 0.1,
+                                              torch.tensor(-4.2), lam))
+                self.assertAlmostEqual(got, want, places=5, msg=(margin, lam))
+        # λ=0 退化为纯 DPO（逐位）
+        m = np.float64(1.6)
+        self.assertEqual(float(O.dpo_mixed_loss(m, 0.1, np.float64(-4.2), 0.0)),
+                         float(O.dpo_loss(m, 0.1)))
+        # λ=1 时 NLL 部分恰为 SFT 损失：mixed − pure = −mean logp
+        self.assertAlmostEqual(
+            float(O.dpo_mixed_loss(m, 0.1, np.float64(-4.2), 1.0))
+            - float(O.dpo_loss(m, 0.1)), 4.2, places=6)
+
     def test_group_advantages_uses_the_same_std(self):
         rewards = [1.0, 0.0, 0.0, 1.0, 0.2, 0.4]
         a_np, u_np, _ = O.group_advantages(np.array(rewards), 2)

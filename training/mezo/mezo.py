@@ -1566,12 +1566,41 @@ class DpoMezo(EngineMezo):
 
     def theta0_cache(self) -> None:
         n = 0
+        excess = getattr(self.args, "select_tokens", "excess") == "excess"
         for it in self.items:
             sc, _ = self.eng.score(it["c_seq"]); sr, _ = self.eng.score(it["r_seq"])
-            it["ref_c"] = float(np.sum(self._seg(it, sc, "c")))
-            it["ref_r"] = float(np.sum(self._seg(it, sr, "r")))
+            seg_c = self._seg(it, sc, "c"); seg_r = self._seg(it, sr, "r")
+            it["ref_c"] = float(np.sum(seg_c))
+            it["ref_r"] = float(np.sum(seg_r))
+            if excess:
+                # 双侧各选各的（与反传线同语义）：chosen 只留「起点惊讶」的事实
+                # token，rejected 只压它惊讶的 token —— 模型本来就会的开场/格式
+                # token 不被 rejected 项连坐下压。ce = −logp；某侧全不惊讶退回全量。
+                thresh = self.args.select_thresh
+                first = getattr(self.args, "select_first", 0)
+                it["ref_c_seg"] = seg_c
+                it["ref_r_seg"] = seg_r
+                for side, seg in (("c", seg_c), ("r", seg_r)):
+                    m = np.asarray(guard.select_mask([-v for v in seg], thresh, first),
+                                   dtype=bool)
+                    if not m.any():
+                        m = np.ones(len(seg), dtype=bool)
+                    it[f"{side}_sel"] = m
             n += 2
-        print(f"theta0 cache: {n} score calls (dpo ref)", flush=True)
+        print(f"theta0 cache: {n} score calls (dpo ref)"
+              + (", excess selection on" if excess else ""), flush=True)
+
+    def _margin_parts(self, it: dict, sc, sr) -> tuple[float, float, float, float, int, int]:
+        """当前 θ 下（excess 掩码口径的）(pol_c, pol_r, ref_c, ref_r, n_c, n_r)。"""
+        seg_c = self._seg(it, sc, "c"); seg_r = self._seg(it, sr, "r")
+        if "c_sel" in it:
+            mc, mj = it["c_sel"], it["r_sel"]
+            pol_c = float(np.sum(seg_c[mc])); pol_r = float(np.sum(seg_r[mj]))
+            ref_c = float(np.sum(it["ref_c_seg"][mc]))
+            ref_r = float(np.sum(it["ref_r_seg"][mj]))
+            return pol_c, pol_r, ref_c, ref_r, int(mc.sum()), int(mj.sum())
+        return (float(np.sum(seg_c)), float(np.sum(seg_r)),
+                it["ref_c"], it["ref_r"], it["c_ntok"], it["r_ntok"])
 
     def margin_stats(self) -> tuple[float, float]:
         """当前 θ 下的 DPO margin 均值 + 为正的样本比例（report.eval_step 自动调用）。
@@ -1584,10 +1613,8 @@ class DpoMezo(EngineMezo):
         for it in self.items:
             sc, _ = self.eng.score(it["c_seq"])
             sr, _ = self.eng.score(it["r_seq"])
-            pol_c = float(np.sum(self._seg(it, sc, "c")))
-            pol_r = float(np.sum(self._seg(it, sr, "r")))
-            vals.append(objectives.dpo_margin(pol_c, pol_r, it["ref_c"], it["ref_r"],
-                                              it["c_ntok"], it["r_ntok"]))
+            pol_c, pol_r, ref_c, ref_r, nc, nr = self._margin_parts(it, sc, sr)
+            vals.append(objectives.dpo_margin(pol_c, pol_r, ref_c, ref_r, nc, nr))
         if not vals:
             return 0.0, 0.0
         return float(np.mean(vals)), float(np.mean([v > 0 for v in vals]))
@@ -1597,15 +1624,15 @@ class DpoMezo(EngineMezo):
         losses = []
         for it in batch:
             sc, _ = self.eng.score(it["c_seq"]); sr, _ = self.eng.score(it["r_seq"])
-            pol_c = float(np.sum(self._seg(it, sc, "c")))
-            pol_r = float(np.sum(self._seg(it, sr, "r")))
-            margin = objectives.dpo_margin(pol_c, pol_r, it["ref_c"], it["ref_r"],
-                                           it["c_ntok"], it["r_ntok"])
+            pol_c, pol_r, ref_c, ref_r, nc, nr = self._margin_parts(it, sc, sr)
+            margin = objectives.dpo_margin(pol_c, pol_r, ref_c, ref_r, nc, nr)
             # β 跟着归一化换算（objectives.dpo_beta_effective）：不换算则 KL 约束
             # 强度被除以 n̄，长序列上等于消失 —— 零阶差分信号同样会被这个尺度淹没。
-            beta_eff = objectives.dpo_beta_effective(self.args.beta,
-                                                     it["c_ntok"], it["r_ntok"])
-            losses.append(float(objectives.dpo_loss(margin, beta_eff)))
+            beta_eff = objectives.dpo_beta_effective(self.args.beta, nc, nr)
+            # NLL 正则零额外成本：pol_c 在上面已经 SCORE 过，mean logp 直接可得。
+            losses.append(float(objectives.dpo_mixed_loss(
+                margin, beta_eff, pol_c / max(1, nc),
+                getattr(self.args, "dpo_nll_weight", 0.0))))
         return float(np.mean(losses)) if losses else 0.0
 
 
@@ -2167,6 +2194,11 @@ def main() -> int:
                     help="健康度口径：目标文本的 jsonl(prompt,answer) 或 identity；"
                          "dpo/grpo/luspo 的 eval 靠它才有 ce 一项（不然只有一个词的 logp）")
     ap.add_argument("--beta", type=float, default=0.1, help="DPO 的 β")
+    ap.add_argument("--dpo-nll-weight", type=float, default=0.0, metavar="L",
+                    help="DPO + λ·NLL(chosen) 正则：纯 DPO 的 sigmoid 在 margin 翻正后梯度"
+                         "自限（β_eff≈4.5 时 margin +1.6 即 0.07%），chosen 绝对 logp 推不到"
+                         " argmax 翻口；NLL 项不过 sigmoid，饱和区仍满梯度（零阶侧零额外 "
+                         "SCORE：pol_c 已算）。λ=0 纯 DPO；λ=1 时 NLL 部分恰为同几何 CE")
     ap.add_argument("--group-size", type=int, default=4, help="GRPO：一条 prompt 的采样条数 K")
     ap.add_argument("--rl-fallback", choices=("sft", "dpo", "off"), default="sft", metavar="sft|dpo|off",
                     help="RL 的次级算法兜底（默认 sft）：某组 K 条轨迹**全错**（奖励全 0）时"
