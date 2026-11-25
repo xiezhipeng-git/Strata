@@ -802,7 +802,12 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
             int inc = x;
             for (int w2 = 0; w2 < warp; ++w2) inc += s_warp[w2];
             const int before = above + inc - v;
-            if (before < width && (above + inc >= width || t == 255)) {
+            // The winner is the unique t where the cumulative count crosses `width` (before < width <= before + v).
+            // The old `|| t == 255` fallback also wrote here, racing with the winner's write on s_digit/s_above:
+            // whichever thread landed last won, so the threshold - and the selected cells - differed run to run
+            // with bitwise-identical scores.  bin 0 needs no fallback: the cells matching the prefix number
+            // width or more, so some bin always crosses (n_kv > width is guaranteed above).
+            if (before < width && above + inc >= width) {
                 s_digit = 255 - t;
                 s_above = before;
             }
